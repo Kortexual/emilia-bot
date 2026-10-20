@@ -42,6 +42,7 @@ Everything stays on your machine, apart from the web searches the model chooses 
 
 - `@Emilia what's the capital of Australia?` (mention the bot *user*; `@everyone` and role pings are ignored)
 - Reply to someone's message and mention the bot, e.g. `@Emilia is this true?`: the message you replied to is included as context.
+- `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can only ping people who are part of the conversation (the sender, people mentioned or replied to, and people in her memory of the channel).
 - `@Emilia !forget` (or `!reset`) clears the memory of that channel. It needs the *Manage Messages* permission; in a DM anyone can do it.
 - DMs are ignored unless you set `RESPOND_TO_DMS=true`.
 
@@ -50,7 +51,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
 ### Only @mentions
 `EmiliaBot._is_for_me` in `bot.py` is the whole rule: the message must come from a human, be an ordinary message or reply,
 and mention the bot (a reply that pings the bot counts). Anything else is dropped before any work is done.
-Replies can never ping `@everyone`, roles or other users, whatever the model writes.
+Replies can never ping `@everyone` or roles, whatever the model writes. When the model writes `@Name` for someone in the
+conversation, `link_mentions` in `bot.py` turns it into a real ping for that user only; any other name stays plain text.
 
 ### Web search
 LM Studio has no built-in search. What its OpenAI-compatible API offers is **tool calling**: the bot describes a
@@ -77,7 +79,8 @@ Language models remember nothing between requests, so "memory" means re-sending 
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
 It keeps the last `MEMORY_TURNS` exchanges and sends as many as fit in `MEMORY_MAX_CHARS` with each request.
 
-- Everyone in a channel shares that channel's memory; messages carry the speaker's name so the bot can tell people apart.
+- Everyone in a channel shares that channel's memory, but each message is saved with who sent it (their name and
+  Discord user ID), so the bot keeps people apart and can ping them later. Memory files from older versions are upgraded automatically.
 - Only messages addressed to the bot, and its replies, are stored. It does not log the rest of the channel.
 - It is a window, not a permanent record: older exchanges drop off. Raise the limits if your model's context allows.
 - `@Emilia !forget` clears one channel; deleting `memory.db` clears everything.

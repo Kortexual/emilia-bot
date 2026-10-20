@@ -20,7 +20,7 @@ import discord
 import prompts
 from config import ConfigError, Settings
 from llm import ChatResult, LLMError, LMStudioClient
-from memory import MemoryStore
+from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, sanitize_user_text, split_message
 from tooling import Tool
 from websearch import WebSearchTool, ddgs_installed
@@ -52,6 +52,28 @@ def sources_footer(urls: list[str], max_links: int = 3) -> str:
     return "\n-# 🔎 Searched the web · " + " · ".join(picked) if picked else ""
 
 
+def link_mentions(text: str, people: dict[str, int]) -> tuple[str, list[int]]:
+    """Turn "@Name" in a reply into a real Discord ping, for the people in `people` (name -> user ID).
+
+    Returns the new text and the IDs it pings. Anyone not in `people` stays plain text, so the model
+    can only ping people who are part of the conversation.
+    """
+    if not people:
+        return text, []
+    by_name = {name.lower(): user_id for name, user_id in people.items()}
+    names = sorted(people, key=len, reverse=True)  # "@Ann Marie" before "@Ann"
+    pattern = re.compile(r"(?<![\w<])@(" + "|".join(map(re.escape, names)) + r")(?!\w)", re.IGNORECASE)
+    pinged: list[int] = []
+
+    def to_ping(match: re.Match[str]) -> str:
+        user_id = by_name[match.group(1).lower()]
+        if user_id not in pinged:
+            pinged.append(user_id)
+        return f"<@{user_id}>"
+
+    return pattern.sub(to_ping, text), pinged
+
+
 class EmiliaBot(discord.Client):
     def __init__(
         self,
@@ -64,7 +86,8 @@ class EmiliaBot(discord.Client):
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
         super().__init__(
             intents=intents,
-            # Whatever the model writes can never ping @everyone, roles or arbitrary users.
+            # Whatever the model writes can never ping @everyone, roles or arbitrary users. Replies
+            # that ping people in the conversation allow exactly those users (see link_mentions).
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True),
         )
         self.settings = settings
@@ -143,13 +166,16 @@ class EmiliaBot(discord.Client):
             return
         self._busy.add(user_id)
         try:
-            quote = await self._quoted_context(message)
-            reply = await self._respond(message, key, quote + text)
+            quote, quoted_author = await self._quoted_context(message)
+            reply, pinged = await self._respond(message, key, quote + text, quoted_author)
         finally:
             self._busy.discard(user_id)
-        await self._send(message, reply)
+        await self._send(message, reply, pinged)
 
-    async def _respond(self, message: discord.Message, key: str, user_text: str) -> str:
+    async def _respond(
+        self, message: discord.Message, key: str, user_text: str, quoted_author: discord.abc.User | None
+    ) -> tuple[str, list[int]]:
+        """The reply to post, and the IDs of the users it pings."""
         author = prompts.safe_name(message.author.display_name)
         async with message.channel.typing():  # keeps "typing..." showing, even while queued
             async with self._channel_lock(key):
@@ -163,24 +189,25 @@ class EmiliaBot(discord.Client):
                     result = await self.llm.chat(prompts.build_messages(system_prompt, history, author, user_text))
                 except LLMError as exc:
                     log.error("LM Studio request failed: %s", exc)
-                    return prompts.ERROR_REPLY
+                    return prompts.ERROR_REPLY, []
 
                 reply = clean_reply(result.text, self._speaker_names())
                 if not reply:
                     log.warning("The model sent an empty reply")
-                    return prompts.EMPTY_REPLY
+                    return prompts.EMPTY_REPLY, []
                 if prompts.LEAK_DETECTOR.leaks(reply):
                     log.warning("Blocked a reply that repeated the system prompt")
-                    return prompts.BLOCKED_REPLY
+                    return prompts.BLOCKED_REPLY, []
 
-                try:
-                    await asyncio.to_thread(self.memory.add_turn, key, author, user_text, reply)
+                try:  # stored with plain "@Name"s, the way the model wrote them
+                    await asyncio.to_thread(self.memory.add_turn, key, author, str(message.author.id), user_text, reply)
                 except sqlite3.Error:
                     log.exception("Could not save this exchange to memory")  # still deliver the reply
 
+        reply, pinged = link_mentions(reply, self._pingable(message, history, quoted_author))
         if result.sources and self.settings.show_sources:
             reply += sources_footer(result.sources)
-        return reply
+        return reply, pinged
 
     async def _reset(self, message: discord.Message, key: str) -> None:
         if message.guild is not None and not message.channel.permissions_for(message.author).manage_messages:
@@ -198,6 +225,17 @@ class EmiliaBot(discord.Client):
             lock = self._locks[key] = asyncio.Lock()
         return lock
 
+    def _pingable(
+        self, message: discord.Message, history: list[StoredMessage], quoted_author: discord.abc.User | None
+    ) -> dict[str, int]:
+        """Everyone the reply may ping, by the name the model knows them by: people who spoke in the
+        remembered conversation, the sender, and anyone the message mentions or replies to."""
+        people = {item.author: int(item.author_id) for item in history if item.role == "user" and item.author_id}
+        for user in [*message.mentions, quoted_author, message.author]:
+            if user is not None and (self.user is None or user.id != self.user.id):
+                people[prompts.safe_name(user.display_name)] = user.id
+        return people
+
     def _speaker_names(self) -> tuple[str, ...]:
         return (prompts.PERSONA_NAME, self.user.display_name if self.user else "")
 
@@ -214,39 +252,41 @@ class EmiliaBot(discord.Client):
             text = text.replace(f"<#{channel.id}>", f"#{channel.name}")
         return re.sub(r"<a?:(\w+):\d+>", r":\1:", text)  # custom emoji -> :name:
 
-    async def _quoted_context(self, message: discord.Message) -> str:
-        """If this is a reply to someone else's message, include what it said, so that
-        '@Emilia is this true?' makes sense. Our own earlier messages are already in memory."""
+    async def _quoted_context(self, message: discord.Message) -> tuple[str, discord.abc.User | None]:
+        """If this is a reply to someone else's message, include what it said (and who said it), so
+        that '@Emilia is this true?' makes sense. Our own earlier messages are already in memory."""
         ref = message.reference
         if ref is None or ref.message_id is None:
-            return ""
+            return "", None
         quoted = ref.resolved
         if quoted is None:
             try:
                 quoted = await message.channel.fetch_message(ref.message_id)
             except discord.HTTPException:
-                return ""
+                return "", None
         if not hasattr(quoted, "author"):  # the original was deleted
-            return ""
+            return "", None
         if self.user is not None and quoted.author.id == self.user.id:
-            return ""
+            return "", None
         body = sanitize_user_text(self._render(quoted), 300).replace('"', "'")
         if not body:
-            return ""
-        return f'(replying to {prompts.safe_name(quoted.author.display_name)}: "{body}") '
+            return "", None
+        return f'(replying to {prompts.safe_name(quoted.author.display_name)}: "{body}") ', quoted.author
 
-    async def _send(self, message: discord.Message, text: str) -> None:
-        """Reply to the message, spilling over into follow-up messages if it is long."""
+    async def _send(self, message: discord.Message, text: str, pinged: list[int] | None = None) -> None:
+        """Reply to the message, spilling over into follow-up messages if it is long.
+        Only the users in `pinged` are actually notified by mentions in the text."""
+        allowed = discord.AllowedMentions(users=[discord.Object(user_id) for user_id in pinged or []])
         for index, chunk in enumerate(split_message(text, CHUNK_SIZE)):
             if index == 0:
                 try:
-                    await message.reply(chunk)
+                    await message.reply(chunk, allowed_mentions=allowed)
                     continue
                 except discord.Forbidden:
                     raise
                 except discord.HTTPException as exc:  # e.g. the original message was deleted meanwhile
                     log.info("Could not reply to message %s (%s); posting normally instead", message.id, exc)
-            await message.channel.send(chunk)
+            await message.channel.send(chunk, allowed_mentions=allowed)
 
 
 def main() -> None:
