@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Secrets and local data
+.env
+*.log
+*.db
+*.db-wal
+*.db-shm

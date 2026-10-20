@@ -1,0 +1,365 @@
+"""Tests the LM Studio client against a tiny fake server that speaks the documented response format."""
+import asyncio
+import json
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import llm
+from llm import LLMError, LLMHTTPError, LMStudioClient
+from tooling import ToolResult
+
+
+# --- fakes -----------------------------------------------------------------------
+class FakeLMStudio:
+    """Replies to POST /v1/chat/completions from a script and records every request it receives.
+
+    A script entry is a response body (200), a (status, body) tuple, or ("sleep", seconds, body).
+    """
+
+    def __init__(self, script=(), models=("my-chat-model", "text-embedding-nomic")):
+        self.script = list(script)
+        self.models = list(models)
+        self.requests = []  # parsed JSON bodies sent to /chat/completions
+        self.headers = []  # headers of every request
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, body):
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except OSError:
+                    pass  # the client gave up (timeout test)
+
+            def do_GET(self):
+                outer.headers.append(dict(self.headers))
+                if self.path == "/v1/models":
+                    self._send(200, {"object": "list", "data": [{"id": m, "object": "model"} for m in outer.models]})
+                else:
+                    self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                outer.requests.append(body)
+                outer.headers.append(dict(self.headers))
+                if not outer.script:
+                    return self._send(500, {"error": "script exhausted"})
+                entry = outer.script.pop(0)
+                if isinstance(entry, tuple) and entry[0] == "sleep":
+                    time.sleep(entry[1])
+                    return self._send(200, entry[2])
+                if isinstance(entry, tuple):
+                    return self._send(*entry)
+                self._send(200, entry)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        threading.Thread(target=lambda: self.server.serve_forever(poll_interval=0.01), daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def text_reply(text):
+    return {"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}]}
+
+
+def tool_reply(*calls, content=None):
+    """calls: (name, arguments) pairs; arguments may be a dict or a raw string."""
+    tool_calls = [
+        {
+            "id": str(1000 + i),
+            "type": "function",
+            "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)},
+        }
+        for i, (name, args) in enumerate(calls)
+    ]
+    message = {"role": "assistant", "tool_calls": tool_calls}
+    if content is not None:
+        message["content"] = content
+    return {"choices": [{"index": 0, "finish_reason": "tool_calls", "message": message}]}
+
+
+class FakeSearch:
+    name = "web_search"
+    schema = {
+        "name": "web_search",
+        "description": "Search the web",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    }
+
+    def __init__(self):
+        self.calls = []
+
+    async def run(self, arguments):
+        self.calls.append(arguments)
+        return ToolResult(f"RESULT for {arguments.get('query')}", ["https://example.com/a"])
+
+
+USER = [{"role": "system", "content": "be nice"}, {"role": "user", "content": "hello?"}]
+
+
+class ClientTestCase(unittest.IsolatedAsyncioTestCase):
+    def serve(self, script=(), **kwargs):
+        server = FakeLMStudio(script, **kwargs)
+        self.addCleanup(server.stop)
+        return server
+
+    async def client(self, server, *, tools=(), **kwargs):
+        kwargs.setdefault("model", "my-chat-model")
+        client = LMStudioClient(base_url=server.url, tools=tools, **kwargs)
+        await client.start()
+        self.addAsyncCleanup(client.close)
+        return client
+
+
+class ChatTests(ClientTestCase):
+    async def test_plain_answer(self):
+        server = self.serve([text_reply("Hello!")])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search])
+
+        result = await client.chat(USER)
+
+        self.assertEqual(result.text, "Hello!")
+        self.assertFalse(result.used_tools)
+        sent = server.requests[0]
+        self.assertEqual(sent["model"], "my-chat-model")
+        self.assertEqual(sent["messages"], USER)
+        self.assertEqual(sent["tools"][0], {"type": "function", "function": search.schema})
+        self.assertNotIn("temperature", sent)  # LM Studio's own UI settings apply unless configured
+        self.assertNotIn("max_tokens", sent)
+
+    async def test_tool_round_trip(self):
+        server = self.serve([tool_reply(("web_search", {"query": "weather atlanta"})), text_reply("It is sunny.")])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search])
+
+        result = await client.chat(USER)
+
+        self.assertEqual(result.text, "It is sunny.")
+        self.assertTrue(result.used_tools)
+        self.assertEqual(result.sources, ["https://example.com/a"])
+        self.assertEqual(search.calls, [{"query": "weather atlanta"}])
+
+        followup = server.requests[1]["messages"]
+        self.assertEqual(followup[:2], USER)
+        assistant, tool = followup[2], followup[3]
+        self.assertEqual(assistant["role"], "assistant")
+        self.assertEqual(assistant["tool_calls"][0]["id"], "1000")
+        self.assertEqual(json.loads(assistant["tool_calls"][0]["function"]["arguments"]), {"query": "weather atlanta"})
+        self.assertEqual(tool["role"], "tool")
+        self.assertEqual(tool["tool_call_id"], "1000")  # ties the result to the request
+        self.assertIn("RESULT for weather atlanta", tool["content"])
+
+    async def test_tool_call_printed_as_text_is_rescued(self):
+        for printed in (
+            '<tool_call>\n{"name": "web_search", "arguments": {"query": "qwen release"}}\n</tool_call>',
+            '[TOOL_REQUEST]{"name": "web_search", "arguments": {"query": "qwen release"}}[END_TOOL_REQUEST]',
+            '{"name": "web_search", "parameters": {"query": "qwen release"}}',
+        ):
+            with self.subTest(printed=printed[:20]):
+                server = self.serve([text_reply(printed), text_reply("Found it.")])
+                search = FakeSearch()
+                client = await self.client(server, tools=[search])
+                result = await client.chat(USER)
+                self.assertEqual(result.text, "Found it.")
+                self.assertEqual(search.calls, [{"query": "qwen release"}])
+                self.assertEqual(server.requests[1]["messages"][2]["tool_calls"][0]["function"]["name"], "web_search")
+
+    async def test_ordinary_json_in_an_answer_is_not_mistaken_for_a_tool_call(self):
+        server = self.serve([text_reply('{"name": "Emilia", "mood": "shy"}')])
+        search = FakeSearch()
+        result = await (await self.client(server, tools=[search])).chat(USER)
+        self.assertEqual(result.text, '{"name": "Emilia", "mood": "shy"}')
+        self.assertEqual(search.calls, [])
+
+    async def test_unreadable_arguments_are_reported_back_to_the_model(self):
+        server = self.serve([tool_reply(("web_search", "this is not json")), text_reply("Sorry, I couldn't check.")])
+        search = FakeSearch()
+        result = await (await self.client(server, tools=[search])).chat(USER)
+
+        self.assertEqual(result.text, "Sorry, I couldn't check.")
+        self.assertEqual(search.calls, [])  # never ran with garbage
+        self.assertIn("Error", server.requests[1]["messages"][3]["content"])
+
+    async def test_unknown_tool_is_reported_back_to_the_model(self):
+        server = self.serve([tool_reply(("launch_missiles", {})), text_reply("No.")])
+        result = await (await self.client(server, tools=[FakeSearch()])).chat(USER)
+        self.assertEqual(result.text, "No.")
+        self.assertIn("no tool called", server.requests[1]["messages"][3]["content"])
+
+    async def test_a_crashing_tool_does_not_crash_the_chat(self):
+        class Crashy(FakeSearch):
+            async def run(self, arguments):
+                raise ValueError("boom")
+
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), text_reply("Still here.")])
+        with self.assertLogs("emilia.llm", level="ERROR"):
+            result = await (await self.client(server, tools=[Crashy()])).chat(USER)
+        self.assertEqual(result.text, "Still here.")
+
+    async def test_tool_rounds_are_limited_and_the_last_round_must_answer(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "one"})),
+                tool_reply(("web_search", {"query": "two"})),
+                text_reply("Final answer."),
+            ]
+        )
+        search = FakeSearch()
+        result = await (await self.client(server, tools=[search])).chat(USER)
+
+        self.assertEqual(result.text, "Final answer.")
+        self.assertEqual(len(search.calls), llm.MAX_TOOL_ROUNDS)
+        self.assertEqual(len(server.requests), llm.MAX_TOOL_ROUNDS + 1)
+        self.assertIn("tools", server.requests[0])
+        self.assertIn("tools", server.requests[1])
+        self.assertNotIn("tools", server.requests[-1])  # no tools offered on the final round
+
+        last = server.requests[-1]["messages"]
+        tool_messages = [m["content"] for m in last if m["role"] == "tool"]
+        self.assertNotIn("final answer", tool_messages[0].lower())
+        self.assertIn("final answer", tool_messages[-1].lower())  # nudge attached to the last result
+        ids = [m["tool_call_id"] for m in last if m["role"] == "tool"]
+        self.assertEqual(len(set(ids)), len(ids))
+
+    async def test_parallel_tool_calls_are_capped(self):
+        calls = [("web_search", {"query": f"q{i}"}) for i in range(5)]
+        server = self.serve([tool_reply(*calls), text_reply("done")])
+        search = FakeSearch()
+        await (await self.client(server, tools=[search])).chat(USER)
+
+        self.assertEqual(len(search.calls), llm.MAX_CALLS_PER_ROUND)
+        followup = server.requests[1]["messages"]
+        assistant = next(m for m in followup if m["role"] == "assistant")
+        tool_msgs = [m for m in followup if m["role"] == "tool"]
+        self.assertEqual(len(assistant["tool_calls"]), len(tool_msgs))  # every call gets exactly one result
+
+    async def test_server_rejecting_tools_falls_back_to_a_plain_request(self):
+        server = self.serve([(400, {"error": "this model's template has no tool support"}), text_reply("Plain answer.")])
+        with self.assertLogs("emilia.llm", level="WARNING"):
+            result = await (await self.client(server, tools=[FakeSearch()])).chat(USER)
+        self.assertEqual(result.text, "Plain answer.")
+        self.assertIn("tools", server.requests[0])
+        self.assertNotIn("tools", server.requests[1])
+
+    async def test_other_http_errors_are_raised(self):
+        server = self.serve([(500, {"error": "model crashed"})])
+        with self.assertRaises(LLMHTTPError) as caught:
+            await (await self.client(server)).chat(USER)
+        self.assertEqual(caught.exception.status, 500)
+
+    async def test_http_400_without_tools_is_not_retried(self):
+        server = self.serve([(400, {"error": "context length exceeded"})])
+        with self.assertRaises(LLMHTTPError):
+            await (await self.client(server)).chat(USER)
+        self.assertEqual(len(server.requests), 1)
+
+    async def test_reasoning_is_stripped_from_answers(self):
+        server = self.serve([text_reply("<think>The user greets me. Be shy.</think>\n\nH-hello!")])
+        result = await (await self.client(server)).chat(USER)
+        self.assertEqual(result.text, "H-hello!")
+
+    async def test_reasoning_is_not_echoed_back_in_tool_rounds(self):
+        server = self.serve(
+            [tool_reply(("web_search", {"query": "x"}), content="<think>I should search.</think>"), text_reply("ok")]
+        )
+        await (await self.client(server, tools=[FakeSearch()])).chat(USER)
+        assistant = server.requests[1]["messages"][2]
+        self.assertEqual(assistant["content"], "")
+
+    async def test_empty_content_gives_empty_text(self):
+        server = self.serve([{"choices": [{"message": {"role": "assistant", "content": None}}]}])
+        result = await (await self.client(server)).chat(USER)
+        self.assertEqual(result.text, "")
+
+    async def test_unexpected_response_shape(self):
+        server = self.serve([{"unexpected": True}])
+        with self.assertRaises(LLMError):
+            await (await self.client(server)).chat(USER)
+
+    async def test_no_tools_registered_means_none_offered(self):
+        server = self.serve([text_reply("hi")])
+        await (await self.client(server)).chat(USER)
+        self.assertNotIn("tools", server.requests[0])
+
+    async def test_optional_parameters_are_sent_only_when_configured(self):
+        server = self.serve([text_reply("hi")])
+        await (await self.client(server, temperature=0.3, max_tokens=256)).chat(USER)
+        self.assertEqual(server.requests[0]["temperature"], 0.3)
+        self.assertEqual(server.requests[0]["max_tokens"], 256)
+
+
+class ConnectionTests(ClientTestCase):
+    async def test_model_is_auto_detected_and_embedding_models_are_skipped(self):
+        server = self.serve([text_reply("hi")], models=("text-embedding-nomic", "qwen-chat", "other-chat"))
+        client = await self.client(server, model="")
+        self.assertEqual(client.model, "qwen-chat")
+        await client.chat(USER)
+        self.assertEqual(server.requests[0]["model"], "qwen-chat")
+
+    async def test_configured_model_is_used_even_if_unlisted(self):
+        server = self.serve([text_reply("hi")])
+        with self.assertLogs("emilia.llm", level="WARNING"):  # warns about the mismatch, but proceeds
+            client = await self.client(server, model="something-else")
+        await client.chat(USER)
+        self.assertEqual(server.requests[0]["model"], "something-else")
+
+    async def test_api_key_is_sent_only_when_set(self):
+        server = self.serve([text_reply("a"), text_reply("b")])
+        with_key = await self.client(server, api_key="s3cret")
+        await with_key.chat(USER)
+        self.assertEqual(server.headers[-1].get("Authorization"), "Bearer s3cret")
+
+        without_key = await self.client(server)
+        await without_key.chat(USER)
+        self.assertNotIn("Authorization", server.headers[-1])
+
+    async def test_unreachable_lm_studio_starts_quietly_then_fails_clearly(self):
+        server = self.serve()
+        url = server.url
+        await asyncio.to_thread(server.stop)  # nothing is listening any more
+        client = LMStudioClient(base_url=url, model="m")
+        with self.assertLogs("emilia.llm", level="WARNING"):
+            await client.start()  # must not raise: LM Studio may simply not be running yet
+        self.addAsyncCleanup(client.close)
+        with self.assertRaises(LLMError) as caught:
+            await client.chat(USER)
+        self.assertIn("cannot reach LM Studio", str(caught.exception))
+
+    async def test_late_start_of_lm_studio_is_picked_up(self):
+        server = self.serve([text_reply("hi")])
+        client = LMStudioClient(base_url=server.url, model="")  # model unknown, as if LM Studio started late
+        client._session = None
+        await client.start()
+        client.model = ""  # pretend detection failed at startup
+        await client.chat(USER)
+        self.assertEqual(client.model, "my-chat-model")
+        await client.close()
+
+    async def test_slow_model_times_out_cleanly(self):
+        server = self.serve([("sleep", 1.5, text_reply("too late"))])
+        client = await self.client(server, timeout=0.3)
+        with self.assertRaises(LLMError) as caught:
+            await client.chat(USER)
+        self.assertIn("timed out", str(caught.exception))
+
+    async def test_using_the_client_before_start_is_an_error(self):
+        client = LMStudioClient(base_url="http://127.0.0.1:9/v1", model="m")
+        with self.assertRaises(LLMError):
+            await client.chat(USER)
+
+
+if __name__ == "__main__":
+    unittest.main()
