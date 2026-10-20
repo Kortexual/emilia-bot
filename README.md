@@ -148,7 +148,7 @@ tests/        run with:  python -m unittest
 
 ## License
 
-Copyright (C) 2026 YOUR NAME.
+Copyright (C) 2026 Jamin Chen.
 
 Emilia is free software, released under the [GNU Affero General Public License v3.0 or later](LICENSE)
 (AGPL-3.0-or-later). You can use, modify and share it, including commercially, as long as you keep the
