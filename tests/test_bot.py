@@ -1,3 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Emilia: a Discord bot for LM Studio
+# Copyright (C) 2026 YOUR NAME
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Tests the Discord layer with fake messages/channels and a fake LLM (no network needed)."""
 import asyncio
 import itertools
@@ -53,13 +71,15 @@ class FakeChannel:
         self.id = channel_id
         self.can_manage = can_manage
         self.sent = []
+        self.allowed_mentions = []  # the AllowedMentions of every send()
         self.typing_count = 0
 
     def typing(self):
         return _Typing(self)
 
-    async def send(self, text):
+    async def send(self, text, allowed_mentions=None):
         self.sent.append(text)
+        self.allowed_mentions.append(allowed_mentions)
 
     def permissions_for(self, member):
         return SimpleNamespace(manage_messages=self.can_manage)
@@ -92,9 +112,11 @@ class FakeMessage:
         self.reference = reference
         self.type = kind
         self.replies = []
+        self.allowed_mentions = []  # the AllowedMentions of every reply()
 
-    async def reply(self, text, **kwargs):
+    async def reply(self, text, allowed_mentions=None):
         self.replies.append(text)
+        self.allowed_mentions.append(allowed_mentions)
 
 
 class BotTestCase(unittest.IsolatedAsyncioTestCase):
@@ -201,7 +223,7 @@ class ConversationTests(BotTestCase):
         self.assertEqual(system["role"], "system")
         self.assertIn("Re:Zero", system["content"])
         self.assertIn("web_search", system["content"])
-        self.assertEqual(user["content"], '<USER_INPUT name="Alice">\ntell @Bob hi\n</USER_INPUT>')
+        self.assertEqual(user["content"], '<USER_INPUT name="Alice">\ntell @Bob hi\n</USER_INPUT>\n\n' + prompts.REMINDER)
 
     async def test_system_prompt_has_no_search_section_when_search_is_off(self):
         bot = self.make_bot(web_search=False)
@@ -354,6 +376,36 @@ class ConversationTests(BotTestCase):
         # Whoever went second saw the first exchange in its history.
         lengths = sorted(len(call) for call in self.llm.calls)
         self.assertEqual(lengths, [2, 4])
+
+
+class PingTests(BotTestCase):
+    def pinged_ids(self, message):
+        return [user.id for user in message.allowed_mentions[0].users]
+
+    async def test_can_ping_someone_the_message_mentions(self):
+        bot = self.make_bot(llm=FakeLLM(text="@bob, Alice says dinner is ready!"))
+        bob = person("Bob", user_id=555)
+        message = self.msg(self.mention("tell <@555> dinner is ready"), author=person("Alice", 1), mentions=[BOT, bob])
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["<@555>, Alice says dinner is ready!"])
+        self.assertEqual(self.pinged_ids(message), [555])
+        self.assertEqual(self.memory.recent("1")[-1].content, "@bob, Alice says dinner is ready!")  # stored readable
+
+    async def test_can_ping_people_from_the_remembered_conversation(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("I'm Alice"), author=person("Alice", 1)))
+        self.llm.text = "Of course! @Alice, Bob is looking for you."
+        message = self.msg(self.mention("can you get Alice for me?"), author=person("Bob", 2))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Of course! <@1>, Bob is looking for you."])
+        self.assertEqual(self.pinged_ids(message), [1])
+
+    async def test_people_outside_the_conversation_are_never_pinged(self):
+        bot = self.make_bot(llm=FakeLLM(text="Hi @Carol and @Emilia! <@777>"))
+        message = self.msg(self.mention("ping Carol and user 777"))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hi @Carol and @Emilia! <@777>"])
+        self.assertEqual(self.pinged_ids(message), [])
 
 
 class ResetTests(BotTestCase):
