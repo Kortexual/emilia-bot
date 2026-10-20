@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS messages (
     channel_id TEXT NOT NULL,
     role       TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     author     TEXT,
+    author_id  TEXT,
     content    TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -30,6 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
 class StoredMessage:
     role: str  # "user" or "assistant"
     author: str  # speaker's display name (user messages only)
+    author_id: str  # speaker's Discord user ID (user messages only), so people can be told apart and pinged
     content: str
 
 
@@ -45,6 +47,9 @@ class MemoryStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         with self._db:
             self._db.executescript(_SCHEMA)
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
+            if "author_id" not in columns:  # memory.db files from before user IDs were stored
+                self._db.execute("ALTER TABLE messages ADD COLUMN author_id TEXT")
 
     def recent(self, channel_id: str, max_chars: int | None = None) -> list[StoredMessage]:
         """Remembered messages for a channel, oldest first.
@@ -54,14 +59,16 @@ class MemoryStore:
         """
         with self._lock:
             rows = self._db.execute(
-                "SELECT role, author, content FROM ("
-                "  SELECT id, role, author, content FROM messages"
+                "SELECT role, author, author_id, content FROM ("
+                "  SELECT id, role, author, author_id, content FROM messages"
                 "  WHERE channel_id = ? ORDER BY id DESC LIMIT ?"
                 ") ORDER BY id ASC",
                 (channel_id, self._max_messages),
             ).fetchall()
 
-        messages = [StoredMessage(role, author or "", content) for role, author, content in rows]
+        messages = [
+            StoredMessage(role, author or "", author_id or "", content) for role, author, author_id, content in rows
+        ]
         total = sum(len(m.content) for m in messages)
 
         def drop_oldest() -> None:
@@ -76,12 +83,12 @@ class MemoryStore:
                 drop_oldest()
         return messages
 
-    def add_turn(self, channel_id: str, author: str, user_text: str, reply_text: str) -> None:
+    def add_turn(self, channel_id: str, author: str, author_id: str, user_text: str, reply_text: str) -> None:
         """Store one exchange atomically and trim the channel to the newest `max_turns`."""
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO messages (channel_id, role, author, content) VALUES (?, 'user', ?, ?)",
-                (channel_id, author, user_text),
+                "INSERT INTO messages (channel_id, role, author, author_id, content) VALUES (?, 'user', ?, ?, ?)",
+                (channel_id, author, author_id, user_text),
             )
             self._db.execute(
                 "INSERT INTO messages (channel_id, role, author, content) VALUES (?, 'assistant', NULL, ?)",
