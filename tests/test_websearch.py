@@ -109,6 +109,14 @@ class WebSearchToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No web results", result.text)
         self.assertNotIn("unavailable", result.text)
 
+    async def test_braille_in_snippets_is_removed(self):
+        def fake_search(query, max_results):
+            return hits(("Braille patterns", "https://a.example", "Table: \u2801\u2803\u2809 means abc"))
+
+        result = await WebSearchTool(search_fn=fake_search).run({"query": "braille"})
+        self.assertIn("Table: means abc", result.text)
+        self.assertNotRegex(result.text, "[\u2800-\u28ff]")
+
     async def test_only_http_links_are_kept(self):
         def fake_search(query, max_results):
             return hits(

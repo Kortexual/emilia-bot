@@ -30,16 +30,19 @@ import logging
 import re
 import sqlite3
 import sys
+from collections import Counter
+from dataclasses import replace
 from datetime import date
 from typing import Any, Protocol
 
 import discord
 
 import prompts
+import styleguard
 from config import ConfigError, Settings
 from llm import ChatResult, LLMError, LMStudioClient
 from memory import MemoryStore, StoredMessage
-from textutil import clean_reply, sanitize_user_text, split_message
+from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
 from websearch import WebSearchTool, ddgs_installed
 
@@ -47,6 +50,8 @@ log = logging.getLogger("emilia.bot")
 
 CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some headroom
 RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
+FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
+ABOUT_COMMAND = "!about"  # "@Emilia !about I garden and like tea" saves a note about yourself
 
 
 class ChatBackend(Protocol):
@@ -90,6 +95,21 @@ def link_mentions(text: str, people: dict[str, int]) -> tuple[str, list[int]]:
         return f"<@{user_id}>"
 
     return pattern.sub(to_ping, text), pinged
+
+
+_AT_NAME = re.compile(r"(?<![\w<])@(\w[\w'.-]*(?:[ \t]+\w[\w'.-]*){0,2})")
+MAX_MEMBER_LOOKUPS = 3  # per reply: each one may cost a request to Discord
+
+
+def ping_candidates(reply: str) -> list[list[str]]:
+    """For each "@..." in a reply, the names it could stand for, longest first ("@Jack Larpel hi" ->
+    ["Jack Larpel hi", "Jack Larpel", "Jack"]), since the model doesn't mark where a name ends."""
+    groups = []
+    for match in _AT_NAME.finditer(reply):
+        words = match.group(1).split()
+        names = [" ".join(words[:count]).rstrip(".'-") for count in range(len(words), 0, -1)]
+        groups.append([name for name in dict.fromkeys(names) if name])
+    return groups
 
 
 class EmiliaBot(discord.Client):
@@ -171,8 +191,15 @@ class EmiliaBot(discord.Client):
         text = sanitize_user_text(self._render(message), self.settings.max_input_chars)
         key = str(message.channel.id)
 
+        command, _, argument = text.partition(" ")
         if text.lower() in RESET_COMMANDS:
             await self._reset(message, key)
+            return
+        if text.lower() == FORGET_ME_COMMAND:
+            await self._forget_me(message)
+            return
+        if command.lower() == ABOUT_COMMAND:
+            await self._about(message, argument)
             return
         if not text:  # a bare @mention
             await self._send(message, prompts.GREETING)
@@ -184,32 +211,64 @@ class EmiliaBot(discord.Client):
             return
         self._busy.add(user_id)
         try:
-            quote, quoted_author = await self._quoted_context(message)
-            reply, pinged = await self._respond(message, key, quote + text, quoted_author)
+            quoted_body, quoted_author = await self._quoted_context(message)
+            reply, pinged = await self._respond(message, key, text, quoted_body, quoted_author)
         finally:
             self._busy.discard(user_id)
         await self._send(message, reply, pinged)
 
     async def _respond(
-        self, message: discord.Message, key: str, user_text: str, quoted_author: discord.abc.User | None
+        self,
+        message: discord.Message,
+        key: str,
+        text: str,
+        quoted_body: str,
+        quoted_author: discord.abc.User | None,
     ) -> tuple[str, list[int]]:
         """The reply to post, and the IDs of the users it pings."""
-        author = prompts.safe_name(message.author.display_name)
+        people = self._people(message, quoted_author)
+        author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
         async with message.channel.typing():  # keeps "typing..." showing, even while queued
             async with self._channel_lock(key):
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
+                labels = self._labels(history, people)
+                known = await self._remember_people(people, list(labels))
+                author = labels[str(message.author.id)]
+                others = [labels[str(user.id)] for user in people[1:]]
+                quote = ""
+                if quoted_body and quoted_author is not None:
+                    quote = f'(replying to {labels[str(quoted_author.id)]}: "{quoted_body}") '
+                user_text = quote + text
+
+                shown = history
+                if self.settings.forget_standing_instructions:
+                    shown = styleguard.drop_stale_directives(shown)
+                shown = [replace(m, author=labels.get(m.author_id, m.author)) if m.role == "user" else m for m in shown]
+                profiles = await self._profiles(people, labels)
+
                 system_prompt = prompts.build_system_prompt(
                     date.today(),
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
                 )
+                messages = prompts.build_messages(system_prompt, shown, author, user_text, others, profiles)
                 try:
-                    result = await self.llm.chat(prompts.build_messages(system_prompt, history, author, user_text))
+                    result = await self.llm.chat(messages)
+                    reply = clean_reply(result.text, self._speaker_names())
+                    if contains_cipher_script(reply):
+                        # Someone talked the model into writing in braille (or similar). Try once more
+                        # with a nudge; if it still won't write plain text, post a canned line instead.
+                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
+                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
+                        result = await self.llm.chat([*messages[:-1], nudged])
+                        reply = clean_reply(result.text, self._speaker_names())
+                        if contains_cipher_script(reply):
+                            log.warning("Retry was still in braille/cipher script; posting a canned reply")
+                            return prompts.FORMAT_REPLY, []  # not stored, so it can't teach the model the pattern
                 except LLMError as exc:
                     log.error("LM Studio request failed: %s", exc)
                     return prompts.ERROR_REPLY, []
 
-                reply = clean_reply(result.text, self._speaker_names())
                 if not reply:
                     log.warning("The model sent an empty reply")
                     return prompts.EMPTY_REPLY, []
@@ -217,12 +276,20 @@ class EmiliaBot(discord.Client):
                     log.warning("Blocked a reply that repeated the system prompt")
                     return prompts.BLOCKED_REPLY, []
 
+                if self.settings.style_cooldown:
+                    recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
+                    reply = styleguard.cool_down(reply, recent)  # no emoji/flourish may stick from reply to reply
+
                 try:  # stored with plain "@Name"s, the way the model wrote them
-                    await asyncio.to_thread(self.memory.add_turn, key, author, str(message.author.id), user_text, reply)
+                    await asyncio.to_thread(
+                        self.memory.add_turn, key, author_name, str(message.author.id), user_text, reply
+                    )
                 except sqlite3.Error:
                     log.exception("Could not save this exchange to memory")  # still deliver the reply
 
-        reply, pinged = link_mentions(reply, self._pingable(message, history, quoted_author))
+        pingable = self._pingable(labels, known)
+        pingable.update(await self._lookup_members(message, reply, text, pingable))
+        reply, pinged = link_mentions(reply, pingable)
         if result.sources and self.settings.show_sources:
             reply += sources_footer(result.sources)
         return reply, pinged
@@ -236,22 +303,164 @@ class EmiliaBot(discord.Client):
         log.info("Cleared %d remembered messages in channel %s", removed, key)
         await self._send(message, prompts.RESET_DONE)
 
+    async def _about(self, message: discord.Message, argument: str) -> None:
+        """`!about <text>` saves a short note about yourself, `!about` shows it, `!about clear` removes it."""
+        user_id = str(message.author.id)
+        argument = argument.strip()
+        try:
+            if not argument:
+                note = (await asyncio.to_thread(self.memory.abouts, [user_id])).get(user_id, "")
+                await self._send(message, prompts.ABOUT_SHOW.format(text=note) if note else prompts.ABOUT_NONE)
+            elif argument.lower() in {"clear", "reset", "delete", "remove"}:
+                await asyncio.to_thread(self.memory.set_about, user_id, "")
+                await self._send(message, prompts.ABOUT_CLEARED)
+            else:
+                note = prompts.clean_about(argument)
+                await asyncio.to_thread(self.memory.set_about, user_id, note)
+                await self._send(message, prompts.ABOUT_SAVED if note else prompts.ABOUT_NONE)
+        except sqlite3.Error:
+            log.exception("Could not read or save a note for user %s", user_id)
+            await self._send(message, prompts.ERROR_REPLY)
+
+    async def _forget_me(self, message: discord.Message) -> None:
+        await asyncio.to_thread(self.memory.forget_user, str(message.author.id))
+        log.info("Forgot the saved profile of user %s", message.author.id)
+        await self._send(message, prompts.FORGOT_YOU)
+
     # --- helpers -----------------------------------------------------------------
+    def _people(self, message: discord.Message, quoted_author: discord.abc.User | None) -> list[discord.abc.User]:
+        """Everyone involved in this message except the bot: the sender first, then anyone it mentions
+        or replies to, each once."""
+        bot_id = self.user.id if self.user else None
+        people = [message.author]
+        for user in [*message.mentions, quoted_author]:
+            if user is not None and user.id != bot_id and all(user.id != seen.id for seen in people):
+                people.append(user)
+        return people
+
+    @staticmethod
+    def _labels(history: list[StoredMessage], people: list[discord.abc.User]) -> dict[str, str]:
+        """One unambiguous name per person (by user ID) for use in the prompt.
+
+        A person keeps a single name even if they changed it (the newest one wins), and two different
+        people who happen to share a display name get a short ID suffix ("Alex #4821") so the model
+        can never take them for the same person."""
+        names: dict[str, str] = {}
+        for item in history:
+            if item.role == "user" and item.author_id:
+                names[item.author_id] = item.author or "someone"  # newer messages come later and win
+        for user in people:
+            names[str(user.id)] = prompts.safe_name(user.display_name)
+        counts = Counter(name.lower() for name in names.values())
+        return {
+            user_id: name if counts[name.lower()] == 1 else f"{name} #{user_id[-4:]}"
+            for user_id, name in names.items()
+        }
+
+    async def _remember_people(self, people: list[discord.abc.User], ids: list[str]) -> dict[str, list[str]]:
+        """Save the names these people go by, and return every name known for the users in `ids`
+        (user ID -> names): the people in this message and those from the remembered conversation."""
+        entries = []
+        for user in people:
+            names = [
+                ("display", user.display_name),
+                ("username", getattr(user, "name", None)),
+                ("global", getattr(user, "global_name", None)),
+                ("nick", getattr(user, "nick", None)),
+            ]
+            cleaned = [(kind, prompts.safe_name(name, default="")) for kind, name in names if name]
+            entries.append((str(user.id), [(kind, name) for kind, name in cleaned if name]))
+        try:
+            await asyncio.to_thread(self.memory.observe_users, entries)
+            return await asyncio.to_thread(self.memory.aliases, ids)
+        except sqlite3.Error:
+            log.exception("Could not read or save the people directory")  # the reply is still possible
+            return {}
+
+    async def _profiles(self, people: list[discord.abc.User], labels: dict[str, str]) -> dict[str, str]:
+        """Notes the sender and the people they mention wrote about themselves, by prompt name."""
+        ids = [str(user.id) for user in people]
+        try:
+            notes = await asyncio.to_thread(self.memory.abouts, ids)
+        except sqlite3.Error:
+            log.exception("Could not read the people notes")
+            return {}
+        return {labels[user_id]: note for user_id, note in notes.items()}
+
     def _channel_lock(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
         if lock is None:
             lock = self._locks[key] = asyncio.Lock()
         return lock
 
-    def _pingable(
-        self, message: discord.Message, history: list[StoredMessage], quoted_author: discord.abc.User | None
+    async def _lookup_members(
+        self, message: discord.Message, reply: str, typed: str, already: dict[str, int]
     ) -> dict[str, int]:
-        """Everyone the reply may ping, by the name the model knows them by: people who spoke in the
-        remembered conversation, the sender, and anyone the message mentions or replies to."""
-        people = {item.author: int(item.author_id) for item in history if item.role == "user" and item.author_id}
-        for user in [*message.mentions, quoted_author, message.author]:
-            if user is not None and (self.user is None or user.id != self.user.id):
-                people[prompts.safe_name(user.display_name)] = user.id
+        """People the sender asked for by name ("ping Jack") who are in this server but not in the
+        conversation yet. A name is only looked up if the *sender typed it* in this message, so text
+        from the web or from old messages can never make the bot ping someone, and only when it matches
+        exactly one human member."""
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return {}
+        known = {name.lower() for name in already}
+        found: dict[str, int] = {}
+        lookups = 0
+        for names in ping_candidates(reply):
+            for name in names:
+                if name.lower() in known or name.lower() in {n.lower() for n in found}:
+                    break  # this @ is already handled; shorter readings of it would only overlap
+                if not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", typed, re.IGNORECASE):
+                    continue
+                if lookups >= MAX_MEMBER_LOOKUPS:
+                    return found
+                lookups += 1
+                member = await self._find_member(guild, name)
+                if member is not None:
+                    found[name] = member.id
+                    break
+        return found
+
+    async def _find_member(self, guild: discord.Guild, name: str) -> discord.Member | None:
+        """The one human member of `guild` called exactly `name` (nickname, display name, global name
+        or username, ignoring case), or None if there is no such member or the name is ambiguous.
+        Uses the members Discord has already told us about, then Discord's member search (which needs
+        no privileged intent)."""
+        key = name.lower()
+        bot_id = self.user.id if self.user else None
+        candidates = list(getattr(guild, "members", []) or [])
+        search = getattr(guild, "search_members", None)
+        if search is not None:
+            try:
+                candidates += await search(name, limit=25)
+            except (discord.HTTPException, discord.Forbidden):
+                log.info("Member search for %r was refused or failed", name)
+        matches = {}
+        for member in candidates:
+            if getattr(member, "bot", False) or member.id == bot_id:
+                continue
+            names = (member.display_name, getattr(member, "name", None), getattr(member, "global_name", None), getattr(member, "nick", None))
+            if key in {n.lower() for n in names if n}:
+                matches[member.id] = member
+        return next(iter(matches.values())) if len(matches) == 1 else None
+
+    @staticmethod
+    def _pingable(labels: dict[str, str], known: dict[str, list[str]]) -> dict[str, int]:
+        """Everyone the reply may ping, by every name the model might use for them: the name shown in
+        the prompt, plus their username and earlier names (when those point to one person only). Only
+        people in this conversation are included: the sender, anyone the message mentions or replies to,
+        and people who spoke in the remembered conversation."""
+        owners: dict[str, set[str]] = {}
+        for user_id, names in known.items():
+            for name in names:
+                owners.setdefault(name.lower(), set()).add(user_id)
+        people = {
+            name: int(user_id)
+            for user_id, names in known.items()
+            for name in names
+            if owners[name.lower()] == {user_id}
+        }
+        people.update({label: int(user_id) for user_id, label in labels.items()})  # the shown name always wins
         return people
 
     def _speaker_names(self) -> tuple[str, ...]:
@@ -271,8 +480,8 @@ class EmiliaBot(discord.Client):
         return re.sub(r"<a?:(\w+):\d+>", r":\1:", text)  # custom emoji -> :name:
 
     async def _quoted_context(self, message: discord.Message) -> tuple[str, discord.abc.User | None]:
-        """If this is a reply to someone else's message, include what it said (and who said it), so
-        that '@Emilia is this true?' makes sense. Our own earlier messages are already in memory."""
+        """If this is a reply to someone else's message, what it said and who said it, so that
+        '@Emilia is this true?' makes sense. Our own earlier messages are already in memory."""
         ref = message.reference
         if ref is None or ref.message_id is None:
             return "", None
@@ -289,7 +498,7 @@ class EmiliaBot(discord.Client):
         body = sanitize_user_text(self._render(quoted), 300).replace('"', "'")
         if not body:
             return "", None
-        return f'(replying to {prompts.safe_name(quoted.author.display_name)}: "{body}") ', quoted.author
+        return body, quoted.author
 
     async def _send(self, message: discord.Message, text: str, pinged: list[int] | None = None) -> None:
         """Reply to the message, spilling over into follow-up messages if it is long.

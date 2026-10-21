@@ -86,7 +86,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Re:Zero", request1["messages"][0]["content"])
         self.assertEqual(
             request1["messages"][1]["content"],
-            '<USER_INPUT name="Alice">\nwhat\'s the weather in Atlanta today?\n</USER_INPUT>\n\n' + prompts.REMINDER,
+            '<USER_INPUT name="Alice">\nwhat\'s the weather in Atlanta today?\n</USER_INPUT>\n\n' + prompts.reminder_for("Alice"),
         )
         self.assertEqual(request1["tools"][0]["function"]["name"], "web_search")
         roles = [m["role"] for m in request2["messages"]]

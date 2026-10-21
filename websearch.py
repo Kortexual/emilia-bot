@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from textutil import strip_reserved_tags
+from textutil import strip_cipher_script, strip_reserved_tags
 from tooling import ToolResult
 
 log = logging.getLogger("emilia.search")
@@ -77,7 +77,7 @@ def search_sync(query: str, max_results: int) -> list[SearchHit]:
 def _clean(text: str, limit: int) -> str:
     """Search snippets are untrusted web text: drop markup and forged prompt tags, then shorten."""
     text = re.sub(r"<[^>]+>", " ", html.unescape(text))
-    text = " ".join(strip_reserved_tags(text).split())
+    text = " ".join(strip_reserved_tags(strip_cipher_script(text)).split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 

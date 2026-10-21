@@ -24,6 +24,56 @@ import unittest
 from memory import MemoryStore
 
 
+class PeopleDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        self.store = MemoryStore(":memory:", max_turns=3)
+        self.addCleanup(self.store.close)
+
+    def test_names_are_collected_per_user_and_deduplicated_ignoring_case(self):
+        self.store.observe_users([("1", [("display", "Bob"), ("username", "bobby_99"), ("global", "")])])
+        self.store.observe_users([("1", [("display", "bob"), ("nick", "Robert")])])
+        names = self.store.aliases(["1"])["1"]
+        self.assertEqual(sorted(n.lower() for n in names), ["bob", "bobby_99", "robert"])
+        self.assertEqual(self.store.aliases(["2"]), {})
+
+    def test_only_the_newest_names_are_kept(self):
+        for i in range(20):
+            self.store.observe_users([("1", [("display", f"name{i:02d}")])])
+        names = self.store.aliases(["1"])["1"]
+        self.assertEqual(len(names), 12)
+        self.assertIn("name19", names)
+        self.assertNotIn("name00", names)
+
+    def test_a_note_can_be_saved_replaced_and_removed(self):
+        self.assertEqual(self.store.abouts(["1"]), {})
+        self.store.set_about("1", "gardener")
+        self.store.set_about("2", "likes tea")
+        self.assertEqual(self.store.abouts(["1", "2", "3"]), {"1": "gardener", "2": "likes tea"})
+        self.store.set_about("1", "")
+        self.assertEqual(self.store.abouts(["1"]), {})
+
+    def test_forgetting_a_user_removes_their_profile_and_detaches_their_messages(self):
+        self.store.observe_users([("1", [("display", "Alice")]), ("2", [("display", "Bob")])])
+        self.store.set_about("1", "gardener")
+        self.store.add_turn("c1", "Alice", "1", "hi", "hello")
+        self.store.add_turn("c1", "Bob", "2", "hey", "hello Bob")
+        self.assertTrue(self.store.forget_user("1"))
+        self.assertEqual(self.store.aliases(["1"]), {})
+        self.assertEqual(self.store.abouts(["1"]), {})
+        users = [(m.author, m.author_id) for m in self.store.recent("c1") if m.role == "user"]
+        self.assertEqual(users, [("someone", ""), ("Bob", "2")])
+        self.assertEqual(self.store.aliases(["2"])["2"], ["Bob"])  # others are untouched
+        self.assertFalse(self.store.forget_user("1"))  # nothing left to remove
+
+    def test_last_replies(self):
+        for i in range(4):
+            self.store.add_turn("c1", "A", "1", f"q{i}", f"a{i}")
+        self.store.add_turn("c2", "A", "1", "other", "elsewhere")
+        self.assertEqual(self.store.last_replies("c1", 2), ["a2", "a3"])
+        self.assertEqual(self.store.last_replies("c1", 0), [])
+        self.assertEqual(self.store.last_replies("nobody", 3), [])
+
+
 class MemoryStoreTests(unittest.TestCase):
     def setUp(self):
         self.store = MemoryStore(":memory:", max_turns=3)
