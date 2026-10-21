@@ -27,9 +27,19 @@ import re
 #
 # (The original sanitize() used `c not in "\x00-\x1f\x7f"`, which is a *substring* test, not a
 # range: it deleted every "-" from messages and let most control characters through.)
+#
+# U+2800 (blank braille pattern) and the Hangul fillers render as nothing but are ordinary characters
+# to a regex, so they are the usual way to fake an empty or look-alike display name.
 _INVISIBLE = re.compile(
-    r"[\x00-\x08\x0b-\x1f\x7f\u200b\u2060\ufeff\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f]"
+    r"[\x00-\x08\x0b-\x1f\x7f\u200b\u2060\ufeff\u202a-\u202e\u2066-\u2069"
+    r"\u2800\u115f\u1160\u3164\uffa0\U000e0000-\U000e007f]"
 )
+
+# Braille patterns (U+2800-U+28FF). Not needed for a chat persona, but a favourite way to smuggle
+# text past a model: instructions written in braille, or a reply the humans in the channel can't
+# read. They are stripped from everything that goes *into* the prompt, and a reply that is mostly
+# braille is rejected (see contains_cipher_script). To block more scripts later, add ranges here.
+_CIPHER_SCRIPT = re.compile(r"[\u2800-\u28ff]")
 
 # Tags the prompt format relies on. Users (and web pages) must not be able to forge them.
 _RESERVED_TAGS = re.compile(r"</?\s*(?:USER_INPUT|SYSTEM_PROMPT)\b[^>]*>", re.IGNORECASE)
@@ -59,6 +69,10 @@ def strip_reserved_tags(text: str) -> str:
     return _RESERVED_TAGS.sub("", text)
 
 
+def strip_cipher_script(text: str) -> str:
+    return _CIPHER_SCRIPT.sub("", text)
+
+
 def sanitize_user_text(text: str, max_chars: int = 2048) -> str:
     """Make untrusted chat text safe to put in a prompt.
 
@@ -66,7 +80,7 @@ def sanitize_user_text(text: str, max_chars: int = 2048) -> str:
     line (keeping indentation, so pasted code survives) and caps the length.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = strip_reserved_tags(strip_invisible(text))
+    text = strip_reserved_tags(strip_cipher_script(strip_invisible(text)))
 
     lines = []
     for line in text.split("\n"):
@@ -95,12 +109,18 @@ def strip_tool_markup(text: str) -> str:
 
 def clean_reply(text: str, speaker_names: tuple[str, ...] = ()) -> str:
     """Tidy a model reply before it is posted or stored."""
-    text = strip_reserved_tags(strip_tool_markup(strip_reasoning(text)))
+    text = strip_invisible(strip_reserved_tags(strip_tool_markup(strip_reasoning(text))))  # no hidden text
     text = _MASKED_LINK.sub(r"\1 (<\2>)", text)  # show the real URL; <> also stops a big link preview
     for name in filter(None, speaker_names):
         # Models sometimes imitate the "Name: message" layout of the chat history.
         text = re.sub(rf"^\s*{re.escape(name)}\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
     return text.strip()
+
+
+def contains_cipher_script(text: str, minimum: int = 3) -> bool:
+    """True if a reply uses braille (or another blocked script) in earnest. Stray single characters
+    are ignored; three or more means the model was talked into writing in it."""
+    return len(_CIPHER_SCRIPT.findall(text)) >= minimum
 
 
 _WORD = re.compile(r"[a-z0-9']+")

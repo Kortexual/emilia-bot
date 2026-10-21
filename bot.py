@@ -39,7 +39,7 @@ import prompts
 from config import ConfigError, Settings
 from llm import ChatResult, LLMError, LMStudioClient
 from memory import MemoryStore, StoredMessage
-from textutil import clean_reply, sanitize_user_text, split_message
+from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
 from websearch import WebSearchTool, ddgs_installed
 
@@ -203,13 +203,26 @@ class EmiliaBot(discord.Client):
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
                 )
+                messages = prompts.build_messages(
+                    system_prompt, history, author, user_text, self._others(message, quoted_author)
+                )
                 try:
-                    result = await self.llm.chat(prompts.build_messages(system_prompt, history, author, user_text))
+                    result = await self.llm.chat(messages)
+                    reply = clean_reply(result.text, self._speaker_names())
+                    if contains_cipher_script(reply):
+                        # Someone talked the model into writing in braille (or similar). Try once more
+                        # with a nudge; if it still won't write plain text, post a canned line instead.
+                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
+                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
+                        result = await self.llm.chat([*messages[:-1], nudged])
+                        reply = clean_reply(result.text, self._speaker_names())
+                        if contains_cipher_script(reply):
+                            log.warning("Retry was still in braille/cipher script; posting a canned reply")
+                            return prompts.FORMAT_REPLY, []  # not stored, so it can't teach the model the pattern
                 except LLMError as exc:
                     log.error("LM Studio request failed: %s", exc)
                     return prompts.ERROR_REPLY, []
 
-                reply = clean_reply(result.text, self._speaker_names())
                 if not reply:
                     log.warning("The model sent an empty reply")
                     return prompts.EMPTY_REPLY, []
@@ -253,6 +266,19 @@ class EmiliaBot(discord.Client):
             if user is not None and (self.user is None or user.id != self.user.id):
                 people[prompts.safe_name(user.display_name)] = user.id
         return people
+
+    def _others(self, message: discord.Message, quoted_author: discord.abc.User | None) -> list[str]:
+        """Names of the other people the message mentions or replies to (not the bot, not the sender),
+        so the prompt can say plainly that they are not the one who wrote it."""
+        skip = {message.author.id, self.user.id if self.user else None}
+        names: list[str] = []
+        for user in [*message.mentions, quoted_author]:
+            if user is None or user.id in skip:
+                continue
+            name = prompts.safe_name(user.display_name)
+            if name not in names:
+                names.append(name)
+        return names
 
     def _speaker_names(self) -> tuple[str, ...]:
         return (prompts.PERSONA_NAME, self.user.display_name if self.user else "")
