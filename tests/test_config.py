@@ -39,6 +39,13 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(s.respond_to_dms)
         self.assertTrue(s.web_search)
         self.assertEqual(s.memory_turns, 10)
+        self.assertEqual(s.style_cooldown, 4)
+        self.assertTrue(s.forget_standing_instructions)
+
+    def test_style_settings(self):
+        s = load(DISCORD_TOKEN="a", STYLE_COOLDOWN="0", FORGET_STANDING_INSTRUCTIONS="no")
+        self.assertEqual(s.style_cooldown, 0)
+        self.assertFalse(s.forget_standing_instructions)
 
     def test_token_is_required(self):
         with self.assertRaises(ConfigError):
@@ -84,6 +91,7 @@ class SettingsTests(unittest.TestCase):
             {"MEMORY_TURNS": "0"},
             {"LOG_LEVEL": "LOUD"},
             {"LMSTUDIO_TEMPERATURE": "-1"},
+            {"STYLE_COOLDOWN": "-1"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

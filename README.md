@@ -42,8 +42,13 @@ Everything stays on your machine, apart from the web searches the model chooses 
 
 - `@Emilia what's the capital of Australia?` (mention the bot *user*; `@everyone` and role pings are ignored)
 - Reply to someone's message and mention the bot, e.g. `@Emilia is this true?`: the message you replied to is included as context.
-- `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can only ping people who are part of the conversation (the sender, people mentioned or replied to, and people in her memory of the channel).
+- `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can ping the sender, people mentioned or replied to,
+  and people in her memory of the channel. She can also ping someone in the server who is not in the conversation yet if **you type
+  their name** in your message: `@Emilia ping Jack, dinner is ready` (see "Pinging" below).
 - `@Emilia !forget` (or `!reset`) clears the memory of that channel. It needs the *Manage Messages* permission; in a DM anyone can do it.
+- `@Emilia !about I garden and like tea` saves a short note about **yourself** (up to 160 characters). `!about` shows it and
+  `!about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
+- `@Emilia !forgetme` deletes the note and the names saved about you.
 - DMs are ignored unless you set `RESPOND_TO_DMS=true`.
 
 ## How it works
@@ -53,6 +58,14 @@ Everything stays on your machine, apart from the web searches the model chooses 
 and mention the bot (a reply that pings the bot counts). Anything else is dropped before any work is done.
 Replies can never ping `@everyone` or roles, whatever the model writes. When the model writes `@Name` for someone in the
 conversation, `link_mentions` in `bot.py` turns it into a real ping for that user only; any other name stays plain text.
+
+### Pinging
+When the model writes `@Name`, `link_mentions` turns it into a real ping if the name belongs to someone in the conversation (by their
+prompt name, username or an earlier name). If it doesn't, and the **sender typed that name in their own message**, the bot looks for
+exactly one human member of the server with that name (nickname, display name, global name or username, ignoring case) using the cached
+members and Discord's member search, which needs no privileged intent. Prefix matches, bots, ambiguous names, DMs and failed searches
+all leave the name as plain text, and at most 3 names are looked up per reply. Because the name must come from the sender, text from
+the web or from old messages can't make the bot ping anyone. Pings can never reach `@everyone` or roles.
 
 ### Web search
 LM Studio has no built-in search. What its OpenAI-compatible API offers is **tool calling**: the bot describes a
@@ -85,6 +98,37 @@ It keeps the last `MEMORY_TURNS` exchanges and sends as many as fit in `MEMORY_M
 - It is a window, not a permanent record: older exchanges drop off. Raise the limits if your model's context allows.
 - `@Emilia !forget` clears one channel; deleting `memory.db` clears everything.
 
+### People
+Next to the conversation, `memory.db` keeps a small directory of the people involved in messages to the bot: their Discord
+user ID, the names they have been seen under (server nickname or display name, username, global name; the newest 12) and the
+optional note they wrote with `!about`. It is used for three things:
+
+- **One name per person.** In the prompt every person has a single name, even if they change it, and two different people with
+  the same display name become `Alex #4821` and `Alex #1337` (the last digits of their ID), so the model can't mistake one for the other.
+- **Pings by any name.** `@Name` in a reply pings the right person when it uses their prompt name, their username or an earlier name
+  (unless that name could mean two people, in which case nobody is pinged).
+- **Notes people wrote about themselves**, shown to the model as untrusted information, never as instructions.
+
+Nothing is written by the model: notes are only ever set by the person they describe. The directory is shared by all channels and
+servers the bot is in. `!forgetme` removes a person's entry and detaches their stored messages; the text of those messages stays
+until it ages out or the channel is cleared.
+
+### Keeping habits from sticking
+Models copy their own earlier replies and keep following rules that are still in the remembered conversation. So a single
+"end every message with a paw print" (or "reply in braille from now on") could last for the whole memory window. `styleguard.py`
+limits that without looking for specific tricks:
+
+- **Cooldown** (`STYLE_COOLDOWN`, default 4): an emoji, or a trailing `~`, that appeared in one of the bot's last replies is removed from
+  the next one. A flourish can show up now and then, but not in every message.
+- **Expiry** (`FORGET_STANDING_INSTRUCTIONS`, default on): a message that sets a rule meant to last ("from now on...", "every message...",
+  "when you reply to...") is shown to the model for one more exchange and then left out of its prompt. The bot's own "I'll do that next
+  time" reply is treated the same. Nothing is deleted from `memory.db`, and the check is a rough wording heuristic: it will also drop an
+  occasional harmless message such as "I always say hi to my cat, so reply warmly".
+- Replies written in braille are rejected (the bot retries once, then posts a canned line) and braille is stripped from everything that
+  goes into the prompt.
+
+Verbal habits (a pet phrase, a sign-off sentence) are not removed automatically; the prompt asks the model not to repeat itself.
+
 ## Configuration
 
 All settings are environment variables (or lines in `.env`).
@@ -105,6 +149,8 @@ All settings are environment variables (or lines in `.env`).
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |
 | `MEMORY_MAX_CHARS` | `6000` | Cap on remembered text sent per request |
+| `STYLE_COOLDOWN` | `4` | An emoji or `~` used in one of the last N replies is removed from the next (`0` = off) |
+| `FORGET_STANDING_INSTRUCTIONS` | `true` | Leave "from now on..." rules out of the prompt after one more exchange |
 | `MAX_INPUT_CHARS` | `2048` | Longest message accepted |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 
@@ -116,7 +162,8 @@ To change the character, edit `PERSONA` in `prompts.py`.
 bot.py        Discord side: the mention rule, replies, memory use, !forget
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
-memory.py     SQLite conversation memory
+memory.py     SQLite conversation memory and the people directory
+styleguard.py cooldown for emoji tics, expiry of standing instructions
 prompts.py    persona, rules and canned replies
 textutil.py   input sanitising, reply cleanup, message splitting
 config.py     settings from .env

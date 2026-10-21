@@ -88,6 +88,10 @@ class Settings:
     memory_turns: int = 10  # exchanges (user + bot) remembered per channel
     memory_max_chars: int = 6000  # cap on how much memory is sent to the model per request
 
+    # Keeping habits from sticking (see styleguard.py)
+    style_cooldown: int = 4  # an emoji (or "~") used in one of the last N replies is removed from the next; 0 = off
+    forget_standing_instructions: bool = True  # leave "from now on..." rules out of the prompt after one exchange
+
     max_input_chars: int = 2048
     log_level: str = "INFO"
 
@@ -127,6 +131,8 @@ class Settings:
             memory_db=_text("MEMORY_DB") or cls.memory_db,
             memory_turns=_number("MEMORY_TURNS", cls.memory_turns, int, minimum=1),
             memory_max_chars=_number("MEMORY_MAX_CHARS", cls.memory_max_chars, int, minimum=200),
+            style_cooldown=_number("STYLE_COOLDOWN", cls.style_cooldown, int, minimum=0),
+            forget_standing_instructions=_flag("FORGET_STANDING_INSTRUCTIONS", cls.forget_standing_instructions),
             max_input_chars=_number("MAX_INPUT_CHARS", cls.max_input_chars, int, minimum=50),
             log_level=level,
         )

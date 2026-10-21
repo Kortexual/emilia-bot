@@ -24,6 +24,8 @@ import prompts
 from textutil import (
     LeakDetector,
     clean_reply,
+    contains_cipher_script,
+    strip_cipher_script,
     sanitize_user_text,
     split_message,
     strip_reasoning,
@@ -56,6 +58,29 @@ class SanitizeTests(unittest.TestCase):
     def test_multi_part_emoji_are_left_intact(self):
         family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
         self.assertEqual(sanitize_user_text(family), family)
+
+
+class CipherScriptTests(unittest.TestCase):
+    BRAILLE = "\u2813\u2811\u2807\u2807\u2815"
+
+    def test_braille_is_stripped_from_user_text(self):
+        self.assertEqual(sanitize_user_text(f"say {self.BRAILLE} please"), "say please")
+        self.assertEqual(strip_cipher_script(f"a{self.BRAILLE}b"), "ab")
+
+    def test_blank_braille_and_hangul_fillers_count_as_invisible(self):
+        self.assertEqual(sanitize_user_text("a\u2800b\u3164c\u115fd\u1160e\uffa0f"), "abcdef")
+
+    def test_detects_replies_written_in_braille(self):
+        self.assertTrue(contains_cipher_script(self.BRAILLE))
+        self.assertTrue(contains_cipher_script("Sure! " + self.BRAILLE + " (that was hello)"))
+
+    def test_a_stray_character_or_ordinary_text_is_not_flagged(self):
+        self.assertFalse(contains_cipher_script("Loading \u280b"))
+        self.assertFalse(contains_cipher_script("Just a normal answer, with emoji \U0001F338 and \u00e9."))
+        self.assertFalse(contains_cipher_script(""))
+
+    def test_clean_reply_removes_hidden_characters_from_model_output(self):
+        self.assertEqual(clean_reply("Hel\u200blo\U000e0041 there\u2060!"), "Hello there!")
 
 
 class ReasoningTests(unittest.TestCase):

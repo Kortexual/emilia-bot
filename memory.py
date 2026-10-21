@@ -22,14 +22,17 @@ LLMs are stateless: "memory" means re-sending recent messages with every request
 few exchanges per channel on disk so they survive restarts, and cap how much is sent back so a small
 context window isn't overflowed.
 
-Only messages addressed to the bot (and its replies) are stored.
+Only messages addressed to the bot (and its replies) are stored, plus a small directory of the people
+involved in them: user ID, the names they were seen under, and an optional note they wrote themselves.
 """
 from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -42,7 +45,26 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
+
+-- Who people are: one row per Discord user ID, the names they have been seen under, and an optional
+-- note they wrote about themselves with "!about".
+CREATE TABLE IF NOT EXISTS users (
+    user_id    TEXT PRIMARY KEY,
+    about      TEXT NOT NULL DEFAULT '',
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_aliases (
+    user_id   TEXT NOT NULL,
+    alias_key TEXT NOT NULL,   -- lower-case, so "Bob" and "bob" are one alias
+    alias     TEXT NOT NULL,
+    kind      TEXT NOT NULL,   -- display (nickname or display name), username, global or nick
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (user_id, alias_key)
+);
 """
+
+MAX_ALIASES_PER_USER = 12  # the newest names are kept; Discord names change, old ones go stale
 
 
 @dataclass(frozen=True)
@@ -117,6 +139,88 @@ class MemoryStore:
                 "  SELECT id FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?)",
                 (channel_id, channel_id, self._max_messages),
             )
+
+    def last_replies(self, channel_id: str, count: int) -> list[str]:
+        """The bot's own last `count` replies in a channel, oldest first."""
+        if count <= 0:
+            return []
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT content FROM messages WHERE channel_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT ?",
+                (channel_id, count),
+            ).fetchall()
+        return [row[0] for row in reversed(rows)]
+
+    # --- people ------------------------------------------------------------------
+    def observe_users(self, people: Sequence[tuple[str, Sequence[tuple[str, str]]]]) -> None:
+        """Record who was involved in a message: (user_id, [(kind, name), ...]) for each person."""
+        now = time.time()
+        with self._lock, self._db:
+            for user_id, names in people:
+                self._db.execute(
+                    "INSERT INTO users (user_id, first_seen, last_seen) VALUES (?, ?, ?)"
+                    " ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen",
+                    (user_id, now, now),
+                )
+                for kind, name in names:
+                    name = name.strip()
+                    if not name:
+                        continue
+                    self._db.execute(
+                        "INSERT INTO user_aliases (user_id, alias_key, alias, kind, last_seen) VALUES (?, ?, ?, ?, ?)"
+                        " ON CONFLICT(user_id, alias_key) DO UPDATE SET"
+                        " alias = excluded.alias, kind = excluded.kind, last_seen = excluded.last_seen",
+                        (user_id, name.lower(), name, kind, now),
+                    )
+                self._db.execute(
+                    "DELETE FROM user_aliases WHERE user_id = ? AND alias_key NOT IN ("
+                    "  SELECT alias_key FROM user_aliases WHERE user_id = ? ORDER BY last_seen DESC, alias_key LIMIT ?)",
+                    (user_id, user_id, MAX_ALIASES_PER_USER),
+                )
+
+    def aliases(self, user_ids: Sequence[str]) -> dict[str, list[str]]:
+        """Every name known for each of the given users, newest first."""
+        found: dict[str, list[str]] = {}
+        with self._lock:
+            for user_id in user_ids:
+                rows = self._db.execute(
+                    "SELECT alias FROM user_aliases WHERE user_id = ? ORDER BY last_seen DESC, alias_key", (user_id,)
+                ).fetchall()
+                if rows:
+                    found[user_id] = [row[0] for row in rows]
+        return found
+
+    def set_about(self, user_id: str, text: str) -> None:
+        """Save (or, with an empty string, remove) the note a person wrote about themselves."""
+        now = time.time()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO users (user_id, about, first_seen, last_seen) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(user_id) DO UPDATE SET about = excluded.about, last_seen = excluded.last_seen",
+                (user_id, text, now, now),
+            )
+
+    def abouts(self, user_ids: Sequence[str]) -> dict[str, str]:
+        """The notes people wrote about themselves, for those who have one."""
+        found: dict[str, str] = {}
+        with self._lock:
+            for user_id in user_ids:
+                row = self._db.execute("SELECT about FROM users WHERE user_id = ?", (user_id,)).fetchone()
+                if row and row[0]:
+                    found[user_id] = row[0]
+        return found
+
+    def forget_user(self, user_id: str) -> bool:
+        """Delete a person's note and saved names, and detach them from the stored messages (the text of
+        those messages stays until it ages out of the window or the channel is cleared). True if anything
+        was removed."""
+        with self._lock, self._db:
+            removed = self._db.execute("DELETE FROM users WHERE user_id = ?", (user_id,)).rowcount
+            removed += self._db.execute("DELETE FROM user_aliases WHERE user_id = ?", (user_id,)).rowcount
+            removed += self._db.execute(
+                "UPDATE messages SET author = 'someone', author_id = NULL WHERE author_id = ?", (user_id,)
+            ).rowcount
+        return removed > 0
 
     def clear(self, channel_id: str) -> int:
         """Forget a channel. Returns how many messages were removed."""
