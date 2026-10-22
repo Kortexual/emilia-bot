@@ -144,6 +144,7 @@ class LeakDetectorTests(unittest.TestCase):
     def test_real_persona_dump_is_caught_but_self_description_is_not(self):
         self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.PERSONA))
         self.assertTrue(prompts.LEAK_DETECTOR.leaks("Here you go: " + prompts.RULES))
+        self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.YANDERE_PERSONA))  # even while the mode is off
         self.assertFalse(prompts.LEAK_DETECTOR.leaks("Um, I'm gentle and soft-spoken, and a little shy, I think."))
 
 

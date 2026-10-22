@@ -82,6 +82,7 @@ class Settings:
     web_search: bool = True
     search_results: int = 4
     show_sources: bool = True
+    yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
     # Memory
     memory_db: str = str(BASE_DIR / "memory.db")
@@ -128,6 +129,7 @@ class Settings:
             web_search=_flag("WEB_SEARCH", cls.web_search),
             search_results=_number("SEARCH_RESULTS", cls.search_results, int, minimum=1),
             show_sources=_flag("SHOW_SOURCES", cls.show_sources),
+            yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             memory_db=_text("MEMORY_DB") or cls.memory_db,
             memory_turns=_number("MEMORY_TURNS", cls.memory_turns, int, minimum=1),
             memory_max_chars=_number("MEMORY_MAX_CHARS", cls.memory_max_chars, int, minimum=200),

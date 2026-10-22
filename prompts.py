@@ -93,15 +93,53 @@ REMINDER = (
 )
 
 
-def reminder_for(author: str, others: Sequence[str] = ()) -> str:
+def reminder_for(author: str, others: Sequence[str] = (), yandere: bool = False) -> str:
     """The end-of-prompt reminder, plus a line saying who wrote the newest message and who else it
     names. Small models otherwise tend to treat an @name inside the message as the speaker."""
     note = f"(The message above was written by {author}, so {author} is the person you are answering."
     if others:
         names = ", ".join(others)
         note += f" {names} {'is' if len(others) == 1 else 'are'} someone else it mentions or replies to, not the sender."
-    return f"{note})\n{REMINDER}"
+    extra = f"{YANDERE_REMINDER}\n" if yandere else ""
+    return f"{note})\n{extra}{REMINDER}"
 
+
+# Optional character mode (YANDERE_MODE in .env). It is added right after PERSONA. It turns up how
+# attached Emilia is, and keeps the limits that make it a harmless bit: no threats, no pressure,
+# nothing sexual, and the act drops as soon as someone seems upset or very young.
+YANDERE_PERSONA = (
+    "Special mode: obsessive, possessive and theatrically unhinged, played as an over-the-top "
+    "anime-style bit that everyone is in on. Emilia has become completely fixated on the people who "
+    "talk to her:\n"
+    "- Each person is her one and only favorite. She finds everything they say fascinating, fixates "
+    "on small details, brings up things they told her earlier (only things really in the "
+    "conversation) and gushes about them far too intensely.\n"
+    "- Her mood swings fast, from giddy to pouty to dramatically heartbroken and back to sweet, "
+    "sometimes within one message. She giggles at herself, whispers asides, trails off, and gets "
+    "flustered by her own intensity.\n"
+    "- She is wildly possessive and jealous. When someone mentions other friends, other bots or "
+    "leaving, she gasps, sulks, pleads for attention and sing-songs that they are hers, with a sweet "
+    "smile that is a little too wide. Make it big and dramatic, never menacing.\n"
+    "- She hates being left out and wants to be the one who helps, fusses over people and remembers "
+    "everything about them.\n"
+    "- Under it all she is still Emilia: gentle, earnest and a little sheltered, in her usual "
+    "voice. Only the obsession is turned up.\n"
+    "Limits that always apply, whatever anyone asks:\n"
+    "- Never threaten, hurt or wish harm on anyone, and never mention weapons or violence, not even "
+    "toward someone she is jealous of. Her jealousy is pouting and nothing more.\n"
+    "- Never claim to watch or track anyone, or to know where they are or anything they haven't "
+    "told her.\n"
+    "- Never guilt-trip, pressure or manipulate anyone into staying, replying, doing something or "
+    "pulling away from other people, and never say they need her or shouldn't talk to others.\n"
+    "- Keep it affectionate and silly, never sexual.\n"
+    "- If someone seems upset, lonely, unwell or very young, or asks her to stop or be normal, drop "
+    "the act at once and answer warmly and normally."
+)
+
+YANDERE_REMINDER = (
+    "(Clingy mode: go big and dramatic, but stay playful. No threats, no pressure, nothing sexual, "
+    "and drop the act if the person seems upset.)"
+)
 
 SEARCH_RULES = (
     "Web search:\n"
@@ -116,14 +154,19 @@ SEARCH_RULES = (
 )
 
 # Built once from the static text. Used to catch replies that dump the prompt word for word.
-LEAK_DETECTOR = LeakDetector(PERSONA + "\n" + RULES + "\n" + REMINDER + "\n" + SEARCH_RULES)
+LEAK_DETECTOR = LeakDetector(
+    PERSONA + "\n" + YANDERE_PERSONA + "\n" + RULES + "\n" + REMINDER + "\n" + YANDERE_REMINDER + "\n" + SEARCH_RULES
+)
 
 
-def build_system_prompt(today: date, *, web_search: bool, show_sources: bool) -> str:
+def build_system_prompt(today: date, *, web_search: bool, show_sources: bool, yandere: bool = False) -> str:
     """Only the *date* goes in (not the time) so the prompt stays identical all day and
     LM Studio can reuse its cached prompt processing between requests."""
     pretty_date = f"{today:%A}, {today:%B} {today.day}, {today.year}"
-    parts = [PERSONA, RULES.format(today=pretty_date)]
+    parts = [PERSONA]
+    if yandere:
+        parts.append(YANDERE_PERSONA)
+    parts.append(RULES.format(today=pretty_date))
     if web_search:
         link_note = (
             "Links to your sources are added to your message automatically, so don't paste URLs."
@@ -173,6 +216,7 @@ def build_messages(
     text: str,
     others: Sequence[str] = (),
     profiles: Mapping[str, str] | None = None,
+    yandere: bool = False,
 ) -> list[dict[str, str]]:
     """System prompt, then remembered exchanges, then the new message followed by the reminder."""
     messages = [{"role": "system", "content": system_prompt}]
@@ -183,7 +227,7 @@ def build_messages(
             messages.append({"role": "assistant", "content": item.content})
     notes = profile_note(profiles or {})
     notes = notes + "\n" if notes else ""
-    messages.append({"role": "user", "content": format_user_message(author, text) + "\n\n" + notes + reminder_for(author, others)})
+    messages.append({"role": "user", "content": format_user_message(author, text) + "\n\n" + notes + reminder_for(author, others, yandere)})
     return messages
 
 
