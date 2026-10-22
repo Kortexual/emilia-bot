@@ -857,6 +857,58 @@ class PingCandidateTests(unittest.TestCase):
         self.assertEqual(ping_candidates("mail me at a@b.com or <@123>"), [])
 
 
+class OccasionalEmojiTests(BotTestCase):
+    async def test_the_prompt_allows_an_occasional_emoji_without_naming_one(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hello")))
+        system, final = self.llm.calls[0][0]["content"], self.llm.calls[0][-1]["content"]
+        self.assertIn("you add a small emoji. Never in every message.", prompts.PERSONA)
+        self.assertIn("Your occasional emoji are fine.", system)  # the 'don't repeat yourself' rule leaves them alone
+        self.assertNotIn("\U0001F338", system)  # no particular emoji is prescribed
+        self.assertNotIn("Always write in ordinary language", system)
+        self.assertNotIn("plain written text", final)
+
+    async def test_any_emoji_reaches_chat_untouched_when_the_cooldown_is_off(self):
+        for emoji in ("\U0001F338", "\U0001F60A", "\U0001F633"):
+            bot = self.make_bot(llm=FakeLLM(text=f"Nice to see you! {emoji}"), style_cooldown=0)
+            message = self.msg(self.mention("hi"))
+            await bot.on_message(message)
+            self.assertEqual(message.replies, [f"Nice to see you! {emoji}"])
+
+
+class YandereModeTests(BotTestCase):
+    async def first_request(self, **settings):
+        bot = self.make_bot(**settings)
+        await bot.on_message(self.msg(self.mention("hello")))
+        return self.llm.calls[0]
+
+    async def test_it_is_off_by_default(self):
+        call = await self.first_request()
+        self.assertNotIn(prompts.YANDERE_PERSONA, call[0]["content"])
+        self.assertNotIn(prompts.YANDERE_REMINDER, call[-1]["content"])
+
+    async def test_it_adds_the_mode_and_a_reminder_when_switched_on(self):
+        call = await self.first_request(yandere_mode=True)
+        system = call[0]["content"]
+        self.assertIn(prompts.YANDERE_PERSONA, system)
+        self.assertLess(system.index(prompts.PERSONA), system.index(prompts.YANDERE_PERSONA))
+        self.assertLess(system.index(prompts.YANDERE_PERSONA), system.index("How to reply:"))
+        final = call[-1]["content"]
+        self.assertIn(prompts.YANDERE_REMINDER, final)
+        self.assertLess(final.index(prompts.YANDERE_REMINDER), final.index(prompts.REMINDER))  # injection reminder stays last
+
+    async def test_the_limits_are_part_of_the_mode(self):
+        for phrase in ("Never threaten", "never sexual", "drop the act at once", "never say they need her"):
+            self.assertIn(phrase, prompts.YANDERE_PERSONA)
+
+    async def test_everything_else_still_works_in_the_mode(self):
+        bot = self.make_bot(yandere_mode=True, llm=FakeLLM(text="Hey @Bob!"))
+        bob = person("Bob", 20)
+        message = self.msg(self.mention("tell <@20> hi"), mentions=[BOT, bob])
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hey <@20>!"])
+
+
 class SourcesFooterTests(unittest.TestCase):
     def test_no_sources_no_footer(self):
         self.assertEqual(sources_footer([]), "")

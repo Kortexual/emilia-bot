@@ -41,6 +41,13 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.memory_turns, 10)
         self.assertEqual(s.style_cooldown, 4)
         self.assertTrue(s.forget_standing_instructions)
+        self.assertFalse(s.yandere_mode)
+
+    def test_yandere_mode_flag(self):
+        self.assertTrue(load(DISCORD_TOKEN="a", YANDERE_MODE="true").yandere_mode)
+        self.assertFalse(load(DISCORD_TOKEN="a", YANDERE_MODE="off").yandere_mode)
+        with self.assertRaises(ConfigError):
+            load(DISCORD_TOKEN="a", YANDERE_MODE="sometimes")
 
     def test_style_settings(self):
         s = load(DISCORD_TOKEN="a", STYLE_COOLDOWN="0", FORGET_STANDING_INSTRUCTIONS="no")

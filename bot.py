@@ -250,8 +250,11 @@ class EmiliaBot(discord.Client):
                     date.today(),
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
+                    yandere=self.settings.yandere_mode,
                 )
-                messages = prompts.build_messages(system_prompt, shown, author, user_text, others, profiles)
+                messages = prompts.build_messages(
+                    system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
+                )
                 try:
                     result = await self.llm.chat(messages)
                     reply = clean_reply(result.text, self._speaker_names())

@@ -146,6 +146,7 @@ All settings are environment variables (or lines in `.env`).
 | `WEB_SEARCH` | `true` | Let the model search the web |
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
 | `SHOW_SOURCES` | `true` | Links line under answers that used search |
+| `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |
 | `MEMORY_MAX_CHARS` | `6000` | Cap on remembered text sent per request |
@@ -155,6 +156,15 @@ All settings are environment variables (or lines in `.env`).
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 
 To change the character, edit `PERSONA` in `prompts.py`.
+
+### Yandere mode
+`YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes
+obsessive and possessive in an over-the-top, anime-style way: fixated on small details, mood swings from giddy to pouty to heartbroken, and
+dramatic sulking when people mention other friends or bots.
+The text also sets fixed limits that apply however she is asked: no threats or violence (not even toward someone she's "jealous" of), no claiming
+to watch or track anyone, no guilt-tripping or pressuring people or telling them they need her, nothing sexual, and she drops the act and answers
+normally when someone seems upset or very young or asks her to stop. A prompt can't guarantee behaviour with every model, so test it with yours.
+The ready-made replies (greeting, error and so on) keep her normal voice. The setting is read at startup, so restart the bot after changing it.
 
 ## Project layout
 
