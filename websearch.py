@@ -39,6 +39,7 @@ from urllib.parse import urlparse
 
 from textutil import strip_cipher_script, strip_reserved_tags
 from tooling import ToolResult
+from webpage import UrlRegistry
 
 log = logging.getLogger("emilia.search")
 
@@ -127,7 +128,9 @@ class WebSearchTool:
         timeout: float = 20.0,
         cache_ttl: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
+        registry: UrlRegistry | None = None,
     ) -> None:
+        self._registry = registry  # links from results are remembered so fetch_page may open them
         self._max_results = max_results
         self._search_fn = search_fn
         self._timeout = timeout
@@ -143,6 +146,8 @@ class WebSearchTool:
         now = self._clock()
         cached = self._cache.get(query.lower())
         if cached and now - cached[0] < self._cache_ttl:
+            if self._registry:
+                self._registry.allow(cached[1].sources)
             return cached[1]
 
         try:
@@ -163,6 +168,8 @@ class WebSearchTool:
             return ToolResult(f'No web results were found for "{query}". Say you could not find anything.')
 
         result = ToolResult(format_hits(query, hits), [hit.url for hit in hits])
+        if self._registry:
+            self._registry.allow(result.sources)
         if len(self._cache) >= 64:
             self._cache.clear()
         self._cache[query.lower()] = (now, result)

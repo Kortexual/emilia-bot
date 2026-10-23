@@ -19,6 +19,7 @@
 import time
 import unittest
 
+from webpage import UrlRegistry
 from websearch import SearchHit, WebSearchTool
 
 
@@ -116,6 +117,27 @@ class WebSearchToolTests(unittest.IsolatedAsyncioTestCase):
         result = await WebSearchTool(search_fn=fake_search).run({"query": "braille"})
         self.assertIn("Table: means abc", result.text)
         self.assertNotRegex(result.text, "[\u2800-\u28ff]")
+
+    async def test_result_links_become_openable_by_fetch_page_and_nothing_else_does(self):
+        registry = UrlRegistry()
+        tool = WebSearchTool(
+            search_fn=lambda q, n: hits(("T", "https://a.example/one", "S"), ("bad", "javascript:alert(1)", "S")),
+            registry=registry,
+        )
+        await tool.run({"query": "q"})
+        self.assertTrue(registry.is_allowed("https://a.example/one"))
+        self.assertFalse(registry.is_allowed("https://a.example/two"))
+        self.assertFalse(registry.is_allowed("javascript:alert(1)"))
+
+    async def test_a_cached_search_renews_the_permission(self):
+        now = [0.0]
+        registry = UrlRegistry(ttl=100, clock=lambda: now[0])
+        tool = WebSearchTool(search_fn=lambda q, n: hits(("T", "https://a.example/one", "S")), registry=registry, clock=lambda: now[0])
+        await tool.run({"query": "q"})
+        now[0] = 150  # the permission has lapsed, but the search result is still cached (5 minutes)
+        self.assertFalse(registry.is_allowed("https://a.example/one"))
+        await tool.run({"query": "q"})
+        self.assertTrue(registry.is_allowed("https://a.example/one"))
 
     async def test_only_http_links_are_kept(self):
         def fake_search(query, max_results):

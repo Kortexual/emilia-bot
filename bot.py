@@ -44,6 +44,7 @@ from llm import ChatResult, LLMError, LMStudioClient
 from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
+from webpage import FetchPageTool, UrlRegistry, extract_urls
 from websearch import WebSearchTool, ddgs_installed
 
 log = logging.getLogger("emilia.bot")
@@ -202,6 +203,7 @@ class EmiliaBot(discord.Client):
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True),
         )
         self.settings = settings
+        self.urls = UrlRegistry()  # links the model may open with fetch_page: search results and the sender's links
         self.memory = memory or MemoryStore(settings.memory_db, settings.memory_turns)
         self.llm: ChatBackend = llm or LMStudioClient(
             base_url=settings.lmstudio_url,
@@ -217,12 +219,15 @@ class EmiliaBot(discord.Client):
         self._busy: set[int] = set()  # users with a request in flight
 
     def _build_tools(self) -> list[Tool]:
-        if not self.settings.web_search:
-            return []
-        if not ddgs_installed():
-            log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
-            return []
-        return [WebSearchTool(self.settings.search_results)]
+        tools: list[Tool] = []
+        if self.settings.web_search:
+            if ddgs_installed():
+                tools.append(WebSearchTool(self.settings.search_results, registry=self.urls))
+            else:
+                log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
+        if self.settings.fetch_pages:
+            tools.append(FetchPageTool(self.urls, max_chars=self.settings.page_max_chars))
+        return tools
 
     # --- lifecycle -------------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -325,7 +330,10 @@ class EmiliaBot(discord.Client):
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
                     yandere=self.settings.yandere_mode,
+                    fetch_pages=self.settings.fetch_pages,
                 )
+                if self.settings.fetch_pages:  # links the sender wrote (or replied to) may be opened this turn
+                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body))
                 messages = prompts.build_messages(
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )
