@@ -38,6 +38,10 @@ class SettingsTests(unittest.TestCase):
         self.assertIsNone(s.max_tokens)
         self.assertFalse(s.respond_to_dms)
         self.assertTrue(s.web_search)
+        self.assertFalse(s.computer_tools)
+        self.assertEqual(s.command_timeout, 30.0)
+        self.assertFalse(s.computer_allow_host_access)
+        self.assertTrue(s.computer_require_confirmation)
         self.assertEqual(s.memory_turns, 10)
         self.assertEqual(s.style_cooldown, 4)
         self.assertTrue(s.forget_standing_instructions)
@@ -90,12 +94,22 @@ class SettingsTests(unittest.TestCase):
             LMSTUDIO_TEMPERATURE="0.7",
             LMSTUDIO_MAX_TOKENS="512",
             MEMORY_TURNS="4",
+            COMPUTER_TOOLS="yes",
+            COMPUTER_WORKSPACE="/tmp/emilia-work",
+            COMMAND_TIMEOUT="15",
+            COMPUTER_ALLOW_HOST_ACCESS="true",
+            COMPUTER_REQUIRE_CONFIRMATION="false",
         )
         self.assertTrue(s.respond_to_dms)
         self.assertFalse(s.web_search)
         self.assertEqual(s.temperature, 0.7)
         self.assertEqual(s.max_tokens, 512)
         self.assertEqual(s.memory_turns, 4)
+        self.assertTrue(s.computer_tools)
+        self.assertEqual(s.computer_workspace, "/tmp/emilia-work")
+        self.assertEqual(s.command_timeout, 15.0)
+        self.assertTrue(s.computer_allow_host_access)
+        self.assertFalse(s.computer_require_confirmation)
 
     def test_bad_values_give_clear_errors(self):
         for bad in (
@@ -105,6 +119,7 @@ class SettingsTests(unittest.TestCase):
             {"LOG_LEVEL": "LOUD"},
             {"LMSTUDIO_TEMPERATURE": "-1"},
             {"STYLE_COOLDOWN": "-1"},
+            {"COMMAND_TIMEOUT": "0"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

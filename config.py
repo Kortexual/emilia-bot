@@ -82,6 +82,11 @@ class Settings:
     web_search: bool = True
     search_results: int = 4
     show_sources: bool = True
+    computer_tools: bool = False  # opt-in: model can operate the configured workspace
+    computer_workspace: str = str(BASE_DIR)
+    command_timeout: float = 30.0
+    computer_allow_host_access: bool = False  # opt-in: paths are not limited to computer_workspace
+    computer_require_confirmation: bool = True  # each mutating call must contain confirm=true
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
@@ -130,6 +135,11 @@ class Settings:
             web_search=_flag("WEB_SEARCH", cls.web_search),
             search_results=_number("SEARCH_RESULTS", cls.search_results, int, minimum=1),
             show_sources=_flag("SHOW_SOURCES", cls.show_sources),
+            computer_tools=_flag("COMPUTER_TOOLS", cls.computer_tools),
+            computer_workspace=_text("COMPUTER_WORKSPACE") or cls.computer_workspace,
+            command_timeout=_number("COMMAND_TIMEOUT", cls.command_timeout, float, minimum=1),
+            computer_allow_host_access=_flag("COMPUTER_ALLOW_HOST_ACCESS", cls.computer_allow_host_access),
+            computer_require_confirmation=_flag("COMPUTER_REQUIRE_CONFIRMATION", cls.computer_require_confirmation),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             memory_db=_text("MEMORY_DB") or cls.memory_db,

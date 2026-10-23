@@ -6,6 +6,7 @@ Everything stays on your machine, apart from the web searches the model chooses 
 - **Only answers @mentions.** Every other message (and every other bot) is ignored.
 - **Remembers the conversation**, per channel, even across restarts.
 - **Searches the web when it's unsure**: the model decides when, using LM Studio's tool calling.
+- **Can work on a local workspace** when explicitly enabled: read, write, edit and delete files, and run shell commands.
 
 ## Requirements
 
@@ -165,6 +166,11 @@ All settings are environment variables (or lines in `.env`).
 | `WEB_SEARCH` | `true` | Let the model search the web |
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
 | `SHOW_SOURCES` | `true` | Links line under answers that used search |
+| `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
+| `COMPUTER_WORKSPACE` | folder containing `bot.py` | The only folder those tools can access; direct paths cannot escape it and commands see it as `/workspace` in a Bubblewrap filesystem sandbox. |
+| `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
+| `COMPUTER_ALLOW_HOST_ACCESS` | `false` | Allow paths and command working directories outside `COMPUTER_WORKSPACE`. This grants the model the OS account's file access. |
+| `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
@@ -176,6 +182,10 @@ All settings are environment variables (or lines in `.env`).
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 
 To change the character, edit `PERSONA` in `prompts.py`.
+
+When `COMPUTER_TOOLS=true`, the `restart_bot` tool is also available. It starts the bot again with
+the same Python command, waits up to 45 seconds for the new process to connect to Discord, then
+closes the old process. If the replacement fails, the original bot remains running.
 
 ### Yandere mode
 `YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes

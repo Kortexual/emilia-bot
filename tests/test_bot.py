@@ -269,6 +269,11 @@ class ConversationTests(BotTestCase):
         await bot.on_message(self.msg(self.mention("hi")))
         self.assertNotIn("web_search", self.llm.calls[0][0]["content"])
 
+    async def test_system_prompt_explains_computer_tools_only_when_enabled(self):
+        bot = self.make_bot(web_search=False, computer_tools=True)
+        await bot.on_message(self.msg(self.mention("make a note")))
+        self.assertIn("Workspace tools", self.llm.calls[0][0]["content"])
+
     async def test_earlier_exchanges_are_remembered(self):
         bot = self.make_bot()
         self.llm.text = "Nice to meet you, Alice."

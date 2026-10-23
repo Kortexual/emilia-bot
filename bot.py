@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import sys
@@ -40,6 +41,8 @@ import discord
 import prompts
 import styleguard
 from config import ConfigError, Settings
+from computer import computer_tools
+from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient
 from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
@@ -191,6 +194,7 @@ class EmiliaBot(discord.Client):
         *,
         llm: ChatBackend | None = None,
         memory: MemoryStore | None = None,
+        restart_ready_fd: int | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
@@ -215,14 +219,34 @@ class EmiliaBot(discord.Client):
         )
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
+        self._restart_ready_fd = restart_ready_fd
+        self._restart_scheduled = False
 
     def _build_tools(self) -> list[Tool]:
+        tools: list[Tool] = []
+        if self.settings.computer_tools:
+            tools.extend(
+                computer_tools(
+                    self.settings.computer_workspace,
+                    command_timeout=self.settings.command_timeout,
+                    allow_host_access=self.settings.computer_allow_host_access,
+                    require_confirmation=self.settings.computer_require_confirmation,
+                )
+            )
+            tools.append(
+                RestartTool(
+                    [sys.executable, *sys.argv],
+                    self._retire_after_handoff,
+                    require_confirmation=self.settings.computer_require_confirmation,
+                )
+            )
         if not self.settings.web_search:
-            return []
+            return tools
         if not ddgs_installed():
             log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
-            return []
-        return [WebSearchTool(self.settings.search_results)]
+            return tools
+        tools.append(WebSearchTool(self.settings.search_results))
+        return tools
 
     # --- lifecycle -------------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -231,6 +255,27 @@ class EmiliaBot(discord.Client):
     async def on_ready(self) -> None:
         scope = "@mentions and DMs" if self.settings.respond_to_dms else "@mentions only"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
+        if self._restart_ready_fd is not None:
+            try:
+                os.write(self._restart_ready_fd, b"1")
+            except OSError:
+                log.warning("Could not notify the previous process that restart succeeded")
+            finally:
+                os.close(self._restart_ready_fd)
+                self._restart_ready_fd = None
+
+    async def _retire_after_handoff(self) -> None:
+        if self._restart_scheduled:
+            return
+        self._restart_scheduled = True
+
+        async def retire() -> None:
+            # Leave a brief overlap so the tool call can complete and the old gateway connection
+            # can close cleanly after the replacement has announced readiness.
+            await asyncio.sleep(3)
+            await self.close()
+
+        asyncio.create_task(retire())
 
     async def close(self) -> None:
         await self.llm.close()
@@ -324,6 +369,7 @@ class EmiliaBot(discord.Client):
                     date.today(),
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
+                    computer_tools=self.settings.computer_tools,
                     yandere=self.settings.yandere_mode,
                 )
                 messages = prompts.build_messages(
@@ -676,7 +722,14 @@ def main() -> None:
     for noisy in ("httpx", "httpcore", "primp", "urllib3", "ddgs"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    bot = EmiliaBot(settings)
+    ready_fd: int | None = None
+    raw_ready_fd = os.environ.pop("EMILIA_RESTART_READY_FD", "")
+    if raw_ready_fd:
+        try:
+            ready_fd = int(raw_ready_fd)
+        except ValueError:
+            log.warning("Ignoring invalid EMILIA_RESTART_READY_FD")
+    bot = EmiliaBot(settings, restart_ready_fd=ready_fd)
     try:
         bot.run(settings.discord_token, log_handler=None)  # we configured logging ourselves above
     except discord.LoginFailure:
