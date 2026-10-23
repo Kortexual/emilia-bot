@@ -21,7 +21,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
 2. **Discord application.**
    1. In the [Developer Portal](https://discord.com/developers/applications) create an application, open its
       **Bot** tab and click **Reset Token** to copy the token.
-   2. On the same tab, under *Privileged Gateway Intents*, switch on **Message Content Intent**.
+   2. On the same tab, under *Privileged Gateway Intents*, switch on **Message Content Intent**. (Also switch on
+      **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below.)
    3. Open **OAuth2 → URL Generator**, tick the scope `bot`, then tick the permissions *View Channels*,
       *Send Messages*, *Send Messages in Threads* and *Read Message History*. Open the generated URL to add the bot to your server.
 
@@ -61,11 +62,29 @@ conversation, `link_mentions` in `bot.py` turns it into a real ping for that use
 
 ### Pinging
 When the model writes `@Name`, `link_mentions` turns it into a real ping if the name belongs to someone in the conversation (by their
-prompt name, username or an earlier name). If it doesn't, and the **sender typed that name in their own message**, the bot looks for
-exactly one human member of the server with that name (nickname, display name, global name or username, ignoring case) using the cached
-members and Discord's member search, which needs no privileged intent. Prefix matches, bots, ambiguous names, DMs and failed searches
-all leave the name as plain text, and at most 3 names are looked up per reply. Because the name must come from the sender, text from
-the web or from old messages can't make the bot ping anyone. Pings can never reach `@everyone` or roles.
+prompt name, username or an earlier name). Every remembered message from a person carries their real Discord user ID, and that is
+what the ping uses.
+
+If the name isn't in the conversation, and the **sender typed it (or at least its first word) in their own message**, the bot looks
+for exactly one human member of the server it could mean:
+
+- **Where it looks:** the members Discord has told the bot about, Discord's member search (which needs no privileged intent), and the
+  people directory (anyone seen under a similar name who is still in the server, which finds people by an old name).
+- **How it matches:** from strictest to loosest: the whole name the model wrote, the whole name you typed, the first word of a name
+  (`Jack` finds `Jack Larpel`, and a username such as `jack_p` counts by its first part), then any other word of a name (`Larpel`).
+  If a level matches more than one person, nobody is pinged.
+- **Last names and other middle words** are only found among members the bot has cached. Discord's own search only matches the *start*
+  of a username or nickname. To make the whole member list available, set `MEMBERS_INTENT=true` and switch on **Server Members Intent**
+  in the Developer Portal (Bot → Privileged Gateway Intents); the bot won't start if the intent is requested but not switched on.
+
+Bots, DMs, ambiguous names and failed searches all leave the name as plain text, and at most 3 names are looked up per reply. Because
+the name must come from the sender, text from the web or from old messages can't make the bot ping anyone. Pings can never reach
+`@everyone` or roles. A member who is found is saved in the directory with their real ID and names.
+
+Messages saved before user IDs were recorded name their author but have no ID. When someone whose name matches takes part in a
+conversation, or is found by name in the server, their real ID is attached to those older messages in that channel, so they can be
+pinged from memory afterwards. A display name shared by two people in the same message is skipped, since the old messages could belong
+to either.
 
 ### Web search
 LM Studio has no built-in search. What its OpenAI-compatible API offers is **tool calling**: the bot describes a
@@ -146,6 +165,7 @@ All settings are environment variables (or lines in `.env`).
 | `WEB_SEARCH` | `true` | Let the model search the web |
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
 | `SHOW_SOURCES` | `true` | Links line under answers that used search |
+| `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |
@@ -183,7 +203,10 @@ tests/        run with:  python -m unittest
 
 ## Troubleshooting
 
-- **"Turn on Message Content Intent" at startup**: Developer Portal → Bot → Privileged Gateway Intents.
+- **"Turn on Message Content Intent" at startup**: Developer Portal → Bot → Privileged Gateway Intents. If you set `MEMBERS_INTENT=true`,
+  switch on **Server Members Intent** there too.
+- **"ping Jack" stays plain text**: the name must be typed in your message and match exactly one human member (see "Pinging"). A last
+  name or a middle word is only found with `MEMBERS_INTENT=true`.
 - **Online but silent**: mention the bot *user* (not a role), check it can see and send in that channel,
   and read the console log.
 - **"I couldn't gather my thoughts"**: the bot couldn't get an answer from LM Studio. The console says why:

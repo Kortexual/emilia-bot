@@ -31,7 +31,7 @@ import re
 import sqlite3
 import sys
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Any, Protocol
 
@@ -112,6 +112,78 @@ def ping_candidates(reply: str) -> list[list[str]]:
     return groups
 
 
+def _norm(text: str) -> str:
+    """Lower-case, drop punctuation and collapse spaces: "Jack P." -> "jack p"."""
+    return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
+
+
+def _first_word(name: str) -> str:
+    """The first word of a name, also splitting usernames at _ . -: "Jack P." and "jack_p" -> "jack"."""
+    parts = re.split(r"[\s_.\-]+", name.strip().lower())
+    return _norm(parts[0]) if parts and parts[0] else ""
+
+
+@dataclass
+class _Candidate:
+    """A server member who might be who the sender meant, with every name they are known by."""
+
+    member: discord.Member
+    names: set[str] = field(default_factory=set)  # normalised full names
+    firsts: set[str] = field(default_factory=set)  # normalised first words
+    words: set[str] = field(default_factory=set)  # every normalised word of every name ("larpel" too)
+
+    def add(self, name: str | None) -> None:
+        if name and _norm(name):
+            self.names.add(_norm(name))
+            if _first_word(name):
+                self.firsts.add(_first_word(name))
+            self.words.update(part for part in (_norm(w) for w in re.split(r"[\s_.\-]+", name)) if part)
+
+
+def _typed_words(words: list[str], typed_norm: str) -> list[str]:
+    """The longest start of `words` that the sender really typed (as whole words, ignoring case and
+    punctuation), or [] if not even the first word was typed."""
+    padded = f" {typed_norm} "
+    for count in range(len(words), 0, -1):
+        anchor = _norm(" ".join(words[:count]))
+        if anchor and f" {anchor} " in padded:
+            return words[:count]
+    return []
+
+
+def _pick(pool: dict[int, _Candidate], reading: str, anchor_words: list[str]) -> _Candidate | None:
+    """The one member a name refers to, trying stricter matches first:
+    1. a name of theirs equals what the model wrote ("jack P." -> nickname "Jack P.")
+    2. a name of theirs equals what the sender typed
+    3. the sender typed one word and it is the first word of one of their names ("Jack" -> "Jack P.")
+    4. the sender typed one word and it is any other word of one of their names ("Larpel" -> "Jack Larpel")
+    If a tier matches several people the name is ambiguous and nobody is picked."""
+    reading_n, anchor_n = _norm(reading), _norm(" ".join(anchor_words))
+    tests = (
+        lambda c: reading_n in c.names,
+        lambda c: anchor_n in c.names,
+        lambda c: " " not in anchor_n and anchor_n in c.firsts,
+        lambda c: " " not in anchor_n and anchor_n in c.words,
+    )
+    for test in tests:
+        hits = [candidate for candidate in pool.values() if test(candidate)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return None
+    return None
+
+
+def _name_span(reading_words: list[str], candidate: _Candidate, anchor_n: str) -> str | None:
+    """How much of "@jack P. says hi" is the person's name: the longest start that is one of their
+    names (or is what the sender typed). Only that part is replaced by the ping."""
+    for count in range(len(reading_words), 0, -1):
+        text = " ".join(reading_words[:count])
+        if _norm(text) in candidate.names or _norm(text) == anchor_n:
+            return text.rstrip(".'-") or None
+    return None
+
+
 class EmiliaBot(discord.Client):
     def __init__(
         self,
@@ -122,6 +194,7 @@ class EmiliaBot(discord.Client):
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
+        intents.members = settings.members_intent  # privileged: Server Members Intent, only if MEMBERS_INTENT=true
         super().__init__(
             intents=intents,
             # Whatever the model writes can never ping @everyone, roles or arbitrary users. Replies
@@ -230,6 +303,7 @@ class EmiliaBot(discord.Client):
         author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
         async with message.channel.typing():  # keeps "typing..." showing, even while queued
             async with self._channel_lock(key):
+                await self._attach_ids(key, people)
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
                 labels = self._labels(history, people)
                 known = await self._remember_people(people, list(labels))
@@ -360,11 +434,11 @@ class EmiliaBot(discord.Client):
             for user_id, name in names.items()
         }
 
-    async def _remember_people(self, people: list[discord.abc.User], ids: list[str]) -> dict[str, list[str]]:
-        """Save the names these people go by, and return every name known for the users in `ids`
-        (user ID -> names): the people in this message and those from the remembered conversation."""
+    @staticmethod
+    def _name_entries(users: list[discord.abc.User]) -> list[tuple[str, list[tuple[str, str]]]]:
+        """(user ID, [(kind, name), ...]) for each user, with every name they go by, cleaned."""
         entries = []
-        for user in people:
+        for user in users:
             names = [
                 ("display", user.display_name),
                 ("username", getattr(user, "name", None)),
@@ -373,8 +447,13 @@ class EmiliaBot(discord.Client):
             ]
             cleaned = [(kind, prompts.safe_name(name, default="")) for kind, name in names if name]
             entries.append((str(user.id), [(kind, name) for kind, name in cleaned if name]))
+        return entries
+
+    async def _remember_people(self, people: list[discord.abc.User], ids: list[str]) -> dict[str, list[str]]:
+        """Save the names these people go by, and return every name known for the users in `ids`
+        (user ID -> names): the people in this message and those from the remembered conversation."""
         try:
-            await asyncio.to_thread(self.memory.observe_users, entries)
+            await asyncio.to_thread(self.memory.observe_users, self._name_entries(people))
             return await asyncio.to_thread(self.memory.aliases, ids)
         except sqlite3.Error:
             log.exception("Could not read or save the people directory")  # the reply is still possible
@@ -400,52 +479,118 @@ class EmiliaBot(discord.Client):
         self, message: discord.Message, reply: str, typed: str, already: dict[str, int]
     ) -> dict[str, int]:
         """People the sender asked for by name ("ping Jack") who are in this server but not in the
-        conversation yet. A name is only looked up if the *sender typed it* in this message, so text
-        from the web or from old messages can never make the bot ping someone, and only when it matches
-        exactly one human member."""
+        conversation yet, as {name as written in the reply: user ID}.
+
+        The sender must have typed the name (at least its first word) in this message, so text from the
+        web or from old messages can never make the bot ping someone. The name is then matched against
+        the server's members and the names saved in the directory, and only a single clear match counts:
+        "Jack" finds the one member called "Jack P.", but not when "Jack S." exists too."""
         guild = getattr(message, "guild", None)
         if guild is None:
             return {}
         known = {name.lower() for name in already}
+        typed_norm = _norm(typed)
         found: dict[str, int] = {}
         lookups = 0
-        for names in ping_candidates(reply):
-            for name in names:
-                if name.lower() in known or name.lower() in {n.lower() for n in found}:
-                    break  # this @ is already handled; shorter readings of it would only overlap
-                if not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", typed, re.IGNORECASE):
-                    continue
-                if lookups >= MAX_MEMBER_LOOKUPS:
-                    return found
-                lookups += 1
-                member = await self._find_member(guild, name)
-                if member is not None:
-                    found[name] = member.id
-                    break
+        for readings in ping_candidates(reply):
+            if any(reading.lower() in known or reading.lower() in {n.lower() for n in found} for reading in readings):
+                continue  # handled by the conversation (or by an earlier lookup in this reply)
+            first = readings[-1].split()[0]  # a reading is "Jack P" or "Jack P hi"; the shortest is the first word
+            if not _typed_words([first], typed_norm):
+                continue
+            if lookups >= MAX_MEMBER_LOOKUPS:
+                break
+            lookups += 1
+            pool = await self._member_pool(guild, first)
+            for reading in readings:
+                words = reading.split()
+                anchor = _typed_words(words, typed_norm)
+                match = _pick(pool, reading, anchor) if anchor else None
+                if match is not None:
+                    span = _name_span(words, match, _norm(" ".join(anchor)))
+                    if span:
+                        found[span] = match.member.id
+                        await self._record_member(match.member)
+                        await self._attach_ids(str(message.channel.id), [match.member])
+                        break
         return found
 
-    async def _find_member(self, guild: discord.Guild, name: str) -> discord.Member | None:
-        """The one human member of `guild` called exactly `name` (nickname, display name, global name
-        or username, ignoring case), or None if there is no such member or the name is ambiguous.
-        Uses the members Discord has already told us about, then Discord's member search (which needs
-        no privileged intent)."""
-        key = name.lower()
+    async def _member_pool(self, guild: discord.Guild, first_word: str) -> dict[int, _Candidate]:
+        """Server members whose names could be what `first_word` starts: those Discord has already told
+        us about, Discord's member search (which needs no privileged intent), and anyone saved in the
+        directory under a matching name who is still in this server (that finds people by an old name)."""
+        start = _norm(first_word)
         bot_id = self.user.id if self.user else None
-        candidates = list(getattr(guild, "members", []) or [])
+        found = list(getattr(guild, "members", []) or [])
         search = getattr(guild, "search_members", None)
         if search is not None:
             try:
-                candidates += await search(name, limit=25)
+                found += await search(first_word, limit=25)
             except (discord.HTTPException, discord.Forbidden):
-                log.info("Member search for %r was refused or failed", name)
-        matches = {}
-        for member in candidates:
+                log.info("Member search for %r was refused or failed", first_word)
+
+        pool: dict[int, _Candidate] = {}
+
+        def add(member) -> _Candidate | None:
             if getattr(member, "bot", False) or member.id == bot_id:
-                continue
-            names = (member.display_name, getattr(member, "name", None), getattr(member, "global_name", None), getattr(member, "nick", None))
-            if key in {n.lower() for n in names if n}:
-                matches[member.id] = member
-        return next(iter(matches.values())) if len(matches) == 1 else None
+                return None
+            candidate = pool.setdefault(member.id, _Candidate(member))
+            for name in (member.display_name, getattr(member, "name", None), getattr(member, "global_name", None), getattr(member, "nick", None)):
+                candidate.add(name)
+            return candidate
+
+        for member in found:
+            add(member)
+        pool = {mid: c for mid, c in pool.items() if start in c.words or any(n.startswith(start) for n in c.names)}
+
+        try:
+            saved_ids = await asyncio.to_thread(self.memory.find_by_alias, start)
+        except sqlite3.Error:
+            log.exception("Could not search the people directory")
+            saved_ids = []
+        for user_id in saved_ids[:5]:
+            member = guild.get_member(int(user_id)) if hasattr(guild, "get_member") else None
+            if member is None and hasattr(guild, "fetch_member"):
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except discord.HTTPException:
+                    member = None  # not in this server (or not allowed to ask): then they can't be pinged here
+            candidate = add(member) if member is not None else None
+            if candidate is not None:
+                for alias in (await asyncio.to_thread(self.memory.aliases, [user_id])).get(user_id, []):
+                    candidate.add(alias)
+        return pool
+
+    async def _attach_ids(self, key: str, users: list[discord.abc.User]) -> None:
+        """Messages saved before user IDs were recorded name their author but have no ID, so that person
+        could never be pinged from memory. When someone whose name matches takes part (or is found by
+        name in the server), their real ID is attached to those messages. A display name shared by two
+        people in the same message is skipped, since the old messages could belong to either."""
+        counts = Counter(prompts.safe_name(user.display_name).lower() for user in users)
+        try:
+            for user in users:
+                if counts[prompts.safe_name(user.display_name).lower()] > 1:
+                    continue
+                user_id = str(user.id)
+                names = [name for _, name in self._name_entries([user])[0][1]]
+                names += (await asyncio.to_thread(self.memory.aliases, [user_id])).get(user_id, [])
+                await asyncio.to_thread(self.memory.backfill_ids, key, user_id, names)
+        except sqlite3.Error:
+            log.exception("Could not attach user IDs to older messages")  # only a convenience
+
+    async def _record_member(self, member: discord.Member) -> None:
+        """Save a member who was just pinged in the directory, with their real user ID and names."""
+        names = [
+            ("display", member.display_name),
+            ("username", getattr(member, "name", None)),
+            ("global", getattr(member, "global_name", None)),
+            ("nick", getattr(member, "nick", None)),
+        ]
+        cleaned = [(kind, prompts.safe_name(name, default="")) for kind, name in names if name]
+        try:
+            await asyncio.to_thread(self.memory.observe_users, [(str(member.id), [(k, n) for k, n in cleaned if n])])
+        except sqlite3.Error:
+            log.exception("Could not save a pinged member to the people directory")
 
     @staticmethod
     def _pingable(labels: dict[str, str], known: dict[str, list[str]]) -> dict[str, int]:
@@ -538,7 +683,8 @@ def main() -> None:
         raise SystemExit("Discord rejected DISCORD_TOKEN. Reset the token in the Developer Portal and update .env.") from None
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "Turn on 'Message Content Intent': Developer Portal > your app > Bot > Privileged Gateway Intents."
+            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true): "
+            "Developer Portal > your app > Bot > Privileged Gateway Intents."
         ) from None
 
 

@@ -190,6 +190,35 @@ class MemoryStore:
                     found[user_id] = [row[0] for row in rows]
         return found
 
+    def backfill_ids(self, channel_id: str, user_id: str, names: Sequence[str]) -> int:
+        """Attach a real user ID to this channel's older user messages that have none (saved before IDs
+        were recorded) and whose author name is one of `names`. Returns how many were updated."""
+        keys = sorted({name.strip().lower() for name in names if name and name.strip()})
+        if not keys:
+            return 0
+        marks = ",".join("?" for _ in keys)
+        with self._lock, self._db:
+            return self._db.execute(
+                "UPDATE messages SET author_id = ? WHERE channel_id = ? AND role = 'user'"
+                f" AND (author_id IS NULL OR author_id = '') AND lower(author) IN ({marks})",
+                (user_id, channel_id, *keys),
+            ).rowcount
+
+    def find_by_alias(self, prefix: str, limit: int = 20) -> list[str]:
+        """User IDs with a saved name that starts with `prefix` (ignoring case), newest first. A starting
+        point only: the caller still checks the person is real and where they are."""
+        prefix = prefix.strip().lower()
+        if not prefix:
+            return []
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT user_id FROM user_aliases WHERE alias_key LIKE ? ESCAPE '\\'"
+                " GROUP BY user_id ORDER BY MAX(last_seen) DESC LIMIT ?",
+                (escaped + "%", limit),
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def set_about(self, user_id: str, text: str) -> None:
         """Save (or, with an empty string, remove) the note a person wrote about themselves."""
         now = time.time()

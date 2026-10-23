@@ -100,17 +100,29 @@ def person(display="Alice", user_id=1, username=None, global_name=None):
 class FakeGuild:
     """A server with some members Discord has already told us about and some only its search finds."""
 
-    def __init__(self, cached=(), searchable=(), error=None):
+    def __init__(self, cached=(), searchable=(), error=None, fetchable=()):
         self.members = list(cached)
         self.searchable = list(searchable)
+        self.fetchable = list(fetchable)
         self.error = error
         self.searches = []
+
+    def get_member(self, user_id):
+        return next((m for m in self.members if m.id == user_id), None)
+
+    async def fetch_member(self, user_id):
+        for member in self.fetchable:
+            if member.id == user_id:
+                return member
+        raise discord.HTTPException()
 
     async def search_members(self, query, limit=1):
         self.searches.append(query)
         if self.error:
             raise self.error
-        return [m for m in self.searchable if query.lower() in {m.display_name.lower(), getattr(m, "name", "").lower()} or m.display_name.lower().startswith(query.lower())][:limit]
+        # Like Discord's member search: the query must be the start of a username or a nickname.
+        q = query.lower()
+        return [m for m in self.searchable if any(n.lower().startswith(q) for n in (m.display_name, getattr(m, "name", None), getattr(m, "global_name", None)) if n)][:limit]
 
 
 class FakeMessage:
@@ -847,6 +859,128 @@ class PingByNameTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey <@1>!"])
         self.assertEqual(guild.searches, [])
 
+    # --- partial names, nicknames and the saved directory ------------------------------------
+    async def test_a_first_name_finds_the_member_whose_nickname_starts_with_it(self):
+        """'ping Jack' when the member is 'Jack P.' (username jackp), and the model writes '@jack P.'."""
+        jack = person("Jack P.", 77, username="jackp")
+        guild = FakeGuild(searchable=[jack])
+        message = await self.ask("Please ping Jack for me!", "@jack P.", guild, author=person("Kortex", 5))
+        self.assertEqual(message.replies, ["<@77>."])
+        self.assertEqual([u.id for u in message.allowed_mentions[0].users], [77])
+
+    async def test_just_the_first_name_is_enough_when_it_is_the_only_match(self):
+        guild = FakeGuild(searchable=[person("Jack P.", 77, username="jackp")])
+        message = await self.ask("ping jack", "Hey @Jack, you're wanted!", guild)
+        self.assertEqual(message.replies, ["Hey <@77>, you're wanted!"])
+
+    async def test_a_first_name_shared_by_two_members_pings_nobody_but_a_full_name_works(self):
+        guild = FakeGuild(searchable=[person("Jack P.", 77), person("Jack S.", 78)])
+        message = await self.ask("ping Jack", "Hey @Jack!", guild)
+        self.assertEqual(message.replies, ["Hey @Jack!"])
+        message = await self.ask("ping Jack", "Hey @Jack S.!", guild)  # the model got more specific than the sender
+        self.assertEqual(message.replies, ["Hey <@78>.!"])
+
+    async def test_only_the_part_that_is_the_name_is_replaced(self):
+        guild = FakeGuild(searchable=[person("Jack P.", 77)])
+        message = await self.ask("ping Jack", "@Jack Larpel says hi", guild)
+        self.assertEqual(message.replies, ["<@77> Larpel says hi"])
+
+    async def test_a_username_with_a_separator_matches_its_first_part(self):
+        guild = FakeGuild(searchable=[person("Cool Guy", 77, username="jack_p")])
+        message = await self.ask("ping Jack", "Hey @Jack!", guild)
+        self.assertEqual(message.replies, ["Hey <@77>!"])
+
+    async def test_a_pinged_member_is_saved_in_the_directory_under_their_real_id(self):
+        guild = FakeGuild(searchable=[person("Jack P.", 77, username="jackp", global_name="Jackie")])
+        await self.ask("ping Jack", "Hey @Jack!", guild)
+        self.assertEqual(sorted(n.lower() for n in self.memory.aliases(["77"])["77"]), ["jack p.", "jackie", "jackp"])
+
+    async def test_a_saved_old_name_still_finds_a_member_who_has_renamed(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi"), author=person("Old Name", 20), channel=FakeChannel(channel_id=2)))
+        await bot.on_message(self.msg(self.mention("hi"), author=person("New Name", 20), channel=FakeChannel(channel_id=3)))
+        guild = FakeGuild(cached=[person("New Name", 20)])
+        self.llm.text = "Hey @Old Name!"
+        message = self.msg(self.mention("ping Old Name"), guild=guild, author=person("Mark", 10))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hey <@20>!"])
+
+    async def test_a_saved_person_who_is_not_in_this_server_is_not_pinged(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi"), author=person("Zed", 30), channel=FakeChannel(channel_id=2)))
+        self.llm.text = "Hey @Zed!"
+        guild = FakeGuild()  # Zed is not a member here, and Discord can't fetch him
+        message = self.msg(self.mention("ping Zed"), guild=guild, author=person("Mark", 10))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hey @Zed!"])
+
+    async def test_a_saved_person_can_be_fetched_from_discord_when_not_cached(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi"), author=person("Zed", 30), channel=FakeChannel(channel_id=2)))
+        self.llm.text = "Hey @Zed!"
+        guild = FakeGuild(fetchable=[person("Zed", 30)])
+        message = self.msg(self.mention("ping Zed"), guild=guild, author=person("Mark", 10))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hey <@30>!"])
+
+
+    async def test_a_first_name_finds_the_member_whose_nickname_is_longer(self):
+        # "Jack Larpel" (username jackpapel) is the only Jack, whether the model writes his full name or just "Jack".
+        for written, expected in (("@Jack Larpel", "<@77>"), ("Okay @Jack!", "Okay <@77>!")):
+            guild = FakeGuild(searchable=[person("Jack Larpel", 77, username="jackpapel")])
+            message = await self.ask("Please ping Jack for me!", written, guild)
+            self.assertEqual(message.replies, [expected])
+            self.assertEqual([u.id for u in message.allowed_mentions[0].users], [77])
+
+    async def test_a_last_name_needs_the_member_list_to_be_cached(self):
+        guild = FakeGuild(searchable=[person("Jack Larpel", 77, username="jackpapel")])  # Discord's search is prefix only
+        message = await self.ask("please ping Larpel", "@Larpel", guild)
+        self.assertEqual(message.replies, ["@Larpel"])
+        guild = FakeGuild(cached=[person("Jack Larpel", 77, username="jackpapel")])  # MEMBERS_INTENT=true
+        message = await self.ask("please ping Larpel", "@Larpel", guild)
+        self.assertEqual(message.replies, ["<@77>"])
+
+    async def test_two_members_sharing_a_first_name_are_never_guessed_between(self):
+        guild = FakeGuild(cached=[person("Jack Larpel", 77), person("Jack Sparrow", 78)])
+        message = await self.ask("ping Jack", "@Jack", guild)
+        self.assertEqual(message.replies, ["@Jack"])
+        message = await self.ask("ping Jack Sparrow", "@Jack Sparrow", guild)
+        self.assertEqual(message.replies, ["<@78>"])
+
+    async def test_older_messages_without_a_user_id_get_the_real_one_when_the_person_is_found(self):
+        bot = self.make_bot(llm=FakeLLM(text="@Jack Larpel"))
+        self.memory.add_turn("1", "Jack Larpel", "", "hi", "hello")  # saved before user IDs were recorded
+        guild = FakeGuild(searchable=[person("Jack Larpel", 77, username="jackpapel")])
+        message = self.msg(self.mention("ping Jack"), guild=guild)
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["<@77>"])
+        first = [m for m in self.memory.recent("1") if m.role == "user"][0]
+        self.assertEqual((first.author, first.author_id), ("Jack Larpel", "77"))
+
+    async def test_older_messages_get_the_id_of_their_author_when_he_talks_again(self):
+        bot = self.make_bot()
+        self.memory.add_turn("1", "Jack Larpel", "", "hi", "hello")
+        await bot.on_message(self.msg(self.mention("I'm back"), author=person("Jack Larpel", 77, username="jackpapel")))
+        rows = [m for m in self.memory.recent("1") if m.role == "user"]
+        self.assertEqual([m.author_id for m in rows], ["77", "77"])
+
+        # and from then on he can be pinged from memory alone, with no search of the server
+        self.llm.text = "Hey @Jack Larpel!"
+        message = self.msg(self.mention("where is he?"), author=person("Alice", 1))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hey <@77>!"])
+
+    async def test_a_name_shared_by_two_people_in_one_message_is_not_attached_to_either(self):
+        bot = self.make_bot()
+        self.memory.add_turn("1", "Alice", "", "hi", "hello")
+        await bot.on_message(self.msg(self.mention("hello <@2>"), author=person("Alice", 1), mentions=[BOT, person("Alice", 2)]))
+        first = [m for m in self.memory.recent("1") if m.role == "user"][0]
+        self.assertEqual(first.author_id, "")
+
+    async def test_the_members_intent_is_only_requested_when_switched_on(self):
+        self.assertFalse(self.make_bot().intents.members)
+        self.assertTrue(self.make_bot(members_intent=True).intents.members)
+
 
 class PingCandidateTests(unittest.TestCase):
     def test_every_at_sign_gives_longest_readings_first(self):
@@ -858,11 +992,12 @@ class PingCandidateTests(unittest.TestCase):
 
 
 class OccasionalEmojiTests(BotTestCase):
-    async def test_the_prompt_allows_an_occasional_emoji_without_naming_one(self):
+    async def test_the_persona_does_not_tell_her_to_use_or_avoid_emoji(self):
         bot = self.make_bot()
         await bot.on_message(self.msg(self.mention("hello")))
         system, final = self.llm.calls[0][0]["content"], self.llm.calls[0][-1]["content"]
-        self.assertIn("you add a small emoji. Never in every message.", prompts.PERSONA)
+        self.assertNotIn("emoji", prompts.PERSONA)  # it is left to the model
+        self.assertNotIn("small emoji", system)
         self.assertIn("Your occasional emoji are fine.", system)  # the 'don't repeat yourself' rule leaves them alone
         self.assertNotIn("\U0001F338", system)  # no particular emoji is prescribed
         self.assertNotIn("Always write in ordinary language", system)

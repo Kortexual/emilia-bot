@@ -65,6 +65,34 @@ class PeopleDirectoryTests(unittest.TestCase):
         self.assertEqual(self.store.aliases(["2"])["2"], ["Bob"])  # others are untouched
         self.assertFalse(self.store.forget_user("1"))  # nothing left to remove
 
+    def test_find_by_alias_matches_name_starts_ignoring_case(self):
+        self.store.observe_users([("1", [("display", "Jack P."), ("username", "jackp")]), ("2", [("display", "Jackson")]), ("3", [("display", "Bob")])])
+        self.assertEqual(sorted(self.store.find_by_alias("JACK")), ["1", "2"])
+        self.assertEqual(self.store.find_by_alias("jackp"), ["1"])
+        self.assertEqual(self.store.find_by_alias("nobody"), [])
+        self.assertEqual(self.store.find_by_alias("  "), [])
+
+    def test_find_by_alias_treats_wildcards_as_plain_characters(self):
+        self.store.observe_users([("1", [("display", "Jack")]), ("2", [("display", "a_b")])])
+        self.assertEqual(self.store.find_by_alias("%"), [])
+        self.assertEqual(self.store.find_by_alias("_"), [])
+        self.assertEqual(self.store.find_by_alias("a_"), ["2"])
+
+    def test_backfill_attaches_ids_only_to_older_messages_that_have_none(self):
+        self.store.close()
+        self.store = MemoryStore(":memory:", max_turns=10)  # roomy enough that nothing is trimmed away
+        self.addCleanup(self.store.close)
+        self.store.add_turn("c1", "Jack Larpel", "", "old", "r1")
+        self.store._db.execute("INSERT INTO messages (channel_id, role, author, content) VALUES ('c1', 'user', 'jack larpel', 'older')")
+        self.store.add_turn("c1", "Jack Larpel", "5", "has an id already", "r2")
+        self.store.add_turn("c1", "Someone Else", "", "other author", "r3")
+        self.store.add_turn("c2", "Jack Larpel", "", "other channel", "r4")
+        self.assertEqual(self.store.backfill_ids("c1", "77", ["Jack Larpel", "jackpapel"]), 2)
+        rows = {m.content: m.author_id for m in self.store.recent("c1") if m.role == "user"}
+        self.assertEqual(rows, {"old": "77", "older": "77", "has an id already": "5", "other author": ""})
+        self.assertEqual(self.store.recent("c2")[0].author_id, "")
+        self.assertEqual(self.store.backfill_ids("c1", "77", []), 0)
+
     def test_last_replies(self):
         for i in range(4):
             self.store.add_turn("c1", "A", "1", f"q{i}", f"a{i}")

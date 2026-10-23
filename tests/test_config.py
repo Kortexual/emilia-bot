@@ -43,6 +43,12 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(s.forget_standing_instructions)
         self.assertFalse(s.yandere_mode)
 
+    def test_members_intent_flag(self):
+        self.assertFalse(load(DISCORD_TOKEN="a").members_intent)
+        self.assertTrue(load(DISCORD_TOKEN="a", MEMBERS_INTENT="yes").members_intent)
+        with self.assertRaises(ConfigError):
+            load(DISCORD_TOKEN="a", MEMBERS_INTENT="maybe")
+
     def test_yandere_mode_flag(self):
         self.assertTrue(load(DISCORD_TOKEN="a", YANDERE_MODE="true").yandere_mode)
         self.assertFalse(load(DISCORD_TOKEN="a", YANDERE_MODE="off").yandere_mode)
