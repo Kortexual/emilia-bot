@@ -103,15 +103,18 @@ hands the results back, and the model writes its answer. At most two rounds of u
   replace the one function `search_sync()` in `websearch.py`.
 - Each search costs an extra generation, which on a large reasoning model can mean a minute or more.
   Turn it all off with `WEB_SEARCH=false`.
-- Answers that used a search end with a small grey line listing a few of the links consulted (`SHOW_SOURCES=false` hides it).
+- Each search shows up as a small grey line such as `🔎 Searching the web for "..."`; once the results are in, a few of the links
+  consulted are added to it (`SHOW_SOURCES=false` leaves them out).
 - LM Studio 0.4+ can also run MCP servers itself through its native `/api/v1/chat` endpoint. This bot uses the
   OpenAI-compatible endpoint instead, so it works on any version with no extra setup.
 
 ### Tool use
 Whatever the model writes next to a tool call is posted straight away, so a reply can come as several Discord messages
-("Let me check..." and then the answer). Every tool it used is listed in a small grey line under the message it belongs to,
-for example `` -# 🛠️ `run_command: ls -la` ``. Tools used without any text are listed under the next message, or on their own line if
-nothing else is said. Memory keeps everything the model said for one request as one reply; the tool lines are not stored.
+("Let me check..." and then the answer). Every tool call is posted as its own small grey message the moment the tool runs,
+written by the tool itself: `🔎 Searching the web for ...`, `📄 Reading notes.txt`, `💻 Running ls -la` and so on (a tool adds
+these through a `describe(arguments)` method; tools without one show their name and first argument). A web search line is
+edited to add its links once the results are in. These lines are sent to the channel, not as replies, and never ping anyone.
+Memory keeps everything the model said for one request as one reply; the tool lines are not stored.
 
 - **`MULTI_TURN_TOOLS=false` (default).** The model can write a message and call tools, gets the results, and then has to answer:
   at most two rounds of tools per message.

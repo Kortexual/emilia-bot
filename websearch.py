@@ -38,7 +38,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from textutil import strip_cipher_script, strip_reserved_tags
-from tooling import ToolResult
+from tooling import ToolResult, code_span
 
 log = logging.getLogger("emilia.search")
 
@@ -134,6 +134,9 @@ class WebSearchTool:
         self._cache_ttl = cache_ttl
         self._clock = clock
         self._cache: dict[str, tuple[float, ToolResult]] = {}
+
+    def describe(self, arguments: dict[str, Any]) -> str:
+        return f"🔎 Searching the web for {code_span(arguments.get('query', ''))}".rstrip()
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         query = " ".join(str(arguments.get("query", "")).split())[:200]

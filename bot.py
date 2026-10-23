@@ -43,7 +43,7 @@ import styleguard
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import computer_tools
 from restart import RestartTool
-from llm import ChatResult, LLMError, LMStudioClient, Step, StepHandler, ToolUse
+from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
@@ -63,12 +63,18 @@ class ChatBackend(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    async def chat(self, messages: list[dict[str, Any]], on_step: StepHandler | None = None) -> ChatResult: ...
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        on_text: TextHandler | None = None,
+        on_tool: ToolHandler | None = None,
+        on_tool_done: ToolHandler | None = None,
+    ) -> ChatResult: ...
 
 
-def sources_footer(urls: list[str], max_links: int = 3) -> str:
-    """A small grey line under the reply naming where web information came from.
-    Links are wrapped in <> so Discord doesn't unfurl a big preview for each one."""
+def source_links(urls: list[str], max_links: int = 3) -> str:
+    """A few of the links a tool consulted, as " · <url> · <url>". Links are wrapped in <> so Discord
+    doesn't unfurl a big preview for each one."""
     picked: list[str] = []
     for url in urls:
         if len(url) > 200 or any(ch in url for ch in "<> \n\t") or f"<{url}>" in picked:
@@ -76,28 +82,12 @@ def sources_footer(urls: list[str], max_links: int = 3) -> str:
         picked.append(f"<{url}>")
         if len(picked) == max_links:
             break
-    return "\n-# 🔎 Searched the web · " + " · ".join(picked) if picked else ""
+    return "".join(f" · {link}" for link in picked)
 
 
-def _describe(use: ToolUse, max_chars: int = 60) -> str:
-    """`name: first argument`, e.g. `run_command: ls -la`. Backticks are swapped out so the model's
-    arguments can't break out of the code span."""
-    name = re.sub(r"[^\w.-]", "", use.name)[:40] or "tool"
-    detail = next((v for k, v in use.arguments.items() if k != "confirm" and isinstance(v, str) and v.strip()), "")
-    detail = " ".join(detail.split()).replace("`", "'")
-    if len(detail) > max_chars:
-        detail = detail[: max_chars - 1] + "…"
-    return f"{name}: {detail}" if detail else name
-
-
-def tools_footer(uses: list[ToolUse], max_shown: int = 6) -> str:
-    """A small grey line under a message listing the tools the model used for it."""
-    if not uses:
-        return ""
-    shown = [f"`{_describe(use)}`" for use in uses[:max_shown]]
-    if len(uses) > max_shown:
-        shown.append(f"+{len(uses) - max_shown} more")
-    return "\n-# 🛠️ " + " · ".join(shown)
+def tool_line(use: ToolUse, *, show_sources: bool = False) -> str:
+    """The small grey message posted when the model uses a tool, with its links once it has run."""
+    return "-# " + use.description + (source_links(use.sources) if show_sources else "")
 
 
 def link_mentions(text: str, people: dict[str, int]) -> tuple[str, list[int]]:
@@ -407,69 +397,68 @@ class EmiliaBot(discord.Client):
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )
 
-                # A reply can be several Discord messages: whatever the model writes next to a tool call,
-                # then its answer (and in multi-turn mode, more as it keeps working). The tools behind
-                # each message are listed under it; tools used without any text wait for the next message.
+                # A reply can be several Discord messages, posted as they happen: whatever the model writes
+                # next to a tool call, a small line for each tool it uses (edited to add its links once it has
+                # run), then its answer (and in multi-turn mode, more as it keeps working).
                 recent: list[str] = []
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
                 kept: list[str] = []  # what was posted, as the model wrote it (plain "@Name"s): this is remembered
-                tools_used: list[ToolUse] = []
-                sources: list[str] = []
-                reported = 0  # how many of the reply's sources arrived with a step
                 posted = False
 
                 async def post(reply: str, *, from_model: bool = True) -> None:
-                    """Post one message with the pending tool and source lines under it. Canned lines
-                    (from_model=False) are neither remembered nor allowed to ping anyone."""
+                    """Post one message. Canned lines (from_model=False) are neither remembered nor allowed to ping anyone."""
                     nonlocal posted
-                    footer = tools_footer(tools_used)
-                    if self.settings.show_sources:
-                        footer += sources_footer(sources)
-                    tools_used.clear()
-                    sources.clear()
                     pinged: list[int] = []
                     if reply and from_model:
-                        if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
-                            reply = styleguard.cool_down(reply, [*recent, *kept])
-                        kept.append(reply)
-                        pingable = self._pingable(labels, known)
-                        pingable.update(await self._lookup_members(message, reply, text, pingable))
-                        reply, pinged = link_mentions(reply, pingable)
-                    if reply or footer:
+                        if prompts.LEAK_DETECTOR.leaks(reply):
+                            log.warning("Blocked a reply that repeated the system prompt")
+                            reply, from_model = prompts.BLOCKED_REPLY, False
+                        else:
+                            if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
+                                reply = styleguard.cool_down(reply, [*recent, *kept])
+                            kept.append(reply)
+                            pingable = self._pingable(labels, known)
+                            pingable.update(await self._lookup_members(message, reply, text, pingable))
+                            reply, pinged = link_mentions(reply, pingable)
+                    if reply:
                         posted = True
-                        await self._send(message, (reply + footer).strip(), pinged)
+                        await self._send(message, reply, pinged)
 
-                async def post_checked(reply: str) -> None:
-                    if prompts.LEAK_DETECTOR.leaks(reply):
-                        log.warning("Blocked a reply that repeated the system prompt")
-                        await post(prompts.BLOCKED_REPLY, from_model=False)
-                    else:
-                        await post(reply)
-
-                async def on_step(step: Step) -> None:
-                    nonlocal reported
-                    reported += len(step.sources)
-                    tools_used.extend(step.tools)
-                    sources.extend(step.sources)
-                    reply = clean_reply(step.text, self._speaker_names())
+                async def on_text(draft: str) -> None:
+                    reply = clean_reply(draft, self._speaker_names())
                     if contains_cipher_script(reply):
                         log.warning("Dropped a message written in braille/cipher script")
+                    elif reply:
+                        await post(reply)
+
+                tool_messages: dict[int, discord.Message] = {}  # by id() of the ToolUse
+
+                async def on_tool(use: ToolUse) -> None:
+                    nonlocal posted
+                    posted = True
+                    sent = await message.channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
+                    tool_messages[id(use)] = sent
+
+                async def on_tool_done(use: ToolUse) -> None:
+                    sent = tool_messages.pop(id(use), None)
+                    if sent is None or not (self.settings.show_sources and source_links(use.sources)):
                         return
-                    if reply:
-                        await post_checked(reply)
+                    try:
+                        await sent.edit(content=tool_line(use, show_sources=True), allowed_mentions=discord.AllowedMentions.none())
+                    except discord.HTTPException as exc:
+                        log.info("Could not add links to a tool message (%s)", exc)
 
                 try:
-                    result = await self.llm.chat(messages, on_step)
+                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done)
                     reply = clean_reply(result.text, self._speaker_names())
                     if contains_cipher_script(reply) and not result.used_tools and not posted:
                         # Someone talked the model into writing in braille (or similar). Try once more
                         # with a nudge; nothing has run or been posted yet, so the retry is harmless.
                         log.warning("Reply was written in braille/cipher script; retrying once in plain text")
                         nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
-                        result = await self.llm.chat([*messages[:-1], nudged], on_step)
+                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done)
                         reply = clean_reply(result.text, self._speaker_names())
-                    sources.extend(result.sources[reported:])  # any that didn't come with a step
                 except LLMError as exc:
                     log.error("LM Studio request failed: %s", exc)
                     await post(prompts.ERROR_REPLY, from_model=False)
@@ -477,8 +466,8 @@ class EmiliaBot(discord.Client):
                     if contains_cipher_script(reply):
                         log.warning("Reply was still in braille/cipher script; posting a canned reply")
                         await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
-                    elif reply or tools_used or sources:
-                        await post_checked(reply)
+                    elif reply:
+                        await post(reply)
                     elif not posted:
                         log.warning("The model sent an empty reply")
                         await post(prompts.EMPTY_REPLY, from_model=False)

@@ -26,9 +26,13 @@ from unittest import mock
 import discord
 
 import prompts
-from bot import EmiliaBot, sources_footer
+from computer import computer_tools
+from restart import RestartTool
+from tooling import default_description
+from websearch import WebSearchTool
+from bot import EmiliaBot, source_links
 from config import Settings
-from llm import ChatResult, LLMError, Step, ToolUse
+from llm import ChatResult, LLMError, ToolUse
 from memory import MemoryStore
 
 BOT = SimpleNamespace(id=999, display_name="Emilia", bot=True)
@@ -47,7 +51,7 @@ class FakeLLM:
     async def close(self):
         pass
 
-    async def chat(self, messages, on_step=None):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
         self.calls.append(messages)
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -57,18 +61,27 @@ class FakeLLM:
         return ChatResult(text, list(self.sources), bool(self.sources))
 
 
-class SteppingLLM(FakeLLM):
-    """A fake that works with tools: it hands each Step to the bot, then ends with `final`."""
+class WorkingLLM(FakeLLM):
+    """A fake that works with tools: it reports each event (text, or a ToolUse) as it happens, then ends with `final`."""
 
-    def __init__(self, steps, final="", sources=()):
+    def __init__(self, events, final="", sources=()):
         super().__init__(text=final, sources=sources)
-        self.steps = list(steps)
+        self.events = list(events)
 
-    async def chat(self, messages, on_step=None):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
         self.calls.append(messages)
-        for step in self.steps:
-            await on_step(step)
-        return ChatResult(self.text, [u for step in self.steps for u in step.sources] + list(self.sources), True)
+        for event in self.events:
+            if isinstance(event, ToolUse):
+                await on_tool(event)
+                await on_tool_done(event)
+            else:
+                await on_text(event)
+        return ChatResult(self.text, list(self.sources), True)
+
+
+def use(description, sources=(), name="some_tool"):
+    """A tool call as LMStudioClient reports it: its chat line, and (once run) its sources."""
+    return ToolUse(name, {}, description, list(sources))
 
 
 class _Typing:
@@ -82,12 +95,25 @@ class _Typing:
         return False
 
 
+class _Sent:
+    """A message the bot sent to a FakeChannel; editing it changes it in place in `sent` and `timeline`."""
+
+    def __init__(self, channel, sent_index, timeline_index):
+        self.channel, self.sent_index, self.timeline_index = channel, sent_index, timeline_index
+
+    async def edit(self, content, allowed_mentions=None):
+        self.channel.sent[self.sent_index] = content
+        self.channel.timeline[self.timeline_index] = content
+        self.channel.allowed_mentions.append(allowed_mentions)
+
+
 class FakeChannel:
     def __init__(self, channel_id=1, can_manage=False):
         self.id = channel_id
         self.can_manage = can_manage
         self.sent = []
         self.allowed_mentions = []  # the AllowedMentions of every send()
+        self.timeline = []  # every message posted here, replies included, in order
         self.typing_count = 0
 
     def typing(self):
@@ -96,6 +122,8 @@ class FakeChannel:
     async def send(self, text, allowed_mentions=None):
         self.sent.append(text)
         self.allowed_mentions.append(allowed_mentions)
+        self.timeline.append(text)
+        return _Sent(self, len(self.sent) - 1, len(self.timeline) - 1)
 
     def permissions_for(self, member):
         return SimpleNamespace(manage_messages=self.can_manage)
@@ -167,6 +195,7 @@ class FakeMessage:
     async def reply(self, text, allowed_mentions=None):
         self.replies.append(text)
         self.allowed_mentions.append(allowed_mentions)
+        self.channel.timeline.append(text)
 
 
 class BotTestCase(unittest.IsolatedAsyncioTestCase):
@@ -358,22 +387,6 @@ class ConversationTests(BotTestCase):
         self.assertEqual(len(message.replies), 1)  # the first piece replies, the rest follow in the channel
         self.assertTrue(all(0 < len(piece) <= 2000 for piece in pieces))
         self.assertEqual(" ".join(" ".join(pieces).split()).count("lorem"), 200)
-
-    async def test_sources_footer_is_shown_but_not_remembered(self):
-        urls = ["https://a.example/1", "https://a.example/1", "https://b.example/2", "https://c.example/3", "https://d.example/4"]
-        bot = self.make_bot(llm=FakeLLM(text="It is sunny.", sources=urls))
-        message = self.msg(self.mention("weather?"))
-        await bot.on_message(message)
-        self.assertTrue(message.replies[0].startswith("It is sunny.\n-# 🔎 Searched the web"))
-        self.assertIn("<https://a.example/1> · <https://b.example/2> · <https://c.example/3>", message.replies[0])
-        self.assertNotIn("d.example", message.replies[0])
-        self.assertEqual(self.memory.recent("1")[-1].content, "It is sunny.")
-
-    async def test_sources_footer_can_be_turned_off(self):
-        bot = self.make_bot(llm=FakeLLM(text="It is sunny.", sources=["https://a.example"]), show_sources=False)
-        message = self.msg(self.mention("weather?"))
-        await bot.on_message(message)
-        self.assertEqual(message.replies, ["It is sunny."])
 
     async def test_replying_to_someone_elses_message_includes_what_it_said(self):
         bot = self.make_bot()
@@ -1064,26 +1077,23 @@ class YandereModeTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey <@20>!"])
 
 
-class SourcesFooterTests(unittest.TestCase):
-    def test_no_sources_no_footer(self):
-        self.assertEqual(sources_footer([]), "")
+class SourceLinksTests(unittest.TestCase):
+    def test_no_sources_no_links(self):
+        self.assertEqual(source_links([]), "")
 
     def test_links_are_wrapped_to_avoid_embeds_and_deduplicated(self):
-        footer = sources_footer(["https://a.example", "https://a.example", "https://b.example"])
-        self.assertEqual(footer, "\n-# 🔎 Searched the web · <https://a.example> · <https://b.example>")
+        links = source_links(["https://a.example", "https://a.example", "https://b.example", "https://c.example", "https://d.example"])
+        self.assertEqual(links, " · <https://a.example> · <https://b.example> · <https://c.example>")
 
     def test_unsafe_or_huge_links_are_skipped(self):
         urls = ["https://x.example/a>b", "https://x.example/has space", "https://x.example/" + "a" * 300, "https://ok.example"]
-        self.assertEqual(sources_footer(urls), "\n-# 🔎 Searched the web · <https://ok.example>")
+        self.assertEqual(source_links(urls), " · <https://ok.example>")
 
 
 class ToolDisplayTests(BotTestCase):
-    async def test_each_message_lists_the_tools_used_for_it_in_small_print(self):
-        llm = SteppingLLM(
-            [
-                Step("Let me look.", [ToolUse("list_files", {"path": "."})]),
-                Step("Found it, fixing now.", [ToolUse("edit_file", {"path": "notes.txt", "old": "a", "new": "b", "confirm": True})]),
-            ],
+    async def test_each_tool_use_is_its_own_small_message_posted_when_it_happens(self):
+        llm = WorkingLLM(
+            ["Let me look.", use("📂 Looking through `.`"), "Found it, fixing now.", use("✏️ Editing `notes.txt`")],
             final="All done!",
         )
         bot = self.make_bot(llm=llm)
@@ -1091,64 +1101,83 @@ class ToolDisplayTests(BotTestCase):
         await bot.on_message(message)
 
         self.assertEqual(
-            message.replies + self.channel.sent,
-            [
-                "Let me look.\n-# 🛠️ `list_files: .`",
-                "Found it, fixing now.\n-# 🛠️ `edit_file: notes.txt`",
-                "All done!",
-            ],
+            self.channel.timeline,
+            ["Let me look.", "-# 📂 Looking through `.`", "Found it, fixing now.", "-# ✏️ Editing `notes.txt`", "All done!"],
         )
+        self.assertEqual(self.channel.sent, ["-# 📂 Looking through `.`", "-# ✏️ Editing `notes.txt`"])  # not replies
+        for allowed in self.channel.allowed_mentions:  # a tool line can never ping anyone
+            self.assertEqual(allowed.to_dict(), discord.AllowedMentions.none().to_dict())
         # Everything she said is remembered as one reply; the tool lines are not.
         self.assertEqual(self.memory.recent("1")[-1].content, "Let me look.\n\nFound it, fixing now.\n\nAll done!")
 
-    async def test_tools_used_without_a_message_are_listed_under_the_next_one(self):
-        llm = SteppingLLM(
-            [Step("", [ToolUse("web_search", {"query": "weather `atlanta`"})], ["https://wx.example/atl"])],
-            final="It's sunny!",
-        )
+    async def test_a_tool_line_gets_its_links_once_the_tool_has_run(self):
+        urls = ["https://wx.example/atl", "https://wx.example/atl", "https://b.example", "https://c.example", "https://d.example"]
+        llm = WorkingLLM([use("🔎 Searching the web for `atlanta weather`", urls)], final="It's sunny!")
         bot = self.make_bot(llm=llm)
         message = self.msg(self.mention("weather?"))
         await bot.on_message(message)
         self.assertEqual(
-            message.replies,
-            ["It's sunny!\n-# 🛠️ `web_search: weather 'atlanta'`\n-# 🔎 Searched the web · <https://wx.example/atl>"],
+            self.channel.timeline,
+            [
+                "-# 🔎 Searching the web for `atlanta weather` · <https://wx.example/atl> · <https://b.example> · <https://c.example>",
+                "It's sunny!",
+            ],
         )
+        self.assertEqual(self.memory.recent("1")[-1].content, "It's sunny!")  # links are not remembered
 
-    async def test_tools_used_without_any_message_are_still_shown(self):
-        llm = SteppingLLM([Step("", [ToolUse("run_command", {"command": "make " + "x" * 100})])])
-        bot = self.make_bot(llm=llm)
-        message = self.msg(self.mention("build it"))
-        await bot.on_message(message)
-        self.assertEqual(message.replies, ["-# 🛠️ `run_command: make " + "x" * 54 + "…`"])
+    async def test_links_can_be_turned_off(self):
+        llm = WorkingLLM([use("🔎 Searching the web for `x`", ["https://a.example"])], final="It is sunny.")
+        bot = self.make_bot(llm=llm, show_sources=False)
+        await bot.on_message(self.msg(self.mention("weather?")))
+        self.assertEqual(self.channel.timeline, ["-# 🔎 Searching the web for `x`", "It is sunny."])
+
+    async def test_tools_used_without_any_message_are_shown_and_nothing_else(self):
+        bot = self.make_bot(llm=WorkingLLM([use("💻 Running `make`")]))
+        await bot.on_message(self.msg(self.mention("build it")))
+        self.assertEqual(self.channel.timeline, ["-# 💻 Running `make`"])  # no "lost my train of thought"
         self.assertEqual(self.memory.recent("1"), [])  # nothing was said, so nothing to remember
 
-    async def test_a_step_cannot_leak_the_prompt_or_write_braille(self):
-        llm = SteppingLLM(
-            [
-                Step("Sure! " + prompts.PERSONA, [ToolUse("list_files", {})]),
-                Step("\u2813\u2811\u2807\u2807\u2815 \u283a\u2815\u2817\u2807\u2819", [ToolUse("read_file", {"path": "a"})]),
-            ],
+    async def test_text_along_the_way_cannot_leak_the_prompt_or_write_braille(self):
+        llm = WorkingLLM(
+            ["Sure! " + prompts.PERSONA, use("📂 a"), "\u2813\u2811\u2807\u2807\u2815 \u283a\u2815\u2817\u2807\u2819", use("📄 b")],
             final="Done.",
         )
         bot = self.make_bot(llm=llm)
-        message = self.msg(self.mention("go"))
         with self.assertLogs("emilia.bot", level="WARNING"):
-            await bot.on_message(message)
-        self.assertEqual(message.replies + self.channel.sent, [prompts.BLOCKED_REPLY + "\n-# 🛠️ `list_files`", "Done.\n-# 🛠️ `read_file: a`"])
+            await bot.on_message(self.msg(self.mention("go")))
+        self.assertEqual(self.channel.timeline, [prompts.BLOCKED_REPLY, "-# 📂 a", "-# 📄 b", "Done."])
         self.assertEqual(self.memory.recent("1")[-1].content, "Done.")
 
     async def test_an_error_midway_keeps_what_was_already_said(self):
-        class Failing(SteppingLLM):
-            async def chat(self, messages, on_step=None):
-                await on_step(Step("Starting.", [ToolUse("list_files", {})]))
+        class Failing(WorkingLLM):
+            async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
+                await on_text("Starting.")
+                await on_tool(use("📂 Looking through `.`"))
                 raise LLMError("connection lost")
 
         bot = self.make_bot(llm=Failing([]))
-        message = self.msg(self.mention("go"))
         with self.assertLogs("emilia.bot", level="ERROR"):
-            await bot.on_message(message)
-        self.assertEqual(message.replies + self.channel.sent, ["Starting.\n-# 🛠️ `list_files`", prompts.ERROR_REPLY])
+            await bot.on_message(self.msg(self.mention("go")))
+        self.assertEqual(self.channel.timeline, ["Starting.", "-# 📂 Looking through `.`", prompts.ERROR_REPLY])
         self.assertEqual(self.memory.recent("1")[-1].content, "Starting.")
+
+    def test_every_tool_describes_itself(self):
+        tools = {tool.name: tool for tool in computer_tools(".")}
+        tools["web_search"] = WebSearchTool()
+        tools["restart_bot"] = RestartTool([], None)
+        for name, arguments, expected in [
+            ("web_search", {"query": "weather `atlanta`"}, "🔎 Searching the web for `weather 'atlanta'`"),
+            ("list_files", {}, "📂 Looking through `.`"),
+            ("read_file", {"path": "notes.txt"}, "📄 Reading `notes.txt`"),
+            ("write_file", {"path": "a.txt", "content": "hi"}, "📝 Writing `a.txt`"),
+            ("edit_file", {"path": "a.txt", "old": "x", "new": "y"}, "✏️ Editing `a.txt`"),
+            ("delete_path", {"path": "old"}, "🗑️ Deleting `old`"),
+            ("run_command", {"command": "make " + "x" * 100}, "💻 Running `make " + "x" * 54 + "…`"),
+            ("restart_bot", {"confirm": True}, "🔄 Restarting the bot"),
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(tools[name].describe(arguments), expected)
+        self.assertEqual(default_description("lookup", {"confirm": True, "term": "tea"}), "🛠️ `lookup: tea`")
 
     async def test_multi_turn_settings_reach_the_client_and_the_prompt(self):
         bot = EmiliaBot(Settings(discord_token="x", multi_turn_tools=True, max_tool_turns=5, computer_tools=True), memory=MemoryStore(":memory:"))

@@ -27,7 +27,7 @@ Tools are assembled in `EmiliaBot._build_tools`. `do_nothing` is not a tool ther
 
 ### How a reply flows
 
-`LMStudioClient.chat(messages, on_step)` runs the generations for one message. Every generation except the last becomes a `Step` (text, `ToolUse`s, sources) passed to `on_step` after its tools ran; the return value (`ChatResult`) is the last thing the model wrote. In `EmiliaBot._respond`, `on_step` and the final result both go through `post()`, which cleans the text, applies the cooldown, resolves pings and appends the tool line (`tools_footer`) and sources line (`sources_footer`). A step with no text holds its tool line for the next message. Everything the model said is stored in memory as one reply joined by blank lines.
+`LMStudioClient.chat(messages, on_text, on_tool, on_tool_done)` runs the generations for one message. As it goes, text the model writes before its last message is passed to `on_text`, and each tool call to `on_tool` just before the tool runs (as a `ToolUse` whose `description` comes from the tool's `describe()`), then to `on_tool_done` with its `sources` filled in; the return value (`ChatResult`) is the last thing the model wrote. In `EmiliaBot._respond`, `on_text` and the final result go through `post()`, which cleans the text, checks for prompt leaks, applies the cooldown and resolves pings. `on_tool` posts `tool_line(use)` as its own channel message with no mentions allowed, and `on_tool_done` edits the links (`source_links`) into it. Everything the model said is stored in memory as one reply joined by blank lines.
 
 ## Running and testing
 
@@ -48,7 +48,7 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 
 - Every `.py` file starts with the AGPL SPDX header block (copy it from an existing file), followed by a module docstring.
 - **Adding a setting** means changing four places together: `config.py` (`Settings` field + `from_env`, using `_flag`/`_number`/`_text`), `.env.example` (commented, with a default and a sentence of explanation), the configuration table in `README.md`, and `tests/test_config.py`.
-- **Adding a tool**: implement the `Tool` protocol from `tooling.py`, register it in `EmiliaBot._build_tools`, and mention it in the prompt rules in `prompts.py` if the model needs guidance on when to use it. Tool results are plain text for the model; put URLs to show users in `ToolResult.sources`.
+- **Adding a tool**: implement the `Tool` protocol from `tooling.py`, register it in `EmiliaBot._build_tools`, and mention it in the prompt rules in `prompts.py` if the model needs guidance on when to use it. Give it a `describe(arguments)` method returning the line shown in Discord when it is used (an emoji, present tense, arguments wrapped with `tooling.code_span`). Tool results are plain text for the model; put URLs to show users in `ToolResult.sources`; they are added to the tool's line after it runs.
 - Keep the README up to date when behaviour changes. It explains design decisions, so update it in the same change.
 - Log errors and details with `log`; never post them in Discord. Canned replies in `prompts.py` are what users see.
 - The character and canned replies stay in persona. Change the persona only in `prompts.py`.

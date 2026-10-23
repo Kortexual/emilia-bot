@@ -64,6 +64,9 @@ class RestartTool:
         self._handed_off = False
         self._replacement: subprocess.Popen | None = None  # the new bot; it outlives this process
 
+    def describe(self, arguments: dict[str, Any]) -> str:
+        return "🔄 Restarting the bot"
+
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         if self._require_confirmation and arguments.get("confirm") is not True:
             return ToolResult("Confirmation required: repeat this call with confirm=true to restart the bot.")

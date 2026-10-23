@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from tooling import ToolResult
+from tooling import ToolResult, code_span
 
 MAX_FILE_BYTES = 256_000
 MAX_OUTPUT_CHARS = 12_000
@@ -197,12 +197,27 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
     return {"name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}
 
 
+# What the chat sees when the model uses each tool: the text, the argument it names, and its default.
+_LABELS = {
+    "list_files": ("📂 Looking through", "path", "."),
+    "read_file": ("📄 Reading", "path", ""),
+    "write_file": ("📝 Writing", "path", ""),
+    "edit_file": ("✏️ Editing", "path", ""),
+    "delete_path": ("🗑️ Deleting", "path", ""),
+    "run_command": ("💻 Running", "command", ""),
+}
+
+
 class _WorkspaceTool:
     def __init__(self, tools: WorkspaceTools, name: str, schema: dict[str, Any]) -> None:
         self._tools, self.name, self.schema = tools, name, schema
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         return await getattr(self._tools, self.name)(arguments)
+
+    def describe(self, arguments: dict[str, Any]) -> str:
+        text, key, default = _LABELS[self.name]
+        return f"{text} {code_span(arguments.get(key) or default)}".rstrip()
 
 
 def computer_tools(

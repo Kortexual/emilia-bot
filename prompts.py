@@ -165,8 +165,8 @@ MULTI_TURN_RULES = (
     "Working over several turns:\n"
     "- After you use a tool you get another turn, and another after that, so you can do longer tasks "
     "step by step. Each time you are prompted, keep going if there is more to do.\n"
-    "- Anything you write is posted in the chat straight away, and the tools you use are listed under "
-    "it. Short progress notes are fine; don't repeat yourself.\n"
+    "- Anything you write is posted in the chat straight away, and so is a short note for every tool "
+    "you use. Short progress notes are fine; don't repeat yourself.\n"
     "- When the task is done and you have said what you wanted to say, call do_nothing to end your turn. "
     "Never post the same message twice."
 )
@@ -195,7 +195,7 @@ def build_system_prompt(
     parts.append(RULES.format(today=pretty_date))
     if web_search:
         link_note = (
-            "Links to your sources are added to your message automatically, so don't paste URLs."
+            "Links to your sources are shown in the chat automatically, so don't paste URLs."
             if show_sources
             else "Don't paste long URLs."
         )

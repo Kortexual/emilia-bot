@@ -40,7 +40,7 @@ from typing import Any, Awaitable, Callable, Sequence
 import aiohttp
 
 from textutil import TOOL_BLOCKS, strip_reasoning, strip_tool_markup
-from tooling import Tool, ToolResult
+from tooling import Tool, ToolResult, default_description
 
 log = logging.getLogger("emilia.llm")
 
@@ -93,7 +93,7 @@ class LLMHTTPError(LLMError):
 
 @dataclass
 class ChatResult:
-    text: str  # the last thing the model wrote; earlier messages went to on_step
+    text: str  # the last thing the model wrote; earlier messages went to on_text
     sources: list[str] = field(default_factory=list)  # URLs returned by tools along the way
     used_tools: bool = False
 
@@ -102,18 +102,12 @@ class ChatResult:
 class ToolUse:
     name: str
     arguments: dict[str, Any]
+    description: str = ""  # the line shown in the chat, from the tool's describe()
+    sources: list[str] = field(default_factory=list)  # filled in once the tool has run
 
 
-@dataclass
-class Step:
-    """One generation that was not the last: what the model wrote, and the tools it ran (already finished)."""
-
-    text: str
-    tools: list[ToolUse] = field(default_factory=list)
-    sources: list[str] = field(default_factory=list)
-
-
-StepHandler = Callable[[Step], Awaitable[None]]
+TextHandler = Callable[[str], Awaitable[None]]
+ToolHandler = Callable[[ToolUse], Awaitable[None]]
 
 
 @dataclass
@@ -242,11 +236,18 @@ class LMStudioClient:
         log.info("LMSTUDIO_MODEL is not set; using %s", self.model)
 
     # --- chat ------------------------------------------------------------------
-    async def chat(self, messages: list[dict[str, Any]], on_step: StepHandler | None = None) -> ChatResult:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        on_text: TextHandler | None = None,
+        on_tool: ToolHandler | None = None,
+        on_tool_done: ToolHandler | None = None,
+    ) -> ChatResult:
         """Run a conversation to completion, executing any tool calls the model makes on the way.
 
-        Every generation except the last is handed to `on_step` once its tools have run, so the caller
-        can post it. Without multi-turn mode the model gets MAX_TOOL_ROUNDS rounds of tools and then
+        As it goes, whatever the model writes before its last message is handed to `on_text`, and every
+        tool call to `on_tool` just before the tool runs (and to `on_tool_done` after, with its sources),
+        so the caller can post them as they happen. Without multi-turn mode the model gets MAX_TOOL_ROUNDS rounds of tools and then
         must answer. In multi-turn mode a tool call starts "working": the model is prompted again after
         every generation (text or tools) until it calls do_nothing or max_turns runs out. do_nothing is
         only offered while working, so it can't end a reply before it has started.
@@ -289,8 +290,8 @@ class LMStudioClient:
                 # nothing new, or no turn left after this one, means it has finished.
                 if not working or not text or round_no + 2 >= limit:
                     return ChatResult(text, sources, used_tools)
-                if on_step is not None:
-                    await on_step(Step(text))
+                if on_text is not None:
+                    await on_text(text)
                 said.append(text)
                 convo.append({"role": "assistant", "content": text})
                 convo.append({"role": "user", "content": CONTINUE_HINT})
@@ -315,9 +316,12 @@ class LMStudioClient:
                 hint = _LAST_TURN_HINT if self._multi_turn else _FINAL_ANSWER_HINT
             else:
                 hint = CONTINUE_HINT if self._multi_turn else ""
-            step = Step(text)
+            if working and all(call.name == DO_NOTHING for call in calls):
+                return ChatResult(text, sources, used_tools)  # what it wrote alongside do_nothing is its last message
             if text:
                 said.append(text)
+                if on_text is not None:
+                    await on_text(text)
             finished = False
             for call in calls:
                 log.info("Model called %s(%s)", call.name, json.dumps(call.arguments)[:200])
@@ -325,22 +329,31 @@ class LMStudioClient:
                     finished = True
                     result = ToolResult("Done.")
                 else:
+                    use = ToolUse(call.name, call.arguments, self._describe(call))
+                    if on_tool is not None:
+                        await on_tool(use)
                     result = await self._run_tool(call, offered)
-                    step.tools.append(ToolUse(call.name, call.arguments))
-                    step.sources.extend(result.sources)
+                    use.sources = list(result.sources)
+                    if on_tool_done is not None:
+                        await on_tool_done(use)
+                    used_tools = True
                 sources.extend(result.sources)
                 note = f"\n\n{hint}" if hint and call is calls[-1] else ""
                 convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
-            used_tools = used_tools or bool(step.tools)
             working = working or (self._multi_turn and any(call.name in self._tools for call in calls))
-            if finished and not step.tools:
-                return ChatResult(text, sources, used_tools)  # what it wrote alongside do_nothing is its last message
-            if on_step is not None:
-                await on_step(step)
             if finished:
                 return ChatResult("", sources, used_tools)
 
         raise LLMError("the tool loop ended without an answer")  # unreachable: the last round offers no tools
+
+    def _describe(self, call: _ToolCall) -> str:
+        describe = getattr(self._tools.get(call.name), "describe", None)
+        if describe is not None:
+            try:
+                return describe(call.arguments)
+            except Exception:
+                log.exception("Could not describe a call to %s", call.name)
+        return default_description(call.name, call.arguments)
 
     async def _run_tool(self, call: _ToolCall, offered: set[str]) -> ToolResult:
         tool = self._tools.get(call.name) if call.name in offered else None

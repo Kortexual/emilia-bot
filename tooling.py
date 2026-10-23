@@ -32,9 +32,27 @@ class ToolResult:
 
 
 class Tool(Protocol):
-    """Anything the model may ask for. `schema` is the OpenAI "function" object."""
+    """Anything the model may ask for. `schema` is the OpenAI "function" object.
+
+    A tool may also define `describe(arguments) -> str`: the short line posted in the chat when the
+    model uses it, e.g. "💻 Running `ls -la`". Tools without one get default_description()."""
 
     name: str
     schema: dict[str, Any]  # {"name": ..., "description": ..., "parameters": {JSON schema}}
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult: ...
+
+
+def code_span(value: Any, max_chars: int = 60) -> str:
+    """`value` as one short line of inline code. Backticks are swapped out so model-written arguments
+    can't break out of the span; "" for nothing."""
+    text = " ".join(str(value).split()).replace("`", "'")
+    if len(text) > max_chars:
+        text = text[: max_chars - 1] + "…"
+    return f"`{text}`" if text else ""
+
+
+def default_description(name: str, arguments: dict[str, Any]) -> str:
+    """For tools without describe(): the name and its first argument, e.g. "🛠️ `lookup: tea`"."""
+    detail = next((v for k, v in arguments.items() if k != "confirm" and isinstance(v, str) and v.strip()), "")
+    return "🛠️ " + code_span(f"{name}: {detail}" if detail.strip() else name)
