@@ -30,8 +30,10 @@ cancelling a request really does stop LM Studio from generating.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -56,10 +58,26 @@ _DO_NOTHING_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 CONTINUE_HINT = (
-    "(Your turn continues. Anything you write is posted in the chat right away. Keep working or talking "
-    "if there is more to do, or call do_nothing to finish.)"
+    "(Note from the system, not from anyone in the chat: your turn is still going. If you have finished, "
+    "call do_nothing now and write nothing. Only write if you have something new to say; never repeat or "
+    "sum up what you already said. Anything you write is posted in the chat right away.)"
 )
 _LAST_TURN_HINT = "(This is your last turn for this message. No more tools are available, so write your final message now.)"
+
+
+def _repeats(text: str, earlier: Sequence[str]) -> bool:
+    """Whether `text` says again what the model already said during this reply. Models asked to carry
+    on after they have finished tend to post their last message again instead of calling do_nothing."""
+    def norm(value: str) -> str:
+        return " ".join(re.sub(r"[^\w\s]", " ", value.casefold()).split())
+
+    new = norm(text)
+    for old in map(norm, earlier):
+        if new == old or (min(len(new), len(old)) >= 20 and (new in old or old in new)):
+            return True
+        if difflib.SequenceMatcher(None, new, old).ratio() >= 0.8:
+            return True
+    return False
 
 
 class LLMError(Exception):
@@ -238,6 +256,7 @@ class LMStudioClient:
         used_ids: set[str] = set()
         used_tools = False
         working = False
+        said: list[str] = []  # what the model wrote so far in this reply, to catch it repeating itself
         tools_enabled = bool(self._tools)
         limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
@@ -258,18 +277,23 @@ class LMStudioClient:
             content = message.get("content")
             content = content if isinstance(content, str) else ""
             text = strip_tool_markup(strip_reasoning(content))
+            if working and text and _repeats(text, said):
+                log.info("The model repeated itself; not posting it again")
+                text = ""
 
             calls: list[_ToolCall] = []
             if offer:
                 calls = _structured_calls(message, round_no) or parse_inline_calls(content, offered, round_no)
             if not calls:
-                if not working or last:
+                # Without tools the reply ends here, unless it is working and has something new to say;
+                # nothing new, or no turn left after this one, means it has finished.
+                if not working or not text or round_no + 2 >= limit:
                     return ChatResult(text, sources, used_tools)
-                # Still working: what it said is posted and it gets another turn.
                 if on_step is not None:
                     await on_step(Step(text))
+                said.append(text)
                 convo.append({"role": "assistant", "content": text})
-                convo.append({"role": "user", "content": _LAST_TURN_HINT if round_no + 2 >= limit else CONTINUE_HINT})
+                convo.append({"role": "user", "content": CONTINUE_HINT})
                 continue
 
             calls = calls[:MAX_CALLS_PER_ROUND]
@@ -292,6 +316,8 @@ class LMStudioClient:
             else:
                 hint = CONTINUE_HINT if self._multi_turn else ""
             step = Step(text)
+            if text:
+                said.append(text)
             finished = False
             for call in calls:
                 log.info("Model called %s(%s)", call.name, json.dumps(call.arguments)[:200])

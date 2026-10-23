@@ -116,7 +116,9 @@ nothing else is said. Memory keeps everything the model said for one request as 
 - **`MULTI_TURN_TOOLS=false` (default).** The model can write a message and call tools, gets the results, and then has to answer:
   at most two rounds of tools per message.
 - **`MULTI_TURN_TOOLS=true`.** A tool call starts a longer turn. After every step (tools, or just text) the model is prompted
-  again and can keep working and talking, until it calls `do_nothing` or reaches `MAX_TOOL_TURNS` generations. `do_nothing`
+  again and can keep working and talking, until it calls `do_nothing` or reaches `MAX_TOOL_TURNS` generations. Many models
+  answer that prompt by saying their last message again instead of calling `do_nothing`, so a reply that is empty or repeats
+  something already said in this reply also ends the turn, and is not posted. `do_nothing`
   is only offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still
   a single generation. Each step is a full generation, so long tasks on big models take a while.
 

@@ -384,12 +384,55 @@ class MultiTurnTests(ClientTestCase):
         self.assertEqual(result.text, "Oh, hello!")
 
     async def test_the_number_of_turns_is_capped_and_the_last_must_answer(self):
-        server = self.serve([tool_reply(("web_search", {"query": "x"})), text_reply("still going"), text_reply("Final.")])
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), tool_reply(("web_search", {"query": "y"})), text_reply("Final.")])
         result, steps = await self.chat(server, max_turns=3)
         self.assertEqual(result.text, "Final.")
         self.assertEqual(len(server.requests), 3)
         self.assertNotIn("tools", server.requests[-1])
         self.assertIn("last turn", server.requests[-1]["messages"][-1]["content"])
+
+    async def test_talking_on_the_last_turn_but_one_ends_the_reply(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), text_reply("Here's what I found.")])
+        result, steps = await self.chat(server, max_turns=3)
+        self.assertEqual(result.text, "Here's what I found.")
+        self.assertEqual(len(server.requests), 2)  # no extra prompt that would only get the message repeated
+
+    async def test_repeating_the_last_message_ends_the_reply_without_posting_it_again(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                text_reply("The capital of Australia is Canberra!"),
+                text_reply("The capital of Australia is Canberra! 😊"),
+            ]
+        )
+        with self.assertLogs("emilia.llm", level="INFO"):
+            result, steps = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual([s.text for s in steps], ["", "The capital of Australia is Canberra!"])
+        self.assertEqual(len(server.requests), 3)
+
+    async def test_saying_nothing_while_working_ends_the_reply(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"}), content="Done, it's Canberra."), text_reply("")])
+        result, steps = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual([s.text for s in steps], ["Done, it's Canberra."])
+        self.assertEqual(len(server.requests), 2)
+
+    async def test_a_repeat_next_to_a_tool_call_is_not_posted_but_the_tool_still_runs(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"}), content="Checking the weather now."),
+                tool_reply(("web_search", {"query": "y"}), content="Checking the weather now!"),
+                tool_reply((llm.DO_NOTHING, {})),
+            ]
+        )
+        result, steps = await self.chat(server)
+        self.assertEqual([s.text for s in steps], ["Checking the weather now.", ""])
+        self.assertEqual([len(s.tools) for s in steps], [1, 1])
+
+    async def test_new_text_is_not_mistaken_for_a_repeat(self):
+        self.assertFalse(llm._repeats("Now I'll fix the second file.", ["Now I'll fix the first file and test it."]))
+        self.assertTrue(llm._repeats("hello", ["Hello!"]))
 
     async def test_without_multi_turn_do_nothing_is_never_offered(self):
         server = self.serve([tool_reply(("web_search", {"query": "x"}), content="Checking!"), text_reply("Sunny.")])
