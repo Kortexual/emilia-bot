@@ -202,7 +202,11 @@ To change the character, edit `PERSONA` in `prompts.py`.
 
 When `COMPUTER_TOOLS=true`, the `restart_bot` tool is also available. It starts the bot again with
 the same Python command, waits up to 45 seconds for the new process to connect to Discord, then
-closes the old process. If the replacement fails, the original bot remains running.
+closes the old process. If the replacement fails, the original bot remains running. Once the replacement is
+connected it answers all new messages, while the old process finishes the reply it was writing and then exits.
+The replacement reads `.env` again, so changed settings take effect. Restarting is only available on Linux and macOS.
+If the bot runs as a systemd service, the service manager may stop the replacement when the original process exits;
+restart the service with systemd instead.
 
 ### Yandere mode
 `YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes

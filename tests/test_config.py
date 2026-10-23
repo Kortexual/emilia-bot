@@ -19,6 +19,7 @@
 import unittest
 from unittest import mock
 
+import config
 from config import ConfigError, Settings
 
 
@@ -130,6 +131,18 @@ class SettingsTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)
+
+
+class RestartEnvironmentTests(unittest.TestCase):
+    def test_a_restarted_bot_starts_from_the_environment_before_dotenv(self):
+        def fake_dotenv():
+            import os
+            os.environ.setdefault("MULTI_TURN_TOOLS", "false")  # what load_dotenv does: never overrides
+
+        with mock.patch.object(config, "_ENV_BEFORE_DOTENV", None), mock.patch("config.load_dotenv", fake_dotenv), \
+                mock.patch.dict("os.environ", {"DISCORD_TOKEN": "abc"}, clear=True):
+            Settings.from_env()
+            self.assertEqual(config.environment_without_dotenv(), {"DISCORD_TOKEN": "abc"})
 
 
 if __name__ == "__main__":

@@ -1165,5 +1165,28 @@ class ToolDisplayTests(BotTestCase):
         self.assertNotIn(prompts.MULTI_TURN_RULES, self.llm.calls[0][0]["content"])
 
 
+class RestartHandoffTests(BotTestCase):
+    async def test_after_a_handoff_new_messages_are_left_to_the_replacement(self):
+        bot = self.make_bot()
+        bot.close = mock.AsyncMock()
+        await bot._retire_after_handoff()
+        message = self.msg(self.mention("hi"))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, [])
+        self.assertEqual(self.llm.calls, [])
+
+    async def test_the_old_bot_finishes_the_reply_in_progress_before_shutting_down(self):
+        bot = self.make_bot()
+        bot.close = mock.AsyncMock()
+        bot._busy.add(1)  # the reply that asked for the restart is still being written
+        await bot._retire_after_handoff()
+        await bot._retire_after_handoff()  # a second handoff changes nothing
+        await asyncio.sleep(1.6)
+        bot.close.assert_not_awaited()
+        bot._busy.discard(1)
+        await asyncio.wait_for(bot._retire_task, 2)
+        bot.close.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()

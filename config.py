@@ -27,6 +27,14 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# The environment as it was before .env was loaded. A restarted bot starts from this one, so that
+# it reads .env afresh: load_dotenv never overrides variables that are already set.
+_ENV_BEFORE_DOTENV: dict[str, str] | None = None
+
+
+def environment_without_dotenv() -> dict[str, str]:
+    return dict(os.environ if _ENV_BEFORE_DOTENV is None else _ENV_BEFORE_DOTENV)
+
 # The original template used this placeholder; treat it the same as "not set".
 _PLACEHOLDER_MODEL = "your-model-name"
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -106,6 +114,9 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        global _ENV_BEFORE_DOTENV
+        if _ENV_BEFORE_DOTENV is None:
+            _ENV_BEFORE_DOTENV = dict(os.environ)
         load_dotenv()
 
         token = _text("DISCORD_TOKEN")

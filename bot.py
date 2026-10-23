@@ -40,7 +40,7 @@ import discord
 
 import prompts
 import styleguard
-from config import ConfigError, Settings
+from config import ConfigError, Settings, environment_without_dotenv
 from computer import computer_tools
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, Step, StepHandler, ToolUse
@@ -51,6 +51,7 @@ from websearch import WebSearchTool, ddgs_installed
 
 log = logging.getLogger("emilia.bot")
 
+RETIRE_TIMEOUT = 600  # seconds a restarted bot waits for its replies in progress before it shuts down anyway
 CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some headroom
 RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
 FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
@@ -243,7 +244,8 @@ class EmiliaBot(discord.Client):
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
         self._restart_ready_fd = restart_ready_fd
-        self._restart_scheduled = False
+        self._retiring = False  # a replacement has taken over: answer no new messages, then shut down
+        self._retire_task: asyncio.Task[None] | None = None
 
     def _build_tools(self) -> list[Tool]:
         tools: list[Tool] = []
@@ -256,13 +258,15 @@ class EmiliaBot(discord.Client):
                     require_confirmation=self.settings.computer_require_confirmation,
                 )
             )
-            tools.append(
-                RestartTool(
-                    [sys.executable, *sys.argv],
-                    self._retire_after_handoff,
-                    require_confirmation=self.settings.computer_require_confirmation,
+            if os.name == "posix":  # the readiness handoff passes a pipe to the new process
+                tools.append(
+                    RestartTool(
+                        [sys.executable, *sys.argv],
+                        self._retire_after_handoff,
+                        environment=environment_without_dotenv(),
+                        require_confirmation=self.settings.computer_require_confirmation,
+                    )
                 )
-            )
         if not self.settings.web_search:
             return tools
         if not ddgs_installed():
@@ -288,17 +292,21 @@ class EmiliaBot(discord.Client):
                 self._restart_ready_fd = None
 
     async def _retire_after_handoff(self) -> None:
-        if self._restart_scheduled:
+        """The replacement is connected: it answers new messages from now on. This bot finishes the
+        replies it is working on (including the one that asked for the restart), then shuts down."""
+        if self._retiring:
             return
-        self._restart_scheduled = True
+        self._retiring = True
+        log.info("A replacement bot has taken over; shutting down once the current replies are done")
 
         async def retire() -> None:
-            # Leave a brief overlap so the tool call can complete and the old gateway connection
-            # can close cleanly after the replacement has announced readiness.
-            await asyncio.sleep(3)
+            deadline = asyncio.get_running_loop().time() + RETIRE_TIMEOUT
+            await asyncio.sleep(1)  # let the tool result reach the model first
+            while self._busy and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.5)
             await self.close()
 
-        asyncio.create_task(retire())
+        self._retire_task = asyncio.create_task(retire())  # keep a reference so it isn't garbage-collected
 
     async def close(self) -> None:
         await self.llm.close()
@@ -307,7 +315,7 @@ class EmiliaBot(discord.Client):
 
     # --- events ------------------------------------------------------------------
     async def on_message(self, message: discord.Message) -> None:
-        if not self._is_for_me(message):
+        if self._retiring or not self._is_for_me(message):  # once restarted, the replacement answers
             return
         try:
             await self._handle(message)
