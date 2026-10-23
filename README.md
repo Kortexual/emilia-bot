@@ -107,6 +107,19 @@ hands the results back, and the model writes its answer. At most two rounds of u
 - LM Studio 0.4+ can also run MCP servers itself through its native `/api/v1/chat` endpoint. This bot uses the
   OpenAI-compatible endpoint instead, so it works on any version with no extra setup.
 
+### Tool use
+Whatever the model writes next to a tool call is posted straight away, so a reply can come as several Discord messages
+("Let me check..." and then the answer). Every tool it used is listed in a small grey line under the message it belongs to,
+for example `` -# 🛠️ `run_command: ls -la` ``. Tools used without any text are listed under the next message, or on their own line if
+nothing else is said. Memory keeps everything the model said for one request as one reply; the tool lines are not stored.
+
+- **`MULTI_TURN_TOOLS=false` (default).** The model can write a message and call tools, gets the results, and then has to answer:
+  at most two rounds of tools per message.
+- **`MULTI_TURN_TOOLS=true`.** A tool call starts a longer turn. After every step (tools, or just text) the model is prompted
+  again and can keep working and talking, until it calls `do_nothing` or reaches `MAX_TOOL_TURNS` generations. `do_nothing`
+  is only offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still
+  a single generation. Each step is a full generation, so long tasks on big models take a while.
+
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
@@ -171,6 +184,8 @@ All settings are environment variables (or lines in `.env`).
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
 | `COMPUTER_ALLOW_HOST_ACCESS` | `false` | Allow paths and command working directories outside `COMPUTER_WORKSPACE`. This grants the model the OS account's file access. |
 | `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
+| `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `do_nothing` (see "Tool use" below) |
+| `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |

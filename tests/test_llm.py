@@ -319,6 +319,91 @@ class ChatTests(ClientTestCase):
         self.assertEqual(server.requests[0]["max_tokens"], 256)
 
 
+
+class MultiTurnTests(ClientTestCase):
+    """MULTI_TURN_TOOLS: after a tool call the model keeps taking turns until it calls do_nothing."""
+
+    async def chat(self, server, **kwargs):
+        steps = []
+
+        async def on_step(step):
+            steps.append(step)
+
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=True, **kwargs)
+        return await client.chat(USER, on_step), steps
+
+    @staticmethod
+    def offered(request):
+        return [t["function"]["name"] for t in request.get("tools", [])]
+
+    async def test_without_tools_it_is_one_ordinary_reply(self):
+        server = self.serve([text_reply("Hi!")])
+        result, steps = await self.chat(server)
+        self.assertEqual(result.text, "Hi!")
+        self.assertEqual(steps, [])
+        self.assertEqual(self.offered(server.requests[0]), ["web_search"])  # do_nothing can't end a reply before it starts
+
+    async def test_it_keeps_working_and_talking_until_do_nothing(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "one"}), content="Let me check."),
+                text_reply("Interesting, one more thing."),
+                tool_reply(("web_search", {"query": "two"})),
+                tool_reply((llm.DO_NOTHING, {}), content="All done!"),
+            ]
+        )
+        result, steps = await self.chat(server)
+
+        self.assertEqual(result.text, "All done!")
+        self.assertEqual([s.text for s in steps], ["Let me check.", "Interesting, one more thing.", ""])
+        self.assertEqual([[t.name for t in s.tools] for s in steps], [["web_search"], [], ["web_search"]])
+        self.assertEqual(steps[0].sources, ["https://example.com/a"])
+        self.assertTrue(result.used_tools)
+        self.assertEqual(len(server.requests), 4)
+        for request in server.requests[1:]:
+            self.assertEqual(self.offered(request), ["web_search", llm.DO_NOTHING])
+        # After a tool result the prompt rides along with it; after plain text it is its own message.
+        second, third = server.requests[1]["messages"], server.requests[2]["messages"]
+        self.assertIn(llm.CONTINUE_HINT, second[-1]["content"])
+        self.assertEqual(second[-1]["role"], "tool")
+        self.assertEqual(third[-2], {"role": "assistant", "content": "Interesting, one more thing."})
+        self.assertEqual(third[-1], {"role": "user", "content": llm.CONTINUE_HINT})
+
+    async def test_do_nothing_next_to_another_tool_runs_that_tool_then_stops(self):
+        server = self.serve([tool_reply(("web_search", {"query": "a"})), tool_reply(("web_search", {"query": "b"}), (llm.DO_NOTHING, {}))])
+        result, steps = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual([[t.arguments for t in s.tools] for s in steps], [[{"query": "a"}], [{"query": "b"}]])
+        self.assertEqual(len(server.requests), 2)
+
+    async def test_do_nothing_is_refused_before_any_work(self):
+        server = self.serve([tool_reply((llm.DO_NOTHING, {})), text_reply("Oh, hello!")])
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=True)
+        result = await client.chat(USER)
+        self.assertIn("no tool called", server.requests[1]["messages"][3]["content"])
+        self.assertEqual(result.text, "Oh, hello!")
+
+    async def test_the_number_of_turns_is_capped_and_the_last_must_answer(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), text_reply("still going"), text_reply("Final.")])
+        result, steps = await self.chat(server, max_turns=3)
+        self.assertEqual(result.text, "Final.")
+        self.assertEqual(len(server.requests), 3)
+        self.assertNotIn("tools", server.requests[-1])
+        self.assertIn("last turn", server.requests[-1]["messages"][-1]["content"])
+
+    async def test_without_multi_turn_do_nothing_is_never_offered(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"}), content="Checking!"), text_reply("Sunny.")])
+        steps = []
+
+        async def on_step(step):
+            steps.append(step)
+
+        result = await (await self.client(server, tools=[FakeSearch()])).chat(USER, on_step)
+        self.assertEqual(result.text, "Sunny.")
+        self.assertEqual([s.text for s in steps], ["Checking!"])
+        self.assertTrue(all(llm.DO_NOTHING not in self.offered(r) for r in server.requests))
+
+
 class ConnectionTests(ClientTestCase):
     async def test_model_is_auto_detected_and_embedding_models_are_skipped(self):
         server = self.serve([text_reply("hi")], models=("text-embedding-nomic", "qwen-chat", "other-chat"))

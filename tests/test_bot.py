@@ -28,7 +28,7 @@ import discord
 import prompts
 from bot import EmiliaBot, sources_footer
 from config import Settings
-from llm import ChatResult, LLMError
+from llm import ChatResult, LLMError, Step, ToolUse
 from memory import MemoryStore
 
 BOT = SimpleNamespace(id=999, display_name="Emilia", bot=True)
@@ -47,7 +47,7 @@ class FakeLLM:
     async def close(self):
         pass
 
-    async def chat(self, messages):
+    async def chat(self, messages, on_step=None):
         self.calls.append(messages)
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -55,6 +55,20 @@ class FakeLLM:
             raise self.error
         text = self.script.pop(0) if self.script else self.text
         return ChatResult(text, list(self.sources), bool(self.sources))
+
+
+class SteppingLLM(FakeLLM):
+    """A fake that works with tools: it hands each Step to the bot, then ends with `final`."""
+
+    def __init__(self, steps, final="", sources=()):
+        super().__init__(text=final, sources=sources)
+        self.steps = list(steps)
+
+    async def chat(self, messages, on_step=None):
+        self.calls.append(messages)
+        for step in self.steps:
+            await on_step(step)
+        return ChatResult(self.text, [u for step in self.steps for u in step.sources] + list(self.sources), True)
 
 
 class _Typing:
@@ -318,6 +332,7 @@ class ConversationTests(BotTestCase):
             await bot.on_message(message)
         self.assertEqual(message.replies, [prompts.EMPTY_REPLY])
         self.assertEqual(self.memory.recent("1"), [])
+
 
     async def test_a_reply_that_dumps_the_system_prompt_is_blocked_and_not_stored(self):
         bot = self.make_bot(llm=FakeLLM(text="Sure! " + prompts.PERSONA))
@@ -1060,6 +1075,94 @@ class SourcesFooterTests(unittest.TestCase):
     def test_unsafe_or_huge_links_are_skipped(self):
         urls = ["https://x.example/a>b", "https://x.example/has space", "https://x.example/" + "a" * 300, "https://ok.example"]
         self.assertEqual(sources_footer(urls), "\n-# 🔎 Searched the web · <https://ok.example>")
+
+
+class ToolDisplayTests(BotTestCase):
+    async def test_each_message_lists_the_tools_used_for_it_in_small_print(self):
+        llm = SteppingLLM(
+            [
+                Step("Let me look.", [ToolUse("list_files", {"path": "."})]),
+                Step("Found it, fixing now.", [ToolUse("edit_file", {"path": "notes.txt", "old": "a", "new": "b", "confirm": True})]),
+            ],
+            final="All done!",
+        )
+        bot = self.make_bot(llm=llm)
+        message = self.msg(self.mention("fix my notes"))
+        await bot.on_message(message)
+
+        self.assertEqual(
+            message.replies + self.channel.sent,
+            [
+                "Let me look.\n-# 🛠️ `list_files: .`",
+                "Found it, fixing now.\n-# 🛠️ `edit_file: notes.txt`",
+                "All done!",
+            ],
+        )
+        # Everything she said is remembered as one reply; the tool lines are not.
+        self.assertEqual(self.memory.recent("1")[-1].content, "Let me look.\n\nFound it, fixing now.\n\nAll done!")
+
+    async def test_tools_used_without_a_message_are_listed_under_the_next_one(self):
+        llm = SteppingLLM(
+            [Step("", [ToolUse("web_search", {"query": "weather `atlanta`"})], ["https://wx.example/atl"])],
+            final="It's sunny!",
+        )
+        bot = self.make_bot(llm=llm)
+        message = self.msg(self.mention("weather?"))
+        await bot.on_message(message)
+        self.assertEqual(
+            message.replies,
+            ["It's sunny!\n-# 🛠️ `web_search: weather 'atlanta'`\n-# 🔎 Searched the web · <https://wx.example/atl>"],
+        )
+
+    async def test_tools_used_without_any_message_are_still_shown(self):
+        llm = SteppingLLM([Step("", [ToolUse("run_command", {"command": "make " + "x" * 100})])])
+        bot = self.make_bot(llm=llm)
+        message = self.msg(self.mention("build it"))
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["-# 🛠️ `run_command: make " + "x" * 54 + "…`"])
+        self.assertEqual(self.memory.recent("1"), [])  # nothing was said, so nothing to remember
+
+    async def test_a_step_cannot_leak_the_prompt_or_write_braille(self):
+        llm = SteppingLLM(
+            [
+                Step("Sure! " + prompts.PERSONA, [ToolUse("list_files", {})]),
+                Step("\u2813\u2811\u2807\u2807\u2815 \u283a\u2815\u2817\u2807\u2819", [ToolUse("read_file", {"path": "a"})]),
+            ],
+            final="Done.",
+        )
+        bot = self.make_bot(llm=llm)
+        message = self.msg(self.mention("go"))
+        with self.assertLogs("emilia.bot", level="WARNING"):
+            await bot.on_message(message)
+        self.assertEqual(message.replies + self.channel.sent, [prompts.BLOCKED_REPLY + "\n-# 🛠️ `list_files`", "Done.\n-# 🛠️ `read_file: a`"])
+        self.assertEqual(self.memory.recent("1")[-1].content, "Done.")
+
+    async def test_an_error_midway_keeps_what_was_already_said(self):
+        class Failing(SteppingLLM):
+            async def chat(self, messages, on_step=None):
+                await on_step(Step("Starting.", [ToolUse("list_files", {})]))
+                raise LLMError("connection lost")
+
+        bot = self.make_bot(llm=Failing([]))
+        message = self.msg(self.mention("go"))
+        with self.assertLogs("emilia.bot", level="ERROR"):
+            await bot.on_message(message)
+        self.assertEqual(message.replies + self.channel.sent, ["Starting.\n-# 🛠️ `list_files`", prompts.ERROR_REPLY])
+        self.assertEqual(self.memory.recent("1")[-1].content, "Starting.")
+
+    async def test_multi_turn_settings_reach_the_client_and_the_prompt(self):
+        bot = EmiliaBot(Settings(discord_token="x", multi_turn_tools=True, max_tool_turns=5, computer_tools=True), memory=MemoryStore(":memory:"))
+        self.addCleanup(bot.memory.close)
+        self.assertTrue(bot.llm._multi_turn)
+        self.assertEqual(bot.llm._max_turns, 5)
+        self.assertNotIn("do_nothing", bot.llm._tools)  # a control the client offers itself, not a tool
+
+        fake = self.make_bot(multi_turn_tools=True, computer_tools=True)
+        await fake.on_message(self.msg(self.mention("hi")))
+        self.assertIn(prompts.MULTI_TURN_RULES, self.llm.calls[0][0]["content"])
+        off = self.make_bot(computer_tools=True)
+        await off.on_message(self.msg(self.mention("hi")))
+        self.assertNotIn(prompts.MULTI_TURN_RULES, self.llm.calls[0][0]["content"])
 
 
 if __name__ == "__main__":

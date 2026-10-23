@@ -18,9 +18,11 @@
 
 """Async client for LM Studio's OpenAI-compatible API, including the tool-calling loop.
 
-How web search works: the model is offered a `web_search` tool. If it decides it is unsure, LM
-Studio answers with a `tool_calls` entry instead of text; we run the search ourselves, hand the
-results back as a `tool` message and ask again. The model decides when to search, not a keyword list.
+How tools work: the model is offered tools such as `web_search`. If it decides to use one, LM Studio
+answers with a `tool_calls` entry (possibly next to some text); we run the tool ourselves, hand the
+result back as a `tool` message and ask again. The model decides when to use a tool, not a keyword list.
+With multi-turn mode on, a tool call lets the model keep working over further turns until it calls
+do_nothing (see LMStudioClient.chat).
 
 Everything here is async (aiohttp), so a slow 27B model never freezes the Discord connection, and
 cancelling a request really does stop LM Studio from generating.
@@ -31,7 +33,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 import aiohttp
 
@@ -40,11 +42,24 @@ from tooling import Tool, ToolResult
 
 log = logging.getLogger("emilia.llm")
 
-# The model may ask for tools in at most this many consecutive rounds; after that it must answer.
-# Every round is a full generation, which is slow on big models, so keep this small.
+# Without multi-turn mode the model may ask for tools in at most this many consecutive rounds; after
+# that it must answer. Every round is a full generation, which is slow on big models, so keep this small.
 MAX_TOOL_ROUNDS = 2
 MAX_CALLS_PER_ROUND = 2
-_FINAL_ANSWER_HINT = "\n\n(No more searches are available. Write your final answer now.)"
+_FINAL_ANSWER_HINT = "(No more tools are available. Write your final answer now.)"
+
+# Multi-turn mode: after using a tool the model keeps getting turns until it calls do_nothing.
+DO_NOTHING = "do_nothing"
+_DO_NOTHING_SCHEMA = {
+    "name": DO_NOTHING,
+    "description": "End your turn. Call this when you have finished working and have nothing more to say.",
+    "parameters": {"type": "object", "properties": {}},
+}
+CONTINUE_HINT = (
+    "(Your turn continues. Anything you write is posted in the chat right away. Keep working or talking "
+    "if there is more to do, or call do_nothing to finish.)"
+)
+_LAST_TURN_HINT = "(This is your last turn for this message. No more tools are available, so write your final message now.)"
 
 
 class LLMError(Exception):
@@ -60,9 +75,27 @@ class LLMHTTPError(LLMError):
 
 @dataclass
 class ChatResult:
-    text: str
+    text: str  # the last thing the model wrote; earlier messages went to on_step
     sources: list[str] = field(default_factory=list)  # URLs returned by tools along the way
     used_tools: bool = False
+
+
+@dataclass
+class ToolUse:
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class Step:
+    """One generation that was not the last: what the model wrote, and the tools it ran (already finished)."""
+
+    text: str
+    tools: list[ToolUse] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+
+
+StepHandler = Callable[[Step], Awaitable[None]]
 
 
 @dataclass
@@ -140,6 +173,8 @@ class LMStudioClient:
         timeout: float = 300.0,
         max_concurrent: int = 1,
         tools: Sequence[Tool] = (),
+        multi_turn: bool = False,
+        max_turns: int = 8,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self.model = model
@@ -148,6 +183,8 @@ class LMStudioClient:
         self._max_tokens = max_tokens
         self._timeout = timeout
         self._tools: dict[str, Tool] = {tool.name: tool for tool in tools}
+        self._multi_turn = multi_turn
+        self._max_turns = max(2, max_turns)  # generations per message in multi-turn mode; the last one must answer
         self._slots = asyncio.Semaphore(max_concurrent)  # limits simultaneous generations
         self._session: aiohttp.ClientSession | None = None
 
@@ -187,33 +224,53 @@ class LMStudioClient:
         log.info("LMSTUDIO_MODEL is not set; using %s", self.model)
 
     # --- chat ------------------------------------------------------------------
-    async def chat(self, messages: list[dict[str, Any]]) -> ChatResult:
-        """Run a conversation to completion, executing any tool calls the model makes on the way."""
+    async def chat(self, messages: list[dict[str, Any]], on_step: StepHandler | None = None) -> ChatResult:
+        """Run a conversation to completion, executing any tool calls the model makes on the way.
+
+        Every generation except the last is handed to `on_step` once its tools have run, so the caller
+        can post it. Without multi-turn mode the model gets MAX_TOOL_ROUNDS rounds of tools and then
+        must answer. In multi-turn mode a tool call starts "working": the model is prompted again after
+        every generation (text or tools) until it calls do_nothing or max_turns runs out. do_nothing is
+        only offered while working, so it can't end a reply before it has started.
+        """
         convo = list(messages)
         sources: list[str] = []
         used_ids: set[str] = set()
         used_tools = False
+        working = False
         tools_enabled = bool(self._tools)
+        limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
-        for round_no in range(MAX_TOOL_ROUNDS + 1):
-            offer = tools_enabled and round_no < MAX_TOOL_ROUNDS  # the last round must be an answer
+        for round_no in range(limit):
+            last = round_no + 1 >= limit
+            offer = tools_enabled and not last  # the last round must be an answer
+            offered = (set(self._tools) | ({DO_NOTHING} if working else set())) if offer else set()
             try:
-                message = await self._complete(convo, offer)
+                message = await self._complete(convo, offer, finish_option=working)
             except LLMHTTPError as exc:
                 if not (offer and exc.status in (400, 422)):
                     raise
-                log.warning("LM Studio rejected a request that offered tools (%s); retrying without web search.", exc)
+                log.warning("LM Studio rejected a request that offered tools (%s); retrying without tools.", exc)
                 tools_enabled = offer = False
+                offered = set()
                 message = await self._complete(convo, False)
 
             content = message.get("content")
             content = content if isinstance(content, str) else ""
+            text = strip_tool_markup(strip_reasoning(content))
 
             calls: list[_ToolCall] = []
             if offer:
-                calls = _structured_calls(message, round_no) or parse_inline_calls(content, set(self._tools), round_no)
+                calls = _structured_calls(message, round_no) or parse_inline_calls(content, offered, round_no)
             if not calls:
-                return ChatResult(strip_tool_markup(strip_reasoning(content)), sources, used_tools)
+                if not working or last:
+                    return ChatResult(text, sources, used_tools)
+                # Still working: what it said is posted and it gets another turn.
+                if on_step is not None:
+                    await on_step(Step(text))
+                convo.append({"role": "assistant", "content": text})
+                convo.append({"role": "user", "content": _LAST_TURN_HINT if round_no + 2 >= limit else CONTINUE_HINT})
+                continue
 
             calls = calls[:MAX_CALLS_PER_ROUND]
             for index, call in enumerate(calls):
@@ -223,26 +280,44 @@ class LMStudioClient:
             convo.append(
                 {
                     "role": "assistant",
-                    "content": strip_tool_markup(strip_reasoning(content)),
+                    "content": text,
                     "tool_calls": [
                         {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
                         for c in calls
                     ],
                 }
             )
-            next_round_is_final = round_no + 1 >= MAX_TOOL_ROUNDS
+            if round_no + 2 >= limit:
+                hint = _LAST_TURN_HINT if self._multi_turn else _FINAL_ANSWER_HINT
+            else:
+                hint = CONTINUE_HINT if self._multi_turn else ""
+            step = Step(text)
+            finished = False
             for call in calls:
                 log.info("Model called %s(%s)", call.name, json.dumps(call.arguments)[:200])
-                result = await self._run_tool(call)
+                if call.name == DO_NOTHING and working:
+                    finished = True
+                    result = ToolResult("Done.")
+                else:
+                    result = await self._run_tool(call, offered)
+                    step.tools.append(ToolUse(call.name, call.arguments))
+                    step.sources.extend(result.sources)
                 sources.extend(result.sources)
-                text = result.text + (_FINAL_ANSWER_HINT if next_round_is_final else "")
-                convo.append({"role": "tool", "tool_call_id": call.id, "content": text})
-            used_tools = True
+                note = f"\n\n{hint}" if hint and call is calls[-1] else ""
+                convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
+            used_tools = used_tools or bool(step.tools)
+            working = working or (self._multi_turn and any(call.name in self._tools for call in calls))
+            if finished and not step.tools:
+                return ChatResult(text, sources, used_tools)  # what it wrote alongside do_nothing is its last message
+            if on_step is not None:
+                await on_step(step)
+            if finished:
+                return ChatResult("", sources, used_tools)
 
         raise LLMError("the tool loop ended without an answer")  # unreachable: the last round offers no tools
 
-    async def _run_tool(self, call: _ToolCall) -> ToolResult:
-        tool = self._tools.get(call.name)
+    async def _run_tool(self, call: _ToolCall, offered: set[str]) -> ToolResult:
+        tool = self._tools.get(call.name) if call.name in offered else None
         if tool is None:
             return ToolResult(f"Error: there is no tool called {call.name!r}.")
         if call.error:
@@ -253,7 +328,7 @@ class LMStudioClient:
             log.exception("Tool %s crashed", call.name)
             return ToolResult(f"Error: the {call.name} tool failed.")
 
-    async def _complete(self, convo: list[dict[str, Any]], offer_tools: bool) -> dict[str, Any]:
+    async def _complete(self, convo: list[dict[str, Any]], offer_tools: bool, finish_option: bool = False) -> dict[str, Any]:
         """One request to /chat/completions; returns the assistant message."""
         if not self.model:  # LM Studio wasn't reachable at startup
             self._pick_model(await self.list_models())
@@ -265,7 +340,8 @@ class LMStudioClient:
         if self._max_tokens is not None:
             payload["max_tokens"] = self._max_tokens
         if offer_tools and self._tools:
-            payload["tools"] = [{"type": "function", "function": tool.schema} for tool in self._tools.values()]
+            schemas = [tool.schema for tool in self._tools.values()] + ([_DO_NOTHING_SCHEMA] if finish_option else [])
+            payload["tools"] = [{"type": "function", "function": schema} for schema in schemas]
 
         async with self._slots:
             data = await self._request("POST", "/chat/completions", payload)
