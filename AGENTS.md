@@ -14,6 +14,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `do_nothing` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
 | `tooling.py` | The `Tool` protocol (`name`, `schema`, `async run(arguments) -> ToolResult`), `ToolResult` |
 | `websearch.py` | `WebSearchTool` over `ddgs`; swap the engine by replacing `search_sync()` only |
+| `webpage.py` | `FetchPageTool`: reads a public web page; `UrlRegistry` limits it to links from search results or the sender's message, and addresses are checked so it can't reach the local network |
 | `computer.py` | `WorkspaceTools` + `computer_tools()`: list/read/write/edit/delete files and `run_command` (Bubblewrap sandbox) |
 | `restart.py` | `RestartTool`: launches a replacement process, waits for it to signal readiness through a pipe fd (`EMILIA_RESTART_READY_FD`), then retires the old one |
 | `memory.py` | `MemoryStore`: SQLite (`memory.db`) for channel history and the people directory (aliases, `!about` notes); migrates older schemas in place |

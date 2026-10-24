@@ -47,6 +47,7 @@ from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, 
 from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
+from webpage import FetchPageTool, UrlRegistry, extract_urls
 from websearch import WebSearchTool, ddgs_installed
 
 log = logging.getLogger("emilia.bot")
@@ -218,6 +219,7 @@ class EmiliaBot(discord.Client):
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True),
         )
         self.settings = settings
+        self.urls = UrlRegistry()  # links the model may open with fetch_page: search results and the sender's links
         self.memory = memory or MemoryStore(settings.memory_db, settings.memory_turns)
         self.llm: ChatBackend = llm or LMStudioClient(
             base_url=settings.lmstudio_url,
@@ -257,12 +259,13 @@ class EmiliaBot(discord.Client):
                         require_confirmation=self.settings.computer_require_confirmation,
                     )
                 )
-        if not self.settings.web_search:
-            return tools
-        if not ddgs_installed():
-            log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
-            return tools
-        tools.append(WebSearchTool(self.settings.search_results))
+        if self.settings.web_search:
+            if ddgs_installed():
+                tools.append(WebSearchTool(self.settings.search_results, registry=self.urls))
+            else:
+                log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
+        if self.settings.fetch_pages:
+            tools.append(FetchPageTool(self.urls, max_chars=self.settings.page_max_chars))
         return tools
 
     # --- lifecycle -------------------------------------------------------------
@@ -392,7 +395,10 @@ class EmiliaBot(discord.Client):
                     computer_tools=self.settings.computer_tools,
                     multi_turn=self.settings.multi_turn_tools,
                     yandere=self.settings.yandere_mode,
+                    fetch_pages=self.settings.fetch_pages,
                 )
+                if self.settings.fetch_pages:  # links the sender wrote (or replied to) may be opened this turn
+                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body))
                 messages = prompts.build_messages(
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )

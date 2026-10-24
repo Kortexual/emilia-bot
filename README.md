@@ -125,6 +125,28 @@ Memory keeps everything the model said for one request as one reply; the tool li
   is only offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still
   a single generation. Each step is a full generation, so long tasks on big models take a while.
 
+### Reading pages
+Search snippets are short. With `FETCH_PAGES=true` (the default) the model also has a `fetch_page` tool that opens a web page and returns
+its text, for when a snippet isn't enough or someone shares a link to read. A question that needs a search and then a page uses both
+tool rounds (search first, then the page), and each tool round is an extra generation.
+
+- **Which links can be opened.** Only links from the web search results of the last 15 minutes, and links the sender wrote in their
+  message (or in the message they replied to). The model can't open a link it found inside a page, or one someone planted in the
+  conversation, so text from the web can't send the bot somewhere or smuggle chat contents out in a URL.
+- **Only the public internet.** The bot runs on your computer, next to LM Studio and anything else on your network, so the address of
+  every site is checked: loopback (`127.0.0.1`, `localhost`), private ranges (`10.x`, `192.168.x`...), link-local and cloud metadata
+  addresses are refused, also when a site redirects to them. The connection is made to the address that was checked, and HTTPS
+  certificates are verified against the site's name.
+- **What is read.** HTML pages and plain text, up to 1 MB, with a deadline and at most 3 redirects. PDFs, images and other files are
+  refused. Scripts, styles, menus, footers and hidden elements are dropped, and `<main>`/`<article>` text is preferred. Pages that need
+  JavaScript to show their content come back empty and the model says it couldn't read them.
+- **How much the model sees.** `PAGE_MAX_CHARS` (default 6000 characters, about 1,500 tokens) per fetch. For a longer page the model
+  is told how to continue with `offset`, which costs another call. Raise it only if your context allows: each fetch is added to the
+  prompt, and a message can fetch up to 2 pages per tool round.
+- **Untrusted text.** Page text is handed over marked as untrusted, with invisible characters, forged prompt tags and braille removed.
+  The same prompt-injection rules apply as for search results.
+- The page is fetched directly from your computer, so the site sees your IP address. Turn the tool off with `FETCH_PAGES=false`.
+
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
@@ -183,7 +205,11 @@ All settings are environment variables (or lines in `.env`).
 | `RESPOND_TO_DMS` | `false` | Answer DMs without needing an @mention |
 | `WEB_SEARCH` | `true` | Let the model search the web |
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
-| `SHOW_SOURCES` | `true` | Links line under answers that used search |
+| `FETCH_PAGES` | `true` | Let the model read whole pages (links from search results or the sender's message) |
+| `PAGE_MAX_CHARS` | `6000` | Characters of page text handed to the model per fetch |
+| `SHOW_SOURCES` | `true` | Add a few result links to each web search line |
+| `FETCH_PAGES` | `true` | Let the model read whole web pages (see "Reading pages") |
+| `PAGE_MAX_CHARS` | `6000` | Characters of page text given to the model per fetch (minimum `500`) |
 | `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
 | `COMPUTER_WORKSPACE` | folder containing `bot.py` | The only folder those tools can access; direct paths cannot escape it and commands see it as `/workspace` in a Bubblewrap filesystem sandbox. |
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
@@ -226,12 +252,15 @@ The ready-made replies (greeting, error and so on) keep her normal voice. The se
 bot.py        Discord side: the mention rule, replies, memory use, !forget
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
+webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
+computer.py   the opt-in workspace file and terminal tools
+restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory
 styleguard.py cooldown for emoji tics, expiry of standing instructions
 prompts.py    persona, rules and canned replies
 textutil.py   input sanitising, reply cleanup, message splitting
 config.py     settings from .env
-tooling.py    the small tool interface shared by llm.py and websearch.py
+tooling.py    the small tool interface shared by llm.py, websearch.py and webpage.py
 tests/        run with:  python -m unittest
 ```
 

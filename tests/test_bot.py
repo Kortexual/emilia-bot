@@ -29,6 +29,7 @@ import prompts
 from computer import computer_tools
 from restart import RestartTool
 from tooling import default_description
+from webpage import FetchPageTool, UrlRegistry
 from websearch import WebSearchTool
 from bot import EmiliaBot, source_links
 from config import Settings
@@ -1077,6 +1078,54 @@ class YandereModeTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey <@20>!"])
 
 
+class PageReadingTests(BotTestCase):
+    async def test_links_the_sender_wrote_may_be_opened_this_turn(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("what does https://blog.example/post-1 say?")))
+        self.assertTrue(bot.urls.is_allowed("https://blog.example/post-1"))
+        self.assertFalse(bot.urls.is_allowed("https://blog.example/post-2"))
+
+    async def test_a_link_in_the_message_being_replied_to_counts_too(self):
+        bot = self.make_bot()
+        original = SimpleNamespace(
+            id=7, content="look: https://news.example/story", author=person("Bob", 2),
+            mentions=[], role_mentions=[], channel_mentions=[],
+        )
+        reference = SimpleNamespace(message_id=7, resolved=original)
+        await bot.on_message(self.msg(self.mention("summarise this please"), reference=reference))
+        self.assertTrue(bot.urls.is_allowed("https://news.example/story"))
+
+    async def test_nothing_is_registered_when_page_reading_is_off(self):
+        bot = self.make_bot(fetch_pages=False)
+        await bot.on_message(self.msg(self.mention("see https://blog.example/post-1")))
+        self.assertFalse(bot.urls.is_allowed("https://blog.example/post-1"))
+
+    async def test_the_prompt_mentions_the_tool_only_when_it_exists(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertIn(prompts.FETCH_RULES, self.llm.calls[0][0]["content"])
+        bot = self.make_bot(fetch_pages=False)
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertNotIn("fetch_page", self.llm.calls[0][0]["content"])
+
+    async def test_the_right_tools_are_offered(self):
+        with mock.patch("bot.ddgs_installed", return_value=True):
+            self.assertEqual([t.name for t in self.make_bot()._build_tools()], ["web_search", "fetch_page"])
+            self.assertEqual([t.name for t in self.make_bot(fetch_pages=False)._build_tools()], ["web_search"])
+            self.assertEqual([t.name for t in self.make_bot(web_search=False)._build_tools()], ["fetch_page"])
+            self.assertEqual(self.make_bot(web_search=False, fetch_pages=False)._build_tools(), [])
+
+    async def test_the_search_tool_and_the_page_tool_share_one_list_of_allowed_links(self):
+        with mock.patch("bot.ddgs_installed", return_value=True):
+            bot = self.make_bot()
+            search, fetch = bot._build_tools()
+        self.assertIs(search._registry, fetch._registry)
+        self.assertIs(search._registry, bot.urls)
+
+    def test_a_dump_of_the_page_rules_would_be_caught(self):
+        self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.FETCH_RULES))
+
+
 class SourceLinksTests(unittest.TestCase):
     def test_no_sources_no_links(self):
         self.assertEqual(source_links([]), "")
@@ -1165,6 +1214,7 @@ class ToolDisplayTests(BotTestCase):
         tools = {tool.name: tool for tool in computer_tools(".")}
         tools["web_search"] = WebSearchTool()
         tools["restart_bot"] = RestartTool([], None)
+        tools["fetch_page"] = FetchPageTool(UrlRegistry())
         for name, arguments, expected in [
             ("web_search", {"query": "weather `atlanta`"}, "🔎 Searching the web for `weather 'atlanta'`"),
             ("list_files", {}, "📂 Looking through `.`"),
@@ -1174,6 +1224,7 @@ class ToolDisplayTests(BotTestCase):
             ("delete_path", {"path": "old"}, "🗑️ Deleting `old`"),
             ("run_command", {"command": "make " + "x" * 100}, "💻 Running `make " + "x" * 54 + "…`"),
             ("restart_bot", {"confirm": True}, "🔄 Restarting the bot"),
+            ("fetch_page", {"url": "https://blog.example/post"}, "🌐 Reading `https://blog.example/post`"),
         ]:
             with self.subTest(name=name):
                 self.assertEqual(tools[name].describe(arguments), expected)
