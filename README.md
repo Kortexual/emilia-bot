@@ -6,6 +6,7 @@ Everything stays on your machine, apart from the web searches the model chooses 
 - **Only answers @mentions.** Every other message (and every other bot) is ignored.
 - **Remembers the conversation**, per channel, even across restarts.
 - **Searches the web when it's unsure**: the model decides when, using LM Studio's tool calling.
+- **Can work on a local workspace** when explicitly enabled: read, write, edit and delete files, and run shell commands.
 
 ## Requirements
 
@@ -102,9 +103,31 @@ hands the results back, and the model writes its answer. At most two rounds of u
   replace the one function `search_sync()` in `websearch.py`.
 - Each search costs an extra generation, which on a large reasoning model can mean a minute or more.
   Turn it all off with `WEB_SEARCH=false`.
-- Answers that used a search end with a small grey line listing a few of the links consulted (`SHOW_SOURCES=false` hides it).
+- Each search shows up as a small grey line such as `🔎 Searching the web for "..."`; once the results are in, a few of the links
+  consulted are added to it (`SHOW_SOURCES=false` leaves them out).
 - LM Studio 0.4+ can also run MCP servers itself through its native `/api/v1/chat` endpoint. This bot uses the
   OpenAI-compatible endpoint instead, so it works on any version with no extra setup.
+
+### Tool use
+Whatever the model writes next to a tool call is posted straight away, so a reply can come as several Discord messages
+("Let me check..." and then the answer). Every tool call is posted as its own small grey message the moment the tool runs,
+written by the tool itself: `🔎 Searching the web for ...`, `📄 Reading notes.txt`, `💻 Running ls -la` and so on (a tool adds
+these through a `describe(arguments)` method; tools without one show their name and first argument). A web search line is
+edited to add its links once the results are in. These lines are sent to the channel, not as replies, and never ping anyone.
+Memory keeps everything the model said for one request as one reply; the tool lines are not stored.
+
+- **`MULTI_TURN_TOOLS=false` (default).** The model can write a message and call tools, gets the results, and then has to answer:
+  at most two rounds of tools per message.
+- **`MULTI_TURN_TOOLS=true`.** A tool call starts a longer turn. After every step the model is prompted again and can keep
+  working and talking, until it calls `stop_talking` or reaches `MAX_TOOL_TURNS` generations. While it is working, every request
+  sends `tool_choice: "required"`, so it must either use another tool or call `stop_talking` (whatever it writes alongside that
+  call is its last message); it can't keep answering with plain text, which models tend to do by repeating themselves. If LM Studio
+  rejects `tool_choice`, the bot stops sending it, and then a reply that is empty or repeats something already said in this reply
+  ends the turn without being posted. Loops are also caught: a tool call identical to the one just before it is not run again
+  (the model is told so and pointed to `stop_talking`), a repeated message is not posted again, and two such repeats in a row
+  end the turn. The console logs how each turn ended (`stop_talking`, repeats, or running out of turns). `stop_talking` is only
+  offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
+  models take a while.
 
 ### Reading pages
 Search snippets are short. With `FETCH_PAGES=true` (the default) the model also has a `fetch_page` tool that opens a web page and returns
@@ -188,7 +211,16 @@ All settings are environment variables (or lines in `.env`).
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
 | `FETCH_PAGES` | `true` | Let the model read whole pages (links from search results or the sender's message) |
 | `PAGE_MAX_CHARS` | `6000` | Characters of page text handed to the model per fetch |
-| `SHOW_SOURCES` | `true` | Links line under answers that used search |
+| `SHOW_SOURCES` | `true` | Add a few result links to each web search line |
+| `FETCH_PAGES` | `true` | Let the model read whole web pages (see "Reading pages") |
+| `PAGE_MAX_CHARS` | `6000` | Characters of page text given to the model per fetch (minimum `500`) |
+| `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
+| `COMPUTER_WORKSPACE` | folder containing `bot.py` | The only folder those tools can access; direct paths cannot escape it and commands see it as `/workspace` in a Bubblewrap filesystem sandbox. |
+| `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
+| `COMPUTER_ALLOW_HOST_ACCESS` | `false` | Allow paths and command working directories outside `COMPUTER_WORKSPACE`. This grants the model the OS account's file access. |
+| `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
+| `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
+| `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
@@ -200,6 +232,14 @@ All settings are environment variables (or lines in `.env`).
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 
 To change the character, edit `PERSONA` in `prompts.py`.
+
+When `COMPUTER_TOOLS=true`, the `restart_bot` tool is also available. It starts the bot again with
+the same Python command, waits up to 45 seconds for the new process to connect to Discord, then
+closes the old process. If the replacement fails, the original bot remains running. Once the replacement is
+connected it answers all new messages, while the old process finishes the reply it was writing and then exits.
+The replacement reads `.env` again, so changed settings take effect. Restarting is only available on Linux and macOS.
+If the bot runs as a systemd service, the service manager may stop the replacement when the original process exits;
+restart the service with systemd instead.
 
 ### Yandere mode
 `YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes
@@ -217,6 +257,8 @@ bot.py        Discord side: the mention rule, replies, memory use, !forget
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
 webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
+computer.py   the opt-in workspace file and terminal tools
+restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory
 styleguard.py cooldown for emoji tics, expiry of standing instructions
 prompts.py    persona, rules and canned replies

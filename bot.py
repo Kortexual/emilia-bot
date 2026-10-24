@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import sys
@@ -39,8 +40,10 @@ import discord
 
 import prompts
 import styleguard
-from config import ConfigError, Settings
-from llm import ChatResult, LLMError, LMStudioClient
+from config import ConfigError, Settings, environment_without_dotenv
+from computer import computer_tools
+from restart import RestartTool
+from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
@@ -49,6 +52,7 @@ from websearch import WebSearchTool, ddgs_installed
 
 log = logging.getLogger("emilia.bot")
 
+RETIRE_TIMEOUT = 600  # seconds a restarted bot waits for its replies in progress before it shuts down anyway
 CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some headroom
 RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
 FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
@@ -60,12 +64,18 @@ class ChatBackend(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    async def chat(self, messages: list[dict[str, Any]]) -> ChatResult: ...
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        on_text: TextHandler | None = None,
+        on_tool: ToolHandler | None = None,
+        on_tool_done: ToolHandler | None = None,
+    ) -> ChatResult: ...
 
 
-def sources_footer(urls: list[str], max_links: int = 3) -> str:
-    """A small grey line under the reply naming where web information came from.
-    Links are wrapped in <> so Discord doesn't unfurl a big preview for each one."""
+def source_links(urls: list[str], max_links: int = 3) -> str:
+    """A few of the links a tool consulted, as " · <url> · <url>". Links are wrapped in <> so Discord
+    doesn't unfurl a big preview for each one."""
     picked: list[str] = []
     for url in urls:
         if len(url) > 200 or any(ch in url for ch in "<> \n\t") or f"<{url}>" in picked:
@@ -73,7 +83,12 @@ def sources_footer(urls: list[str], max_links: int = 3) -> str:
         picked.append(f"<{url}>")
         if len(picked) == max_links:
             break
-    return "\n-# 🔎 Searched the web · " + " · ".join(picked) if picked else ""
+    return "".join(f" · {link}" for link in picked)
+
+
+def tool_line(use: ToolUse, *, show_sources: bool = False) -> str:
+    """The small grey message posted when the model uses a tool, with its links once it has run."""
+    return "-# " + use.description + (source_links(use.sources) if show_sources else "")
 
 
 def link_mentions(text: str, people: dict[str, int]) -> tuple[str, list[int]]:
@@ -192,6 +207,7 @@ class EmiliaBot(discord.Client):
         *,
         llm: ChatBackend | None = None,
         memory: MemoryStore | None = None,
+        restart_ready_fd: int | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
@@ -214,12 +230,35 @@ class EmiliaBot(discord.Client):
             timeout=settings.request_timeout,
             max_concurrent=settings.max_concurrent_requests,
             tools=self._build_tools(),
+            multi_turn=settings.multi_turn_tools,
+            max_turns=settings.max_tool_turns,
         )
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
+        self._restart_ready_fd = restart_ready_fd
+        self._retiring = False  # a replacement has taken over: answer no new messages, then shut down
+        self._retire_task: asyncio.Task[None] | None = None
 
     def _build_tools(self) -> list[Tool]:
         tools: list[Tool] = []
+        if self.settings.computer_tools:
+            tools.extend(
+                computer_tools(
+                    self.settings.computer_workspace,
+                    command_timeout=self.settings.command_timeout,
+                    allow_host_access=self.settings.computer_allow_host_access,
+                    require_confirmation=self.settings.computer_require_confirmation,
+                )
+            )
+            if os.name == "posix":  # the readiness handoff passes a pipe to the new process
+                tools.append(
+                    RestartTool(
+                        [sys.executable, *sys.argv],
+                        self._retire_after_handoff,
+                        environment=environment_without_dotenv(),
+                        require_confirmation=self.settings.computer_require_confirmation,
+                    )
+                )
         if self.settings.web_search:
             if ddgs_installed():
                 tools.append(WebSearchTool(self.settings.search_results, registry=self.urls))
@@ -236,6 +275,31 @@ class EmiliaBot(discord.Client):
     async def on_ready(self) -> None:
         scope = "@mentions and DMs" if self.settings.respond_to_dms else "@mentions only"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
+        if self._restart_ready_fd is not None:
+            try:
+                os.write(self._restart_ready_fd, b"1")
+            except OSError:
+                log.warning("Could not notify the previous process that restart succeeded")
+            finally:
+                os.close(self._restart_ready_fd)
+                self._restart_ready_fd = None
+
+    async def _retire_after_handoff(self) -> None:
+        """The replacement is connected: it answers new messages from now on. This bot finishes the
+        replies it is working on (including the one that asked for the restart), then shuts down."""
+        if self._retiring:
+            return
+        self._retiring = True
+        log.info("A replacement bot has taken over; shutting down once the current replies are done")
+
+        async def retire() -> None:
+            deadline = asyncio.get_running_loop().time() + RETIRE_TIMEOUT
+            await asyncio.sleep(1)  # let the tool result reach the model first
+            while self._busy and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.5)
+            await self.close()
+
+        self._retire_task = asyncio.create_task(retire())  # keep a reference so it isn't garbage-collected
 
     async def close(self) -> None:
         await self.llm.close()
@@ -244,7 +308,7 @@ class EmiliaBot(discord.Client):
 
     # --- events ------------------------------------------------------------------
     async def on_message(self, message: discord.Message) -> None:
-        if not self._is_for_me(message):
+        if self._retiring or not self._is_for_me(message):  # once restarted, the replacement answers
             return
         try:
             await self._handle(message)
@@ -290,10 +354,9 @@ class EmiliaBot(discord.Client):
         self._busy.add(user_id)
         try:
             quoted_body, quoted_author = await self._quoted_context(message)
-            reply, pinged = await self._respond(message, key, text, quoted_body, quoted_author)
+            await self._respond(message, key, text, quoted_body, quoted_author)
         finally:
             self._busy.discard(user_id)
-        await self._send(message, reply, pinged)
 
     async def _respond(
         self,
@@ -302,8 +365,8 @@ class EmiliaBot(discord.Client):
         text: str,
         quoted_body: str,
         quoted_author: discord.abc.User | None,
-    ) -> tuple[str, list[int]]:
-        """The reply to post, and the IDs of the users it pings."""
+    ) -> None:
+        """Generate and post messages; a tool-assisted reply can continue in further turns."""
         people = self._people(message, quoted_author)
         author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
         async with message.channel.typing():  # keeps "typing..." showing, even while queued
@@ -329,6 +392,8 @@ class EmiliaBot(discord.Client):
                     date.today(),
                     web_search=self.settings.web_search,
                     show_sources=self.settings.show_sources,
+                    computer_tools=self.settings.computer_tools,
+                    multi_turn=self.settings.multi_turn_tools,
                     yandere=self.settings.yandere_mode,
                     fetch_pages=self.settings.fetch_pages,
                 )
@@ -337,47 +402,89 @@ class EmiliaBot(discord.Client):
                 messages = prompts.build_messages(
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )
-                try:
-                    result = await self.llm.chat(messages)
-                    reply = clean_reply(result.text, self._speaker_names())
-                    if contains_cipher_script(reply):
-                        # Someone talked the model into writing in braille (or similar). Try once more
-                        # with a nudge; if it still won't write plain text, post a canned line instead.
-                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
-                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
-                        result = await self.llm.chat([*messages[:-1], nudged])
-                        reply = clean_reply(result.text, self._speaker_names())
-                        if contains_cipher_script(reply):
-                            log.warning("Retry was still in braille/cipher script; posting a canned reply")
-                            return prompts.FORMAT_REPLY, []  # not stored, so it can't teach the model the pattern
-                except LLMError as exc:
-                    log.error("LM Studio request failed: %s", exc)
-                    return prompts.ERROR_REPLY, []
 
-                if not reply:
-                    log.warning("The model sent an empty reply")
-                    return prompts.EMPTY_REPLY, []
-                if prompts.LEAK_DETECTOR.leaks(reply):
-                    log.warning("Blocked a reply that repeated the system prompt")
-                    return prompts.BLOCKED_REPLY, []
-
+                # A reply can be several Discord messages, posted as they happen: whatever the model writes
+                # next to a tool call, a small line for each tool it uses (edited to add its links once it has
+                # run), then its answer (and in multi-turn mode, more as it keeps working).
+                recent: list[str] = []
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
-                    reply = styleguard.cool_down(reply, recent)  # no emoji/flourish may stick from reply to reply
+                kept: list[str] = []  # what was posted, as the model wrote it (plain "@Name"s): this is remembered
+                posted = False
 
-                try:  # stored with plain "@Name"s, the way the model wrote them
-                    await asyncio.to_thread(
-                        self.memory.add_turn, key, author_name, str(message.author.id), user_text, reply
-                    )
-                except sqlite3.Error:
-                    log.exception("Could not save this exchange to memory")  # still deliver the reply
+                async def post(reply: str, *, from_model: bool = True) -> None:
+                    """Post one message. Canned lines (from_model=False) are neither remembered nor allowed to ping anyone."""
+                    nonlocal posted
+                    pinged: list[int] = []
+                    if reply and from_model:
+                        if prompts.LEAK_DETECTOR.leaks(reply):
+                            log.warning("Blocked a reply that repeated the system prompt")
+                            reply, from_model = prompts.BLOCKED_REPLY, False
+                        else:
+                            if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
+                                reply = styleguard.cool_down(reply, [*recent, *kept])
+                            kept.append(reply)
+                            pingable = self._pingable(labels, known)
+                            pingable.update(await self._lookup_members(message, reply, text, pingable))
+                            reply, pinged = link_mentions(reply, pingable)
+                    if reply:
+                        posted = True
+                        await self._send(message, reply, pinged)
 
-        pingable = self._pingable(labels, known)
-        pingable.update(await self._lookup_members(message, reply, text, pingable))
-        reply, pinged = link_mentions(reply, pingable)
-        if result.sources and self.settings.show_sources:
-            reply += sources_footer(result.sources)
-        return reply, pinged
+                async def on_text(draft: str) -> None:
+                    reply = clean_reply(draft, self._speaker_names())
+                    if contains_cipher_script(reply):
+                        log.warning("Dropped a message written in braille/cipher script")
+                    elif reply:
+                        await post(reply)
+
+                tool_messages: dict[int, discord.Message] = {}  # by id() of the ToolUse
+
+                async def on_tool(use: ToolUse) -> None:
+                    nonlocal posted
+                    posted = True
+                    sent = await message.channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
+                    tool_messages[id(use)] = sent
+
+                async def on_tool_done(use: ToolUse) -> None:
+                    sent = tool_messages.pop(id(use), None)
+                    if sent is None or not (self.settings.show_sources and source_links(use.sources)):
+                        return
+                    try:
+                        await sent.edit(content=tool_line(use, show_sources=True), allowed_mentions=discord.AllowedMentions.none())
+                    except discord.HTTPException as exc:
+                        log.info("Could not add links to a tool message (%s)", exc)
+
+                try:
+                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done)
+                    reply = clean_reply(result.text, self._speaker_names())
+                    if contains_cipher_script(reply) and not result.used_tools and not posted:
+                        # Someone talked the model into writing in braille (or similar). Try once more
+                        # with a nudge; nothing has run or been posted yet, so the retry is harmless.
+                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
+                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
+                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done)
+                        reply = clean_reply(result.text, self._speaker_names())
+                except LLMError as exc:
+                    log.error("LM Studio request failed: %s", exc)
+                    await post(prompts.ERROR_REPLY, from_model=False)
+                else:
+                    if contains_cipher_script(reply):
+                        log.warning("Reply was still in braille/cipher script; posting a canned reply")
+                        await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
+                    elif reply:
+                        await post(reply)
+                    elif not posted:
+                        log.warning("The model sent an empty reply")
+                        await post(prompts.EMPTY_REPLY, from_model=False)
+
+                if kept:
+                    try:  # stored with plain "@Name"s, the way the model wrote them
+                        await asyncio.to_thread(
+                            self.memory.add_turn, key, author_name, str(message.author.id), user_text, "\n\n".join(kept)
+                        )
+                    except sqlite3.Error:
+                        log.exception("Could not save this exchange to memory")
 
     async def _reset(self, message: discord.Message, key: str) -> None:
         if message.guild is not None and not message.channel.permissions_for(message.author).manage_messages:
@@ -684,7 +791,14 @@ def main() -> None:
     for noisy in ("httpx", "httpcore", "primp", "urllib3", "ddgs"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    bot = EmiliaBot(settings)
+    ready_fd: int | None = None
+    raw_ready_fd = os.environ.pop("EMILIA_RESTART_READY_FD", "")
+    if raw_ready_fd:
+        try:
+            ready_fd = int(raw_ready_fd)
+        except ValueError:
+            log.warning("Ignoring invalid EMILIA_RESTART_READY_FD")
+    bot = EmiliaBot(settings, restart_ready_fd=ready_fd)
     try:
         bot.run(settings.discord_token, log_handler=None)  # we configured logging ourselves above
     except discord.LoginFailure:

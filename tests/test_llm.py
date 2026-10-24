@@ -319,6 +319,265 @@ class ChatTests(ClientTestCase):
         self.assertEqual(server.requests[0]["max_tokens"], 256)
 
 
+
+class ToolReportTests(ClientTestCase):
+    async def test_each_call_is_reported_with_its_description_before_it_runs_and_its_sources_after(self):
+        search = FakeSearch()
+        search.describe = lambda arguments: f"searching for {arguments['query']}"
+        seen = []
+
+        async def on_tool(use):
+            seen.append(("start", use.description, list(use.sources), len(search.calls)))
+
+        async def on_tool_done(use):
+            seen.append(("done", use.description, list(use.sources), len(search.calls)))
+
+        server = self.serve([tool_reply(("web_search", {"query": "tea"})), text_reply("Tea is nice.")])
+        await (await self.client(server, tools=[search])).chat(USER, None, on_tool, on_tool_done)
+        self.assertEqual(
+            seen,
+            [("start", "searching for tea", [], 0), ("done", "searching for tea", ["https://example.com/a"], 1)],
+        )
+
+    async def described(self, tool):
+        seen = []
+
+        async def on_tool(use):
+            seen.append(use.description)
+
+        server = self.serve([tool_reply(("web_search", {"query": "tea"})), text_reply("ok")])
+        await (await self.client(server, tools=[tool])).chat(USER, None, on_tool)
+        return seen
+
+    async def test_a_tool_without_describe_gets_a_default_line(self):
+        self.assertEqual(await self.described(FakeSearch()), ["🛠️ `web_search: tea`"])
+
+    async def test_a_broken_describe_falls_back_to_the_default_line(self):
+        class Broken(FakeSearch):
+            def describe(self, arguments):
+                raise KeyError("query")
+
+        with self.assertLogs("emilia.llm", level="ERROR"):
+            self.assertEqual(await self.described(Broken()), ["🛠️ `web_search: tea`"])
+
+
+class MultiTurnTests(ClientTestCase):
+    """MULTI_TURN_TOOLS: after a tool call the model keeps taking turns until it calls stop_talking."""
+
+    async def chat(self, server, multi_turn=True, **kwargs):
+        """Returns the result and what was reported along the way: ("text", ...) and ("tool", name, arguments)."""
+        events = []
+
+        async def on_text(text):
+            events.append(("text", text))
+
+        async def on_tool(use):
+            events.append(("tool", use.name, use.arguments))
+
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=multi_turn, **kwargs)
+        return await client.chat(USER, on_text, on_tool), events
+
+    @staticmethod
+    def offered(request):
+        return [t["function"]["name"] for t in request.get("tools", [])]
+
+    async def test_without_tools_it_is_one_ordinary_reply(self):
+        server = self.serve([text_reply("Hi!")])
+        result, events = await self.chat(server)
+        self.assertEqual(result.text, "Hi!")
+        self.assertEqual(events, [])
+        self.assertEqual(self.offered(server.requests[0]), ["web_search"])  # stop_talking can't end a reply before it starts
+
+    async def test_it_keeps_working_and_talking_until_stop_talking(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "one"}), content="Let me check."),
+                text_reply("Interesting, one more thing."),
+                tool_reply(("web_search", {"query": "two"})),
+                tool_reply((llm.STOP_TALKING, {}), content="All done!"),
+            ]
+        )
+        result, events = await self.chat(server)
+
+        self.assertEqual(result.text, "All done!")
+        self.assertEqual(
+            events,
+            [
+                ("text", "Let me check."),
+                ("tool", "web_search", {"query": "one"}),
+                ("text", "Interesting, one more thing."),
+                ("tool", "web_search", {"query": "two"}),
+            ],
+        )
+        self.assertEqual(result.sources, ["https://example.com/a"] * 2)
+        self.assertTrue(result.used_tools)
+        self.assertEqual(len(server.requests), 4)
+        for request in server.requests[1:]:
+            self.assertEqual(self.offered(request), ["web_search", llm.STOP_TALKING])
+        # After a tool result the prompt rides along with it; after plain text it is its own message.
+        second, third = server.requests[1]["messages"], server.requests[2]["messages"]
+        self.assertIn(llm.CONTINUE_HINT, second[-1]["content"])
+        self.assertEqual(second[-1]["role"], "tool")
+        self.assertEqual(third[-2], {"role": "assistant", "content": "Interesting, one more thing."})
+        self.assertEqual(third[-1], {"role": "user", "content": llm.CONTINUE_HINT})
+
+    async def test_stop_talking_next_to_another_tool_runs_that_tool_then_stops(self):
+        server = self.serve([tool_reply(("web_search", {"query": "a"})), tool_reply(("web_search", {"query": "b"}), (llm.STOP_TALKING, {}))])
+        result, events = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual(events, [("tool", "web_search", {"query": "a"}), ("tool", "web_search", {"query": "b"})])
+        self.assertEqual(len(server.requests), 2)
+
+    async def test_stop_talking_is_refused_before_any_work(self):
+        server = self.serve([tool_reply((llm.STOP_TALKING, {})), text_reply("Oh, hello!")])
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=True)
+        result = await client.chat(USER)
+        self.assertIn("no tool called", server.requests[1]["messages"][3]["content"])
+        self.assertEqual(result.text, "Oh, hello!")
+
+    async def test_the_number_of_turns_is_capped_and_the_last_must_answer(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), tool_reply(("web_search", {"query": "y"})), text_reply("Final.")])
+        result, events = await self.chat(server, max_turns=3)
+        self.assertEqual(result.text, "Final.")
+        self.assertEqual(len(server.requests), 3)
+        self.assertNotIn("tools", server.requests[-1])
+        self.assertIn("last turn", server.requests[-1]["messages"][-1]["content"])
+
+    async def test_talking_on_the_last_turn_but_one_ends_the_reply(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), text_reply("Here's what I found.")])
+        result, events = await self.chat(server, max_turns=3)
+        self.assertEqual(result.text, "Here's what I found.")
+        self.assertEqual(len(server.requests), 2)  # no extra prompt that would only get the message repeated
+
+    async def test_repeating_the_last_message_ends_the_reply_without_posting_it_again(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                text_reply("The capital of Australia is Canberra!"),
+                text_reply("The capital of Australia is Canberra! 😊"),
+            ]
+        )
+        with self.assertLogs("emilia.llm", level="INFO"):
+            result, events = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual(events, [("tool", "web_search", {"query": "x"}), ("text", "The capital of Australia is Canberra!")])
+        self.assertEqual(len(server.requests), 3)
+
+    async def test_saying_nothing_while_working_ends_the_reply(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"}), content="Done, it's Canberra."), text_reply("")])
+        result, events = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual(events, [("text", "Done, it's Canberra."), ("tool", "web_search", {"query": "x"})])
+        self.assertEqual(len(server.requests), 2)
+
+    async def test_a_repeat_next_to_a_tool_call_is_not_posted_but_the_tool_still_runs(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"}), content="Checking the weather now."),
+                tool_reply(("web_search", {"query": "y"}), content="Checking the weather now!"),
+                tool_reply((llm.STOP_TALKING, {})),
+            ]
+        )
+        result, events = await self.chat(server)
+        self.assertEqual(
+            events,
+            [("text", "Checking the weather now."), ("tool", "web_search", {"query": "x"}), ("tool", "web_search", {"query": "y"})],
+        )
+
+    async def test_while_working_every_request_requires_a_tool_call(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                tool_reply((llm.STOP_TALKING, {}), content="It's Canberra."),
+            ]
+        )
+        result, events = await self.chat(server)
+        self.assertEqual(result.text, "It's Canberra.")  # its last words come with stop_talking
+        self.assertNotIn("tool_choice", server.requests[0])  # a plain chat reply stays possible at first
+        self.assertEqual(server.requests[1]["tool_choice"], "required")
+
+    async def test_a_server_that_rejects_tool_choice_is_asked_again_without_it(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                (400, {"error": "tool_choice 'required' is not supported"}),
+                tool_reply(("web_search", {"query": "y"})),
+                tool_reply((llm.STOP_TALKING, {})),
+            ]
+        )
+        with self.assertLogs("emilia.llm", level="WARNING"):
+            result, events = await self.chat(server)
+        self.assertEqual(len(server.requests), 4)
+        self.assertEqual(server.requests[1]["tool_choice"], "required")
+        self.assertNotIn("tool_choice", server.requests[2])
+        self.assertIn("tools", server.requests[2])  # tools are still offered; only tool_choice is dropped
+        self.assertNotIn("tool_choice", server.requests[3])  # and it isn't tried again
+
+    async def test_the_last_turn_requires_no_tool(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), tool_reply(("web_search", {"query": "y"})), text_reply("Final.")])
+        await self.chat(server, max_turns=3)
+        self.assertNotIn("tool_choice", server.requests[-1])
+
+    async def test_the_same_tool_call_twice_in_a_row_is_not_run_again_and_a_third_time_ends_the_turn(self):
+        same = ("web_search", {"query": "x"})
+        server = self.serve([tool_reply(same), tool_reply(same), tool_reply(same)])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search], multi_turn=True)
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            result = await client.chat(USER)
+        self.assertEqual(result.text, "")
+        self.assertEqual(len(search.calls), 1)  # run once only
+        self.assertEqual(len(server.requests), 3)
+        self.assertIn("call stop_talking now", server.requests[2]["messages"][-1]["content"])  # told why, and how to stop
+        self.assertTrue(any("kept repeating itself" in line for line in logs.output))
+
+    async def test_repeating_a_message_next_to_reworded_tool_calls_ends_the_turn(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "canberra population"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "population of canberra"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "canberra population 2026"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "never reached"})),
+            ]
+        )
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            result, events = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual(len(server.requests), 3)
+        self.assertEqual([e for e in events if e[0] == "text"], [("text", "Let me look that up for you!")])  # posted once
+        self.assertTrue(any("kept repeating itself" in line for line in logs.output))
+
+    async def test_the_same_call_after_something_else_is_run_again(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                tool_reply(("web_search", {"query": "y"})),
+                tool_reply(("web_search", {"query": "x"})),
+                tool_reply((llm.STOP_TALKING, {})),
+            ]
+        )
+        search = FakeSearch()
+        await (await self.client(server, tools=[search], multi_turn=True)).chat(USER)
+        self.assertEqual([c["query"] for c in search.calls], ["x", "y", "x"])
+
+    async def test_ending_the_turn_with_stop_talking_is_logged(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), tool_reply((llm.STOP_TALKING, {}))])
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            await self.chat(server)
+        self.assertTrue(any("Model called stop_talking: turn over" in line for line in logs.output))
+
+    async def test_new_text_is_not_mistaken_for_a_repeat(self):
+        self.assertFalse(llm._repeats("Now I'll fix the second file.", ["Now I'll fix the first file and test it."]))
+        self.assertTrue(llm._repeats("hello", ["Hello!"]))
+
+    async def test_without_multi_turn_stop_talking_is_never_offered(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"}), content="Checking!"), text_reply("Sunny.")])
+        result, events = await self.chat(server, multi_turn=False)
+        self.assertEqual(result.text, "Sunny.")
+        self.assertEqual(events, [("text", "Checking!"), ("tool", "web_search", {"query": "x"})])
+        self.assertTrue(all(llm.STOP_TALKING not in self.offered(r) for r in server.requests))
+
+
 class ConnectionTests(ClientTestCase):
     async def test_model_is_auto_detected_and_embedding_models_are_skipped(self):
         server = self.serve([text_reply("hi")], models=("text-embedding-nomic", "qwen-chat", "other-chat"))

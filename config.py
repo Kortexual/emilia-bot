@@ -27,6 +27,14 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# The environment as it was before .env was loaded. A restarted bot starts from this one, so that
+# it reads .env afresh: load_dotenv never overrides variables that are already set.
+_ENV_BEFORE_DOTENV: dict[str, str] | None = None
+
+
+def environment_without_dotenv() -> dict[str, str]:
+    return dict(os.environ if _ENV_BEFORE_DOTENV is None else _ENV_BEFORE_DOTENV)
+
 # The original template used this placeholder; treat it the same as "not set".
 _PLACEHOLDER_MODEL = "your-model-name"
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -84,6 +92,13 @@ class Settings:
     fetch_pages: bool = True  # let the model read whole pages (links from search results or the sender's message)
     page_max_chars: int = 6000  # characters of page text handed to the model per fetch
     show_sources: bool = True
+    computer_tools: bool = False  # opt-in: model can operate the configured workspace
+    computer_workspace: str = str(BASE_DIR)
+    command_timeout: float = 30.0
+    computer_allow_host_access: bool = False  # opt-in: paths are not limited to computer_workspace
+    computer_require_confirmation: bool = True  # each mutating call must contain confirm=true
+    multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
+    max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
@@ -101,6 +116,9 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        global _ENV_BEFORE_DOTENV
+        if _ENV_BEFORE_DOTENV is None:
+            _ENV_BEFORE_DOTENV = dict(os.environ)
         load_dotenv()
 
         token = _text("DISCORD_TOKEN")
@@ -134,6 +152,13 @@ class Settings:
             fetch_pages=_flag("FETCH_PAGES", cls.fetch_pages),
             page_max_chars=_number("PAGE_MAX_CHARS", cls.page_max_chars, int, minimum=500),
             show_sources=_flag("SHOW_SOURCES", cls.show_sources),
+            computer_tools=_flag("COMPUTER_TOOLS", cls.computer_tools),
+            computer_workspace=_text("COMPUTER_WORKSPACE") or cls.computer_workspace,
+            command_timeout=_number("COMMAND_TIMEOUT", cls.command_timeout, float, minimum=1),
+            computer_allow_host_access=_flag("COMPUTER_ALLOW_HOST_ACCESS", cls.computer_allow_host_access),
+            computer_require_confirmation=_flag("COMPUTER_REQUIRE_CONFIRMATION", cls.computer_require_confirmation),
+            multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
+            max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             memory_db=_text("MEMORY_DB") or cls.memory_db,

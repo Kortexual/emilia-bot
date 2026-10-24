@@ -79,7 +79,10 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         reply = first.replies[0]
         self.assertTrue(reply.startswith("It's sunny and about 75 degrees, I think!"), reply)
         self.assertNotIn("<think>", reply)
-        self.assertIn("-# 🔎 Searched the web · <https://wx.example/atl> · <https://wx.example/hourly>", reply)
+        self.assertEqual(
+            channel.sent,
+            ["-# 🔎 Searching the web for `Atlanta weather today` · <https://wx.example/atl> · <https://wx.example/hourly>"],
+        )
 
         request1, request2 = server.requests[0], server.requests[1]
         self.assertEqual(request1["messages"][0]["role"], "system")

@@ -50,7 +50,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 from textutil import strip_cipher_script, strip_invisible, strip_reserved_tags
-from tooling import ToolResult
+from tooling import ToolResult, code_span
 
 log = logging.getLogger("emilia.page")
 
@@ -431,6 +431,9 @@ class FetchPageTool:
         self._cache_ttl = cache_ttl
         self._clock = clock
         self._cache: dict[str, tuple[float, str, str, str]] = {}  # url -> (time, title, text, final url)
+
+    def describe(self, arguments: dict[str, Any]) -> str:
+        return f"🌐 Reading {code_span(arguments.get('url', ''))}".rstrip()
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         url = str(arguments.get("url", "")).strip()[:2000]
