@@ -518,6 +518,54 @@ class MultiTurnTests(ClientTestCase):
         await self.chat(server, max_turns=3)
         self.assertNotIn("tool_choice", server.requests[-1])
 
+    async def test_the_same_tool_call_twice_in_a_row_is_not_run_again_and_a_third_time_ends_the_turn(self):
+        same = ("web_search", {"query": "x"})
+        server = self.serve([tool_reply(same), tool_reply(same), tool_reply(same)])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search], multi_turn=True)
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            result = await client.chat(USER)
+        self.assertEqual(result.text, "")
+        self.assertEqual(len(search.calls), 1)  # run once only
+        self.assertEqual(len(server.requests), 3)
+        self.assertIn("call stop_talking now", server.requests[2]["messages"][-1]["content"])  # told why, and how to stop
+        self.assertTrue(any("kept repeating itself" in line for line in logs.output))
+
+    async def test_repeating_a_message_next_to_reworded_tool_calls_ends_the_turn(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "canberra population"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "population of canberra"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "canberra population 2026"}), content="Let me look that up for you!"),
+                tool_reply(("web_search", {"query": "never reached"})),
+            ]
+        )
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            result, events = await self.chat(server)
+        self.assertEqual(result.text, "")
+        self.assertEqual(len(server.requests), 3)
+        self.assertEqual([e for e in events if e[0] == "text"], [("text", "Let me look that up for you!")])  # posted once
+        self.assertTrue(any("kept repeating itself" in line for line in logs.output))
+
+    async def test_the_same_call_after_something_else_is_run_again(self):
+        server = self.serve(
+            [
+                tool_reply(("web_search", {"query": "x"})),
+                tool_reply(("web_search", {"query": "y"})),
+                tool_reply(("web_search", {"query": "x"})),
+                tool_reply((llm.STOP_TALKING, {})),
+            ]
+        )
+        search = FakeSearch()
+        await (await self.client(server, tools=[search], multi_turn=True)).chat(USER)
+        self.assertEqual([c["query"] for c in search.calls], ["x", "y", "x"])
+
+    async def test_ending_the_turn_with_stop_talking_is_logged(self):
+        server = self.serve([tool_reply(("web_search", {"query": "x"})), tool_reply((llm.STOP_TALKING, {}))])
+        with self.assertLogs("emilia.llm", level="INFO") as logs:
+            await self.chat(server)
+        self.assertTrue(any("Model called stop_talking: turn over" in line for line in logs.output))
+
     async def test_new_text_is_not_mistaken_for_a_repeat(self):
         self.assertFalse(llm._repeats("Now I'll fix the second file.", ["Now I'll fix the first file and test it."]))
         self.assertTrue(llm._repeats("hello", ["Hello!"]))

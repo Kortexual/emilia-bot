@@ -67,6 +67,10 @@ CONTINUE_HINT = (
     "If the request is done, call stop_talking now; you don't need to say anything else. Only use another tool "
     "if there is more work to do. Never repeat or sum up what you already said.)"
 )
+_REPEATED_CALL = (
+    "This is exactly the same as your previous tool call, so it was not run again: the result above still "
+    "stands. If the request is done, call stop_talking now."
+)
 _LAST_TURN_HINT = "(This is your last turn for this message. No more tools are available, so write your final message now.)"
 
 
@@ -264,6 +268,8 @@ class LMStudioClient:
         used_tools = False
         working = False
         said: list[str] = []  # what the model wrote so far in this reply, to catch it repeating itself
+        previous_calls: list[str] = []  # the last round's tool calls, to catch it repeating them
+        repeated_rounds = 0
         tools_enabled = bool(self._tools)
         limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
@@ -284,8 +290,9 @@ class LMStudioClient:
             content = message.get("content")
             content = content if isinstance(content, str) else ""
             text = strip_tool_markup(strip_reasoning(content))
-            if working and text and _repeats(text, said):
-                log.info("The model repeated itself; not posting it again")
+            echoed = working and bool(text) and _repeats(text, said)
+            if echoed:
+                log.info("The model repeated an earlier message; not posting it again")
                 text = ""
 
             calls: list[_ToolCall] = []
@@ -295,6 +302,8 @@ class LMStudioClient:
                 # Without tools the reply ends here, unless it is working and has something new to say;
                 # nothing new, or no turn left after this one, means it has finished.
                 if not working or not text or round_no + 2 >= limit:
+                    if working:
+                        log.info("Turn over: %s", "out of turns (MAX_TOOL_TURNS)" if text else "the model had nothing new to say")
                     return ChatResult(text, sources, used_tools)
                 if on_text is not None:
                     await on_text(text)
@@ -323,7 +332,17 @@ class LMStudioClient:
             else:
                 hint = CONTINUE_HINT if self._multi_turn else ""
             if working and all(call.name == STOP_TALKING for call in calls):
+                log.info("Model called stop_talking: turn over")
                 return ChatResult(text, sources, used_tools)  # what it wrote alongside stop_talking is its last message
+            keys = [f"{c.name}:{json.dumps(c.arguments, sort_keys=True)}" for c in calls if not (working and c.name == STOP_TALKING)]
+            repeated = bool(keys) and keys == previous_calls  # back to back only: "run tests, edit, run tests" is fine
+            previous_calls = keys
+            # A repeated tool call, or a repeated message next to a new one, is a strike; two in a row end
+            # the turn. Models stuck in a loop repeat their message and only reword their tool calls slightly.
+            repeated_rounds = repeated_rounds + 1 if repeated or echoed else 0
+            if repeated_rounds >= 2:
+                log.info("Turn over: the model kept repeating itself")
+                return ChatResult("", sources, used_tools)
             if text:
                 said.append(text)
                 if on_text is not None:
@@ -334,6 +353,9 @@ class LMStudioClient:
                 if call.name == STOP_TALKING and working:
                     finished = True
                     result = ToolResult("Done.")
+                elif repeated:
+                    log.info("Not running %s again: same call as the round before", call.name)
+                    result = ToolResult(_REPEATED_CALL)
                 else:
                     use = ToolUse(call.name, call.arguments, self._describe(call))
                     if on_tool is not None:
@@ -348,6 +370,7 @@ class LMStudioClient:
                 convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
             working = working or (self._multi_turn and any(call.name in self._tools for call in calls))
             if finished:
+                log.info("Model called stop_talking: turn over")
                 return ChatResult("", sources, used_tools)
 
         raise LLMError("the tool loop ended without an answer")  # unreachable: the last round offers no tools

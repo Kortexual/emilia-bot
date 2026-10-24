@@ -123,8 +123,10 @@ Memory keeps everything the model said for one request as one reply; the tool li
   sends `tool_choice: "required"`, so it must either use another tool or call `stop_talking` (whatever it writes alongside that
   call is its last message); it can't keep answering with plain text, which models tend to do by repeating themselves. If LM Studio
   rejects `tool_choice`, the bot stops sending it, and then a reply that is empty or repeats something already said in this reply
-  ends the turn without being posted. `stop_talking` is only offered once it has started working, so it can't use it to skip
-  answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
+  ends the turn without being posted. Loops are also caught: a tool call identical to the one just before it is not run again
+  (the model is told so and pointed to `stop_talking`), a repeated message is not posted again, and two such repeats in a row
+  end the turn. The console logs how each turn ended (`stop_talking`, repeats, or running out of turns). `stop_talking` is only
+  offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
   models take a while.
 
 ### Reading pages
