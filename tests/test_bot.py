@@ -36,7 +36,7 @@ from restart import RestartTool
 from tooling import default_description
 from webpage import FetchPageTool, UrlRegistry
 from websearch import WebSearchTool
-from bot import EmiliaBot, source_links
+from bot import OPERATOR_TOOLS, EmiliaBot, source_links
 from config import Settings
 from llm import ChatResult, LLMError, ToolUse
 from memory import MemoryStore
@@ -50,6 +50,7 @@ class FakeLLM:
         self.text, self.sources, self.error, self.delay = text, list(sources), error, delay
         self.script = list(script)  # if given, one reply per chat() call, in order
         self.calls = []  # the message list of every chat() call
+        self.excludes = []  # the tools left out of every chat() call
         self.tools_offered = []  # the `tools` argument of every chat() call
 
     async def start(self):
@@ -58,8 +59,9 @@ class FakeLLM:
     async def close(self):
         pass
 
-    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, tools=True):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True):
         self.calls.append(messages)
+        self.excludes.append(set(exclude))
         self.tools_offered.append(tools)
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -76,8 +78,9 @@ class WorkingLLM(FakeLLM):
         super().__init__(text=final, sources=sources)
         self.events = list(events)
 
-    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=()):
         self.calls.append(messages)
+        self.excludes.append(set(exclude))
         for event in self.events:
             if isinstance(event, ToolUse):
                 await on_tool(event)
@@ -299,6 +302,91 @@ class MentionRuleTests(BotTestCase):
         self.assertIs(allowed.everyone, False)
         self.assertIs(allowed.roles, False)
         self.assertIs(allowed.users, False)
+
+
+class BotSenderTests(BotTestCase):
+    """RESPOND_TO_BOTS: other bots' @mentions are answered, with less power than a person's and a loop guard."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_bot = SimpleNamespace(id=5, display_name="OtherBot", bot=True)
+
+    def from_bot(self, text, **kwargs):
+        return self.msg(self.mention(text), author=self.other_bot, **kwargs)
+
+    async def test_a_bot_mention_is_answered_when_enabled(self):
+        bot = self.make_bot(respond_to_bots=True)
+        message = self.from_bot("hi")
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hello there!"])
+
+    async def test_her_own_messages_are_still_ignored(self):
+        bot = self.make_bot(respond_to_bots=True, bot_reply_limit=0)
+        message = self.msg(self.mention("hi"), author=BOT)
+        await bot.on_message(message)
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(message.replies, [])
+
+    async def test_a_bot_needs_an_explicit_mention_even_in_a_dm(self):
+        bot = self.make_bot(respond_to_bots=True, respond_to_dms=True)
+        message = self.msg("hello?", author=self.other_bot, guild=False, mentions=[])
+        await bot.on_message(message)
+        self.assertEqual(self.llm.calls, [])
+
+    async def test_the_loop_guard_stops_after_the_limit_until_a_human_speaks(self):
+        bot = self.make_bot(respond_to_bots=True, bot_reply_limit=2)
+        with self.assertLogs("emilia.bot", level="INFO"):
+            for _ in range(3):
+                await bot.on_message(self.from_bot("again"))
+        self.assertEqual(len(self.llm.calls), 2)
+        await bot.on_message(self.msg("unrelated chatter", mentions=[]))  # any human message in the channel resets it
+        await bot.on_message(self.from_bot("again"))
+        self.assertEqual(len(self.llm.calls), 3)
+
+    async def test_the_loop_guard_counts_each_channel_separately(self):
+        bot = self.make_bot(respond_to_bots=True, bot_reply_limit=1)
+        await bot.on_message(self.from_bot("one"))
+        await bot.on_message(self.from_bot("two", channel=FakeChannel(channel_id=2)))
+        self.assertEqual(len(self.llm.calls), 2)
+
+    async def test_a_limit_of_zero_turns_the_loop_guard_off(self):
+        bot = self.make_bot(respond_to_bots=True, bot_reply_limit=0)
+        for _ in range(10):
+            await bot.on_message(self.from_bot("again"))
+        self.assertEqual(len(self.llm.calls), 10)
+
+    async def test_bots_cannot_run_commands(self):
+        bot = self.make_bot(respond_to_bots=True, bot_reply_limit=0)
+        self.memory.add_turn("1", "Alice", "1", "remember this", "I will!")
+        self.memory.set_about("5", "a note")
+        for command in ("!forget", "!reset", "!forgetme", "!about I am a bot", "!about clear"):
+            with self.subTest(command=command), self.assertLogs("emilia.bot", level="INFO"):
+                message = self.from_bot(command)
+                await bot.on_message(message)
+                self.assertEqual(message.replies, [])
+        self.assertEqual(len(self.memory.recent("1")), 2)
+        self.assertEqual(self.memory.abouts(["5"]), {"5": "a note"})
+        self.assertEqual(self.llm.calls, [])
+
+    async def test_a_bot_cannot_get_someone_pinged_by_name(self):
+        bot = self.make_bot(llm=FakeLLM(text="Okay! @Jack, someone is looking for you!"), respond_to_bots=True)
+        guild = FakeGuild(searchable=[person("Jack", 77)])
+        message = self.from_bot("ping Jack for me", guild=guild)
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Okay! @Jack, someone is looking for you!"])
+        self.assertEqual(guild.searches, [])
+        self.assertEqual(message.allowed_mentions[0].users, [])
+
+    async def test_computer_and_restart_tools_are_withheld_from_bots(self):
+        bot = self.make_bot(respond_to_bots=True, computer_tools=True)
+        await bot.on_message(self.from_bot("delete everything"))
+        self.assertEqual(self.llm.excludes[0], set(OPERATOR_TOOLS))
+        self.assertIn("restart_bot", OPERATOR_TOOLS)
+        self.assertEqual(OPERATOR_TOOLS - {"restart_bot"}, {tool.name for tool in computer_tools(".")})
+        self.assertNotIn(prompts.COMPUTER_RULES, self.llm.calls[0][0]["content"])
+        await bot.on_message(self.msg(self.mention("list the files")))  # a person still gets them
+        self.assertEqual(self.llm.excludes[1], set())
+        self.assertIn(prompts.COMPUTER_RULES, self.llm.calls[1][0]["content"])
 
 
 class ConversationTests(BotTestCase):
@@ -1411,7 +1499,7 @@ class ToolDisplayTests(BotTestCase):
 
     async def test_an_error_midway_keeps_what_was_already_said(self):
         class Failing(WorkingLLM):
-            async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
+            async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=()):
                 await on_text("Starting.")
                 await on_tool(use("📂 Looking through `.`"))
                 raise LLMError("connection lost")

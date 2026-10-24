@@ -38,7 +38,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Collection, Protocol
 
 import discord
 
@@ -48,7 +48,7 @@ import prompts
 import styleguard
 from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
-from computer import computer_tools
+from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, Presence, StoredMessage
@@ -68,6 +68,7 @@ QUOTE_CHARS = 300  # how much of a replied-to message is shown to the model
 FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the sender wants to talk about
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
 FORWARD_COMMENT_WAIT = 2.0  # seconds a forward on its own (in a DM) waits for a comment that would answer it instead
+OPERATOR_TOOLS = COMPUTER_TOOL_NAMES | {RestartTool.name}  # never offered when the sender is a bot (RESPOND_TO_BOTS)
 
 
 class ChatBackend(Protocol):
@@ -82,6 +83,7 @@ class ChatBackend(Protocol):
         on_tool: ToolHandler | None = None,
         on_tool_done: ToolHandler | None = None,
         *,
+        exclude: Collection[str] = (),
         tools: bool = True,
     ) -> ChatResult: ...
 
@@ -261,6 +263,7 @@ class EmiliaBot(discord.Client):
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
         self._forwards: dict[tuple[int, int], discord.Message] = {}  # (channel, user) -> their latest forward there
+        self._bot_streak: dict[int, int] = {}  # by channel ID: replies to bots since a human last spoke there
         self._restart_ready_fd = restart_ready_fd
         self._retiring = False  # a replacement has taken over: answer no new messages, then shut down
         self._retire_task: asyncio.Task[None] | None = None
@@ -322,6 +325,8 @@ class EmiliaBot(discord.Client):
 
     async def on_ready(self) -> None:
         scope = "@mentions and DMs" if self.settings.respond_to_dms else "@mentions only"
+        if self.settings.respond_to_bots:
+            scope += ", including from other bots"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
         if self._restart_ready_fd is not None:
             try:
@@ -360,11 +365,15 @@ class EmiliaBot(discord.Client):
 
     # --- events ------------------------------------------------------------------
     async def on_message(self, message: discord.Message) -> None:
+        if not message.author.bot:  # a human speaking ends any run of bot-to-bot replies in this channel
+            self._bot_streak.pop(message.channel.id, None)
         if self._retiring:  # once restarted, the replacement answers
             return
         forward = self._note_forward(message)
         if not self._is_for_me(message):
             return
+        if message.author.bot:
+            self._bot_streak[message.channel.id] = self._bot_streak.get(message.channel.id, 0) + 1
         try:
             await self._handle(message, forward)
         except discord.Forbidden:
@@ -374,12 +383,22 @@ class EmiliaBot(discord.Client):
 
     def _is_for_me(self, message: discord.Message) -> bool:
         """The whole "only respond to @mentions" rule lives here."""
-        if self.user is None or message.author.bot:  # includes ourselves and other bots
+        if self.user is None or message.author.id == self.user.id:  # never her own messages
+            return False
+        if message.author.bot and not self.settings.respond_to_bots:
             return False
         if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return False  # joins, pins, etc.
         # An explicit mention of this bot. (@everyone/@here and role pings don't count.)
-        if any(user.id == self.user.id for user in message.mentions):
+        mentioned = any(user.id == self.user.id for user in message.mentions)
+        if message.author.bot:
+            # Only explicit mentions, and only so many in a row: two bots pinging each other would never stop.
+            limit = self.settings.bot_reply_limit
+            if mentioned and limit and self._bot_streak.get(message.channel.id, 0) >= limit:
+                log.info("Not answering bot %s: %d replies to bots in a row in this channel", message.author.id, limit)
+                return False
+            return mentioned
+        if mentioned:
             return True
         return message.guild is None and self.settings.respond_to_dms
 
@@ -409,6 +428,9 @@ class EmiliaBot(discord.Client):
         key = str(message.channel.id)
 
         command, _, argument = text.partition(" ")
+        if message.author.bot and (text.lower() in RESET_COMMANDS | {FORGET_ME_COMMAND} or command.lower() == ABOUT_COMMAND):
+            log.info("Ignored a command from bot %s", message.author.id)  # commands are for people only
+            return
         if text.lower() in RESET_COMMANDS:
             await self._reset(message, key)
             return
@@ -448,6 +470,7 @@ class EmiliaBot(discord.Client):
         forwarded: Forwarded | None = None,
     ) -> None:
         """Generate and post messages; a tool-assisted reply can continue in further turns."""
+        from_bot = message.author.bot  # only possible with RESPOND_TO_BOTS: no computer tools, no pings by name
         people = self._people(message, quoted_author)
         author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
         async with message.channel.typing():  # keeps "typing..." showing, even while queued
@@ -475,7 +498,7 @@ class EmiliaBot(discord.Client):
                 profiles = await self._profiles(people, labels)
                 scene = await self._scene(key) if self.settings.time_awareness else None
 
-                system_prompt = self._system_prompt()
+                system_prompt = self._system_prompt(from_bot=from_bot)
                 if self.settings.fetch_pages or self.settings.browser_tools:  # links the sender wrote, quoted or forwarded
                     forwarded_body = forwarded.body if forwarded is not None else ""
                     self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body))
@@ -513,7 +536,8 @@ class EmiliaBot(discord.Client):
                                 reply = styleguard.cool_down(reply, [*recent, *kept])
                             kept.append(reply)
                             pingable = self._pingable(labels, known)
-                            pingable.update(await self._lookup_members(message, reply, text, pingable))
+                            if not from_bot:  # "the sender typed their name" only counts for people
+                                pingable.update(await self._lookup_members(message, reply, text, pingable))
                             reply, pinged = link_mentions(reply, pingable)
                     if reply:
                         posted = True
@@ -543,15 +567,16 @@ class EmiliaBot(discord.Client):
                     except discord.HTTPException as exc:
                         log.info("Could not add links to a tool message (%s)", exc)
 
+                exclude = OPERATOR_TOOLS if from_bot else ()
                 try:
-                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done)
+                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
                     reply = clean_reply(result.text, self._speaker_names())
                     if contains_cipher_script(reply) and not result.used_tools and not posted:
                         # Someone talked the model into writing in braille (or similar). Try once more
                         # with a nudge; nothing has run or been posted yet, so the retry is harmless.
                         log.warning("Reply was written in braille/cipher script; retrying once in plain text")
                         nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
-                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done)
+                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
                         reply = clean_reply(result.text, self._speaker_names())
                 except LLMError as exc:
                     log.error("LM Studio request failed: %s", exc)
@@ -576,13 +601,13 @@ class EmiliaBot(discord.Client):
                     await self._record_spoke(key, bool(scene and scene.kind))
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, *, from_bot: bool = False) -> str:
         today = self._now().date() if self.settings.timezone else date.today()
         return prompts.build_system_prompt(
             today,
             web_search=self.settings.web_search,
             show_sources=self.settings.show_sources,
-            computer_tools=self.settings.computer_tools,
+            computer_tools=self.settings.computer_tools and not from_bot,
             multi_turn=self.settings.multi_turn_tools,
             yandere=self.settings.yandere_mode,
             fetch_pages=self.settings.fetch_pages,
