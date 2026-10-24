@@ -318,6 +318,34 @@ class ChatTests(ClientTestCase):
         self.assertEqual(server.requests[0]["temperature"], 0.3)
         self.assertEqual(server.requests[0]["max_tokens"], 256)
 
+    async def test_excluded_tools_are_neither_offered_nor_run(self):
+        class Command(FakeSearch):
+            name = "run_command"
+            schema = {**FakeSearch.schema, "name": "run_command"}
+
+        command, search = Command(), FakeSearch()
+        server = self.serve([tool_reply(("run_command", {"query": "rm -rf"})), text_reply("No.")])
+        client = await self.client(server, tools=[search, command])
+        reported = []
+
+        async def on_tool(use):
+            reported.append(use.name)
+
+        result = await client.chat(USER, None, on_tool, exclude={"run_command"})
+        self.assertEqual(result.text, "No.")
+        self.assertFalse(result.used_tools)
+        self.assertEqual([t["function"]["name"] for t in server.requests[0]["tools"]], ["web_search"])
+        self.assertEqual(command.calls, [])  # asked for anyway: refused
+        self.assertEqual(reported, [])  # and not shown in the chat as if it had run
+        self.assertIn("no tool called", server.requests[1]["messages"][3]["content"])
+
+        server = self.serve([text_reply("hi"), text_reply("hi")])
+        client = await self.client(server, tools=[command])
+        await client.chat(USER, exclude={"run_command"})
+        self.assertNotIn("tools", server.requests[0])  # nothing left to offer
+        await client.chat(USER)
+        self.assertIn("tools", server.requests[1])  # only for that conversation
+
 
 
 class ToolReportTests(ClientTestCase):

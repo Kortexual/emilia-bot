@@ -35,7 +35,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Collection, Sequence
 
 import aiohttp
 
@@ -252,6 +252,8 @@ class LMStudioClient:
         on_text: TextHandler | None = None,
         on_tool: ToolHandler | None = None,
         on_tool_done: ToolHandler | None = None,
+        *,
+        exclude: Collection[str] = (),
     ) -> ChatResult:
         """Run a conversation to completion, executing any tool calls the model makes on the way.
 
@@ -260,8 +262,10 @@ class LMStudioClient:
         so the caller can post them as they happen. Without multi-turn mode the model gets MAX_TOOL_ROUNDS rounds of tools and then
         must answer. In multi-turn mode a tool call starts "working": the model is prompted again after
         every generation (text or tools) until it calls stop_talking or max_turns runs out. stop_talking is
-        only offered while working, so it can't end a reply before it has started.
+        only offered while working, so it can't end a reply before it has started. Tools named in
+        `exclude` are neither offered nor run for this conversation.
         """
+        tools = {name: tool for name, tool in self._tools.items() if name not in exclude}
         convo = list(messages)
         sources: list[str] = []
         used_ids: set[str] = set()
@@ -270,15 +274,15 @@ class LMStudioClient:
         said: list[str] = []  # what the model wrote so far in this reply, to catch it repeating itself
         previous_calls: list[str] = []  # the last round's tool calls, to catch it repeating them
         repeated_rounds = 0
-        tools_enabled = bool(self._tools)
+        tools_enabled = bool(tools)
         limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
         for round_no in range(limit):
             last = round_no + 1 >= limit
             offer = tools_enabled and not last  # the last round must be an answer
-            offered = (set(self._tools) | ({STOP_TALKING} if working else set())) if offer else set()
+            offered = (set(tools) | ({STOP_TALKING} if working else set())) if offer else set()
             try:
-                message = await self._complete(convo, offer, finish_option=working, require_tool=working)
+                message = await self._complete(convo, offer, finish_option=working, require_tool=working, tools=tools)
             except LLMHTTPError as exc:
                 if not (offer and exc.status in (400, 422)):
                     raise
@@ -356,6 +360,8 @@ class LMStudioClient:
                 elif repeated:
                     log.info("Not running %s again: same call as the round before", call.name)
                     result = ToolResult(_REPEATED_CALL)
+                elif call.name not in offered:  # unknown or excluded: refused, and not shown in the chat as if it ran
+                    result = await self._run_tool(call, offered)
                 else:
                     use = ToolUse(call.name, call.arguments, self._describe(call))
                     if on_tool is not None:
@@ -368,7 +374,7 @@ class LMStudioClient:
                 sources.extend(result.sources)
                 note = f"\n\n{hint}" if hint and call is calls[-1] else ""
                 convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
-            working = working or (self._multi_turn and any(call.name in self._tools for call in calls))
+            working = working or (self._multi_turn and any(call.name in tools for call in calls))
             if finished:
                 log.info("Model called stop_talking: turn over")
                 return ChatResult("", sources, used_tools)
@@ -397,10 +403,17 @@ class LMStudioClient:
             return ToolResult(f"Error: the {call.name} tool failed.")
 
     async def _complete(
-        self, convo: list[dict[str, Any]], offer_tools: bool, finish_option: bool = False, require_tool: bool = False
+        self,
+        convo: list[dict[str, Any]],
+        offer_tools: bool,
+        finish_option: bool = False,
+        require_tool: bool = False,
+        tools: dict[str, Tool] | None = None,
     ) -> dict[str, Any]:
         """One request to /chat/completions; returns the assistant message. With require_tool the model
-        must answer with a tool call (tool_choice="required"), if the server supports it."""
+        must answer with a tool call (tool_choice="required"), if the server supports it. `tools` are the
+        ones to offer (all of them by default)."""
+        tools = self._tools if tools is None else tools
         if not self.model:  # LM Studio wasn't reachable at startup
             self._pick_model(await self.list_models())
 
@@ -410,8 +423,8 @@ class LMStudioClient:
             payload["temperature"] = self._temperature
         if self._max_tokens is not None:
             payload["max_tokens"] = self._max_tokens
-        if offer_tools and self._tools:
-            schemas = [tool.schema for tool in self._tools.values()] + ([_STOP_TALKING_SCHEMA] if finish_option else [])
+        if offer_tools and tools:
+            schemas = [tool.schema for tool in tools.values()] + ([_STOP_TALKING_SCHEMA] if finish_option else [])
             payload["tools"] = [{"type": "function", "function": schema} for schema in schemas]
             if require_tool and self._tool_choice_ok:
                 payload["tool_choice"] = "required"

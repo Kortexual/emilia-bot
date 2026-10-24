@@ -206,6 +206,7 @@ _LABELS = {
     "delete_path": ("🗑️ Deleting", "path", ""),
     "run_command": ("💻 Running", "command", ""),
 }
+TOOL_NAMES = frozenset(_LABELS)  # every tool computer_tools() returns
 
 
 class _WorkspaceTool:
