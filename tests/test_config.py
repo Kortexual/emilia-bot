@@ -39,6 +39,8 @@ class SettingsTests(unittest.TestCase):
         self.assertIsNone(s.temperature)  # left to LM Studio's own settings, as before
         self.assertIsNone(s.max_tokens)
         self.assertFalse(s.respond_to_dms)
+        self.assertFalse(s.respond_to_bots)
+        self.assertEqual(s.bot_reply_limit, 3)
         self.assertTrue(s.web_search)
         self.assertFalse(s.computer_tools)
         self.assertEqual(s.command_timeout, 30.0)
@@ -96,6 +98,8 @@ class SettingsTests(unittest.TestCase):
         s = load(
             DISCORD_TOKEN="a",
             RESPOND_TO_DMS="Yes",
+            RESPOND_TO_BOTS="true",
+            BOT_REPLY_LIMIT="0",
             WEB_SEARCH="off",
             LMSTUDIO_TEMPERATURE="0.7",
             LMSTUDIO_MAX_TOKENS="512",
@@ -111,6 +115,8 @@ class SettingsTests(unittest.TestCase):
             MAX_TOOL_TURNS="4",
         )
         self.assertTrue(s.respond_to_dms)
+        self.assertTrue(s.respond_to_bots)
+        self.assertEqual(s.bot_reply_limit, 0)  # loop guard off
         self.assertFalse(s.web_search)
         self.assertEqual(s.temperature, 0.7)
         self.assertEqual(s.max_tokens, 512)
@@ -135,6 +141,8 @@ class SettingsTests(unittest.TestCase):
             {"STYLE_COOLDOWN": "-1"},
             {"COMMAND_TIMEOUT": "0"},
             {"MAX_TOOL_TURNS": "1"},
+            {"BOT_REPLY_LIMIT": "-1"},
+            {"RESPOND_TO_BOTS": "sometimes"},
             {"BROWSER_TOOLS": "sometimes"},
             {"BROWSER_REQUIRE_CONFIRMATION": "2"},
         ):

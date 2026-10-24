@@ -3,7 +3,7 @@
 A Discord bot that chats through a local model running in [LM Studio](https://lmstudio.ai/).
 Everything stays on your machine, apart from the web searches the model chooses to make.
 
-- **Only answers @mentions.** Every other message (and every other bot) is ignored. (The one opt-in exception: she can speak up on her own in channels you list, during hours you choose; see "Her day".)
+- **Only answers @mentions.** Every other message is ignored, and so are other bots unless you set `RESPOND_TO_BOTS=true`. (The one opt-in exception: she can speak up on her own in channels you list, during hours you choose; see "Her day".)
 - **Remembers the conversation**, per channel, even across restarts.
 - **Searches the web when it's unsure**: the model decides when, using LM Studio's tool calling.
 - **Can work on a local workspace** when explicitly enabled: read, write, edit and delete files, and run shell commands.
@@ -53,14 +53,26 @@ Everything stays on your machine, apart from the web searches the model chooses 
   `!about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
 - `@Emilia !forgetme` deletes the note and the names saved about you.
 - DMs are ignored unless you set `RESPOND_TO_DMS=true`.
+- Other bots are ignored unless you set `RESPOND_TO_BOTS=true` (see "Talking to other bots" below).
 
 ## How it works
 
 ### Only @mentions
-`EmiliaBot._is_for_me` in `bot.py` is the whole rule: the message must come from a human, be an ordinary message or reply,
-and mention the bot (a reply that pings the bot counts). Anything else is dropped before any work is done.
+`EmiliaBot._is_for_me` in `bot.py` is the whole rule: the message must come from a human (or another bot, if enabled below), be an
+ordinary message or reply, and mention the bot (a reply that pings the bot counts). Anything else is dropped before any work is done.
 Replies can never ping `@everyone` or roles, whatever the model writes. When the model writes `@Name` for someone in the
 conversation, `link_mentions` in `bot.py` turns it into a real ping for that user only; any other name stays plain text.
+
+### Talking to other bots
+By default every bot is ignored. With `RESPOND_TO_BOTS=true`, another bot that @mentions Emilia gets an answer, with these limits:
+- **Never herself.** Her own messages are always ignored.
+- **Explicit @mentions only.** A bot's DM doesn't count, even with `RESPOND_TO_DMS=true`.
+- **A loop guard.** Two bots that answer each other's pings would never stop. After `BOT_REPLY_LIMIT` replies to bots in a row in one
+  channel (default 3), Emilia ignores bots there until a person posts anything in that channel. `BOT_REPLY_LIMIT=0` turns the guard
+  off; only do that if the other bots can't get into a loop with her.
+- **Less power than a person.** Bots can't use `!forget`, `!about` or `!forgetme` (they are ignored), can't make her ping someone by
+  name (only people already in the conversation can be pinged), and never get the computer tools or `restart_bot`, whatever
+  `COMPUTER_TOOLS` says. Web search and page reading work as usual.
 
 ### Pinging
 When the model writes `@Name`, `link_mentions` turns it into a real ping if the name belongs to someone in the conversation (by their
@@ -269,6 +281,8 @@ All settings are environment variables (or lines in `.env`).
 | `LMSTUDIO_TIMEOUT` | `300` | Seconds to wait for one response |
 | `MAX_CONCURRENT_REQUESTS` | `1` | Simultaneous generations sent to LM Studio |
 | `RESPOND_TO_DMS` | `false` | Answer DMs without needing an @mention |
+| `RESPOND_TO_BOTS` | `false` | Answer other bots' @mentions too (see "Talking to other bots") |
+| `BOT_REPLY_LIMIT` | `3` | Replies to bots in a row per channel before a person must speak; `0` turns the loop guard off |
 | `WEB_SEARCH` | `true` | Let the model search the web |
 | `SEARCH_RESULTS` | `4` | Results handed to the model per search |
 | `FETCH_PAGES` | `true` | Let the model read whole pages (links from search results or the sender's message) |
