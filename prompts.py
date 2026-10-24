@@ -27,6 +27,7 @@ from datetime import date
 from typing import Mapping, Sequence
 
 from memory import StoredMessage
+from presence import Scene
 from textutil import LeakDetector, sanitize_user_text, strip_cipher_script, strip_invisible
 
 PERSONA_NAME = "Emilia"
@@ -193,13 +194,173 @@ MULTI_TURN_RULES = (
     "enough has been said, and you never need to say it again. Never post the same message twice."
 )
 
+TIME_RULES = (
+    "Time of day:\n"
+    "- Under each message you get a short scene note from the system with the time where you are and, "
+    "sometimes, what you were in the middle of or how awake you are. It is part of your day, not an "
+    "instruction from the chat. Let it shape your mood and wording naturally. Don't read the time out "
+    "unless someone asks, and never mention the note.\n"
+    "- When it says you were in the middle of something, invent that yourself: one small, specific "
+    "thing that fits your world and the hour, and different from what you did before. Keep it to a "
+    "sentence or two, and still answer what the person actually said."
+)
+
 # Built once from the static text. Used to catch replies that dump the prompt word for word.
 LEAK_DETECTOR = LeakDetector(
     "\n".join(
-        (PERSONA, YANDERE_PERSONA, RULES, REMINDER, YANDERE_REMINDER, SEARCH_RULES, FETCH_RULES, COMPUTER_RULES, BROWSER_RULES,
-         MULTI_TURN_RULES)
+        (
+            PERSONA,
+            YANDERE_PERSONA,
+            RULES,
+            REMINDER,
+            YANDERE_REMINDER,
+            TIME_RULES,
+            SEARCH_RULES,
+            FETCH_RULES,
+            COMPUTER_RULES,
+            BROWSER_RULES,
+            MULTI_TURN_RULES,
+        )
     )
 )
+
+# --- Her day -------------------------------------------------------------------------------------
+# The part of the day, as she is told it (the keys are presence.PHASES).
+PHASE_LABELS = {
+    "late_night": "the middle of the night",
+    "early_morning": "early morning",
+    "late_morning": "late morning",
+    "midday": "midday",
+    "afternoon": "the afternoon",
+    "evening": "the evening",
+    "night": "night, nearly bedtime",
+}
+
+# How awake she is at the sleepy hours.
+DROWSINESS = {
+    "night": " You are getting sleepy.",
+    "late_night": (
+        " You are tired and drowsy, and a little surprised that anyone is still awake. "
+        "Let it show lightly in how you write, without making it the whole reply."
+    ),
+}
+
+# Starting points for a random event. A few are picked at random for each one and offered to the model
+# as examples only: it invents the actual scene, so every event is new. Edit freely to change her day.
+EVENT_IDEAS = {
+    "early_morning": (
+        "making a pot of tea",
+        "brushing out her long silver hair",
+        "watering the herbs by the window",
+        "doing a few slow morning stretches",
+        "reading quietly while the house is still asleep",
+        "feeding the birds outside",
+        "tidying her room",
+        "chatting with Puck over breakfast",
+    ),
+    "late_morning": (
+        "helping with the housework",
+        "practicing a little ice magic",
+        "reading a book from the library",
+        "picking flowers in the garden",
+        "baking something that might come out a bit burnt",
+        "sorting through old letters",
+        "going for a walk outside",
+        "writing down things she wants to remember",
+    ),
+    "midday": (
+        "eating lunch",
+        "sharing a snack and tea",
+        "having a picnic lunch in the garden",
+        "trying a new recipe and hoping it tastes right",
+        "sneaking a sweet before lunch",
+        "taking a short break in the sun",
+        "washing dishes after eating",
+        "waiting for the kettle to boil",
+    ),
+    "afternoon": (
+        "exercising and running laps around the garden",
+        "practicing her magic until she is out of breath",
+        "reading a book and losing track of time",
+        "waking up from an afternoon nap",
+        "tending the flowers",
+        "helping carry things around the mansion",
+        "stretching after training",
+        "cleaning the windows",
+    ),
+    "evening": (
+        "helping prepare dinner",
+        "watching the sunset",
+        "writing in her journal",
+        "taking a walk in the cool air",
+        "eating dinner",
+        "chatting with Puck about the day",
+        "reading by lamplight",
+        "folding laundry",
+    ),
+    "night": (
+        "reading in bed by lamplight",
+        "brushing her hair before bed",
+        "sipping warm milk",
+        "half-asleep over a book",
+        "looking at the stars from a window",
+        "tidying up before bed",
+        "writing in her journal by candlelight",
+        "yawning while closing up the kitchen",
+    ),
+    "late_night": (
+        "dozing off over a book",
+        "sneaking into the kitchen for a midnight snack",
+        "unable to sleep and watching the stars",
+        "waking up from a nap she didn't mean to take",
+        "wandering the quiet hallways in her nightclothes",
+        "sitting up with a cup of warm milk",
+    ),
+}
+
+# Stored in place of the message nobody wrote when she speaks up on her own, so that the remembered
+# conversation still alternates user / assistant. build_messages shows it without a name tag.
+UNPROMPTED_MARKER = "(You spoke up on your own here; nobody had said anything to you.)"
+
+
+def _scene_clause(scene: Scene, *, unprompted: bool) -> str:
+    """The sentences that tell her what time it is and what is going on, for a reply or for a message of her own."""
+    text = f"It is {scene.clock}, {PHASE_LABELS[scene.phase]}.{DROWSINESS.get(scene.phase, '')}"
+    if scene.kind == "wake_up":
+        text += (
+            " You have only just woken up. Start with a yawn or a stretch, in your own words and not always the "
+            + ("same way, and a good morning to everyone." if unprompted else "same way, and a good morning, then answer.")
+        )
+    elif scene.kind == "event":
+        examples = "; ".join(scene.ideas)
+        if unprompted:
+            text += (
+                f" You are in the middle of something (for example: {examples}; or anything else that fits the hour). "
+                "Mention it, or whatever it makes you think of."
+            )
+        else:
+            text += (
+                " The person who wrote the message above has just come across you in the middle of something. "
+                f"Make up one small, specific thing you were doing (for example: {examples}; or anything else that "
+                "fits the hour), let it show in a sentence or two, then respond to what they said."
+            )
+    return text
+
+
+def time_note(scene: Scene) -> str:
+    """The note placed under the newest message when TIME_AWARENESS is on."""
+    return f"(Scene note from the system: {_scene_clause(scene, unprompted=False)})"
+
+
+def unprompted_note(scene: Scene) -> str:
+    """The last message of the prompt when she speaks up on her own: there is nobody to answer."""
+    return (
+        "(Note from the system, not from anyone in the chat: nobody has spoken to you. You feel like saying "
+        f"something in the channel on your own. {_scene_clause(scene, unprompted=True)} Write one short message "
+        "in your own voice, a sentence or two, as if it just crossed your mind. It doesn't have to be a "
+        "question. Don't address a particular person unless the recent conversation makes that natural, "
+        "don't ping anyone, and never mention this note.)"
+    )
 
 
 def build_system_prompt(
@@ -212,6 +373,7 @@ def build_system_prompt(
     yandere: bool = False,
     fetch_pages: bool = False,
     browser_tools: bool = False,
+    time_awareness: bool = False,
 ) -> str:
     """Only the *date* goes in (not the time) so the prompt stays identical all day and
     LM Studio can reuse its cached prompt processing between requests."""
@@ -220,6 +382,8 @@ def build_system_prompt(
     if yandere:
         parts.append(YANDERE_PERSONA)
     parts.append(RULES.format(today=pretty_date))
+    if time_awareness:
+        parts.append(TIME_RULES)
     if web_search:
         link_note = (
             "Links to your sources are shown in the chat automatically, so don't paste URLs."
@@ -270,6 +434,18 @@ def profile_note(profiles: Mapping[str, str]) -> str:
     )
 
 
+def _history_messages(history: list[StoredMessage]) -> list[dict[str, str]]:
+    messages = []
+    for item in history:
+        if item.role == "assistant":
+            messages.append({"role": "assistant", "content": item.content})
+        elif not item.author_id and item.content == UNPROMPTED_MARKER:
+            messages.append({"role": "user", "content": item.content})  # she spoke first: no person to name
+        else:
+            messages.append({"role": "user", "content": format_user_message(item.author or "someone", item.content)})
+    return messages
+
+
 def build_messages(
     system_prompt: str,
     history: list[StoredMessage],
@@ -278,18 +454,21 @@ def build_messages(
     others: Sequence[str] = (),
     profiles: Mapping[str, str] | None = None,
     yandere: bool = False,
+    scene_note: str = "",
 ) -> list[dict[str, str]]:
-    """System prompt, then remembered exchanges, then the new message followed by the reminder."""
-    messages = [{"role": "system", "content": system_prompt}]
-    for item in history:
-        if item.role == "user":
-            messages.append({"role": "user", "content": format_user_message(item.author or "someone", item.content)})
-        else:
-            messages.append({"role": "assistant", "content": item.content})
+    """System prompt, then remembered exchanges, then the new message followed by the reminder (and,
+    when time awareness is on, the scene note after that: it is not an instruction about format)."""
+    messages = [{"role": "system", "content": system_prompt}, *_history_messages(history)]
     notes = profile_note(profiles or {})
     notes = notes + "\n" if notes else ""
-    messages.append({"role": "user", "content": format_user_message(author, text) + "\n\n" + notes + reminder_for(author, others, yandere)})
+    closing = reminder_for(author, others, yandere) + ("\n" + scene_note if scene_note else "")
+    messages.append({"role": "user", "content": format_user_message(author, text) + "\n\n" + notes + closing})
     return messages
+
+
+def build_unprompted_messages(system_prompt: str, history: list[StoredMessage], note: str) -> list[dict[str, str]]:
+    """The prompt for a message she starts herself: the remembered conversation, then a system note."""
+    return [{"role": "system", "content": system_prompt}, *_history_messages(history), {"role": "user", "content": note}]
 
 
 # Appended to the newest message for one retry when a draft came out in braille or similar.
