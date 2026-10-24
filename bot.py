@@ -33,7 +33,7 @@ import sqlite3
 import sys
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Protocol
 
 import discord
@@ -57,6 +57,10 @@ CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some h
 RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
 FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
 ABOUT_COMMAND = "!about"  # "@Emilia !about I garden and like tea" saves a note about yourself
+QUOTE_CHARS = 300  # how much of a replied-to message is shown to the model
+FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the sender wants to talk about
+FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
+FORWARD_COMMENT_WAIT = 2.0  # seconds a forward on its own (in a DM) waits for a comment that would answer it instead
 
 
 class ChatBackend(Protocol):
@@ -71,6 +75,15 @@ class ChatBackend(Protocol):
         on_tool: ToolHandler | None = None,
         on_tool_done: ToolHandler | None = None,
     ) -> ChatResult: ...
+
+
+@dataclass
+class Forwarded:
+    """A forwarded message as shown to the model: its text, its author if we could find out, and where/when it was written."""
+
+    body: str
+    author: discord.abc.User | None
+    origin: str  # e.g. " in #kitchen on 2026-10-23 at 10:29 UTC"; empty if unknown
 
 
 def source_links(urls: list[str], max_links: int = 3) -> str:
@@ -235,6 +248,7 @@ class EmiliaBot(discord.Client):
         )
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
+        self._forwards: dict[tuple[int, int], discord.Message] = {}  # (channel, user) -> their latest forward there
         self._restart_ready_fd = restart_ready_fd
         self._retiring = False  # a replacement has taken over: answer no new messages, then shut down
         self._retire_task: asyncio.Task[None] | None = None
@@ -308,10 +322,13 @@ class EmiliaBot(discord.Client):
 
     # --- events ------------------------------------------------------------------
     async def on_message(self, message: discord.Message) -> None:
-        if self._retiring or not self._is_for_me(message):  # once restarted, the replacement answers
+        if self._retiring:  # once restarted, the replacement answers
+            return
+        forward = self._note_forward(message)
+        if not self._is_for_me(message):
             return
         try:
-            await self._handle(message)
+            await self._handle(message, forward)
         except discord.Forbidden:
             log.warning("Missing permission to reply in channel %s", message.channel.id)
         except Exception:
@@ -329,7 +346,27 @@ class EmiliaBot(discord.Client):
         return message.guild is None and self.settings.respond_to_dms
 
     # --- handling ----------------------------------------------------------------
-    async def _handle(self, message: discord.Message) -> None:
+    def _note_forward(self, message: discord.Message) -> discord.Message | None:
+        """The forward this message comments on, if any.
+
+        Discord sends "forward with a message" as two messages: the forward, then the comment. So the
+        latest forward of each person in each channel is kept until they post their next message there,
+        which gets it if it comes within FORWARD_WINDOW. A forward on its own (e.g. in a DM) is its own."""
+        if message.author.bot:
+            return None
+        key = (message.channel.id, message.author.id)
+        previous = self._forwards.pop(key, None)
+        if message.message_snapshots:
+            cutoff = message.created_at - FORWARD_WINDOW
+            for stale in [k for k, m in self._forwards.items() if m.created_at < cutoff]:
+                del self._forwards[stale]
+            self._forwards[key] = message
+            return message
+        if previous is not None and message.created_at - previous.created_at <= FORWARD_WINDOW:
+            return previous
+        return None
+
+    async def _handle(self, message: discord.Message, forward: discord.Message | None = None) -> None:
         text = sanitize_user_text(self._render(message), self.settings.max_input_chars)
         key = str(message.channel.id)
 
@@ -343,7 +380,11 @@ class EmiliaBot(discord.Client):
         if command.lower() == ABOUT_COMMAND:
             await self._about(message, argument)
             return
-        if not text:  # a bare @mention
+        if forward is message:  # a forward on its own: if a comment on it follows, that one is answered instead
+            await asyncio.sleep(FORWARD_COMMENT_WAIT)
+            if self._forwards.get((message.channel.id, message.author.id)) is not message:
+                return
+        elif not text:  # a bare @mention
             await self._send(message, prompts.GREETING)
             return
 
@@ -354,7 +395,8 @@ class EmiliaBot(discord.Client):
         self._busy.add(user_id)
         try:
             quoted_body, quoted_author = await self._quoted_context(message)
-            await self._respond(message, key, text, quoted_body, quoted_author)
+            forwarded = await self._forwarded_context(forward)
+            await self._respond(message, key, text, quoted_body, quoted_author, forwarded)
         finally:
             self._busy.discard(user_id)
 
@@ -365,6 +407,7 @@ class EmiliaBot(discord.Client):
         text: str,
         quoted_body: str,
         quoted_author: discord.abc.User | None,
+        forwarded: Forwarded | None = None,
     ) -> None:
         """Generate and post messages; a tool-assisted reply can continue in further turns."""
         people = self._people(message, quoted_author)
@@ -380,7 +423,12 @@ class EmiliaBot(discord.Client):
                 quote = ""
                 if quoted_body and quoted_author is not None:
                     quote = f'(replying to {labels[str(quoted_author.id)]}: "{quoted_body}") '
-                user_text = quote + text
+                if forwarded is not None:  # its author is only named: they may not even be in this server
+                    by = "someone"
+                    if forwarded.author is not None:
+                        by = labels.get(str(forwarded.author.id)) or prompts.safe_name(forwarded.author.display_name)
+                    quote += f'(forwarded a message from {by}{forwarded.origin}: "{forwarded.body}") '
+                user_text = (quote + text).strip()
 
                 shown = history
                 if self.settings.forget_standing_instructions:
@@ -397,8 +445,9 @@ class EmiliaBot(discord.Client):
                     yandere=self.settings.yandere_mode,
                     fetch_pages=self.settings.fetch_pages,
                 )
-                if self.settings.fetch_pages:  # links the sender wrote (or replied to) may be opened this turn
-                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body))
+                if self.settings.fetch_pages:  # links the sender wrote (or replied to, or forwarded) may be opened this turn
+                    forwarded_body = forwarded.body if forwarded is not None else ""
+                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body))
                 messages = prompts.build_messages(
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )
@@ -742,12 +791,52 @@ class EmiliaBot(discord.Client):
             text = text.replace(f"<#{channel.id}>", f"#{channel.name}")
         return re.sub(r"<a?:(\w+):\d+>", r":\1:", text)  # custom emoji -> :name:
 
+    def _render_snapshot(self, snapshot: discord.MessageSnapshot) -> str:
+        """Like _render, for a forwarded copy: it only has the IDs of whom it mentions, so look up whoever we know.
+        Our own mention stays: it is part of what someone else wrote, not someone addressing us now."""
+        text = snapshot.content
+        for user_id in snapshot.raw_mentions:
+            user = self.user if self.user is not None and user_id == self.user.id else self.get_user(user_id)
+            label = f"@{user.display_name if user else 'someone'}"
+            text = text.replace(f"<@{user_id}>", label).replace(f"<@!{user_id}>", label)
+        for channel_id in snapshot.raw_channel_mentions:
+            channel = self.get_channel(channel_id)
+            text = text.replace(f"<#{channel_id}>", f"#{getattr(channel, 'name', None) or 'channel'}")
+        text = re.sub(r"<@&\d+>", "@role", text)
+        return re.sub(r"<a?:(\w+):\d+>", r":\1:", text)
+
+    async def _forwarded_context(self, forward: discord.Message | None) -> Forwarded | None:
+        """What a forwarded message said, and who wrote it where and when, as far as we can see. Discord's
+        copy leaves out the author, so the original is looked up; that fails if we can't see its channel."""
+        if forward is None or not forward.message_snapshots:
+            return None
+        snapshot = forward.message_snapshots[0]
+        body = sanitize_user_text(self._render_snapshot(snapshot), FORWARD_CHARS).replace('"', "'")
+        if not body:
+            return None
+        ref = forward.reference
+        channel = self.get_channel(ref.channel_id) if ref is not None else None
+        original = snapshot.cached_message
+        if original is None and ref is not None and ref.message_id is not None and hasattr(channel, "fetch_message"):
+            try:
+                original = await channel.fetch_message(ref.message_id)
+            except discord.HTTPException as exc:
+                log.info("Could not look up the original of forwarded message %s (%s)", forward.id, exc)
+        origin = ""
+        name = getattr(channel, "name", None)
+        if name and ref.channel_id != forward.channel.id:
+            origin += f" in #{prompts.safe_name(name, default='channel')}"
+        if snapshot.created_at:
+            origin += f" on {snapshot.created_at:%Y-%m-%d} at {snapshot.created_at:%H:%M} UTC"
+        return Forwarded(body, original.author if original is not None else None, origin)
+
     async def _quoted_context(self, message: discord.Message) -> tuple[str, discord.abc.User | None]:
         """If this is a reply to someone else's message, what it said and who said it, so that
-        '@Emilia is this true?' makes sense. Our own earlier messages are already in memory."""
+        '@Emilia is this true?' makes sense. Our own earlier messages are already in memory. If the
+        message replied to is a forward, what it forwarded is shown."""
         ref = message.reference
-        if ref is None or ref.message_id is None:
-            return "", None
+        if ref is None or ref.message_id is None or getattr(ref, "type", None) == discord.MessageReferenceType.forward:
+            return "", None  # forwards are handled by _forwarded_context
         quoted = ref.resolved
         if quoted is None:
             try:
@@ -758,7 +847,9 @@ class EmiliaBot(discord.Client):
             return "", None
         if self.user is not None and quoted.author.id == self.user.id:
             return "", None
-        body = sanitize_user_text(self._render(quoted), 300).replace('"', "'")
+        snapshots = getattr(quoted, "message_snapshots", None)
+        rendered = self._render_snapshot(snapshots[0]) if not quoted.content and snapshots else self._render(quoted)
+        body = sanitize_user_text(rendered, QUOTE_CHARS).replace('"', "'")
         if not body:
             return "", None
         return body, quoted.author
