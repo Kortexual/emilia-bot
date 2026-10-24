@@ -1,0 +1,3 @@
+# Gitignored files copied from the main checkout into each new Claude Code worktree.
+# venv/ is symlinked instead (see .claude/settings.json); memory.db is left out on purpose.
+.env
