@@ -252,8 +252,12 @@ class LMStudioClient:
         on_text: TextHandler | None = None,
         on_tool: ToolHandler | None = None,
         on_tool_done: ToolHandler | None = None,
+        *,
+        tools: bool = True,
     ) -> ChatResult:
         """Run a conversation to completion, executing any tool calls the model makes on the way.
+        With `tools=False` the model is offered none, however many are configured (used for the messages
+        she starts herself, where nobody has asked for anything to be searched, read or run).
 
         As it goes, whatever the model writes before its last message is handed to `on_text`, and every
         tool call to `on_tool` just before the tool runs (and to `on_tool_done` after, with its sources),
@@ -270,7 +274,7 @@ class LMStudioClient:
         said: list[str] = []  # what the model wrote so far in this reply, to catch it repeating itself
         previous_calls: list[str] = []  # the last round's tool calls, to catch it repeating them
         repeated_rounds = 0
-        tools_enabled = bool(self._tools)
+        tools_enabled = bool(self._tools) and tools
         limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
         for round_no in range(limit):
