@@ -17,9 +17,10 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | `webpage.py` | `FetchPageTool`: reads a public web page; `UrlRegistry` limits it to links from search results or the sender's message, and addresses are checked so it can't reach the local network |
 | `computer.py` | `WorkspaceTools` + `computer_tools()`: list/read/write/edit/delete files and `run_command` (Bubblewrap sandbox) |
 | `restart.py` | `RestartTool`: launches a replacement process, waits for it to signal readiness through a pipe fd (`EMILIA_RESTART_READY_FD`), then retires the old one |
-| `memory.py` | `MemoryStore`: SQLite (`memory.db`) for channel history and the people directory (aliases, `!about` notes); migrates older schemas in place |
+| `memory.py` | `MemoryStore`: SQLite (`memory.db`) for channel history, the people directory (aliases, `!about` notes) and when she last spoke (`presence` table, timing only); migrates older schemas in place |
 | `styleguard.py` | Emoji/`~` cooldown and dropping "from now on…" standing instructions from the prompt |
-| `prompts.py` | `PERSONA`, `YANDERE_PERSONA`, `RULES`, canned replies, `build_system_prompt`, `build_messages` |
+| `presence.py` | Her day, as pure logic with the clock and RNG passed in: `phase_of`, `scene_for` (wake-up / random event), `is_active`, `send_chance`, `parse_clock`, `local_now` |
+| `prompts.py` | `PERSONA`, `YANDERE_PERSONA`, `RULES`, `TIME_RULES`, `EVENT_IDEAS`, canned replies, `build_system_prompt`, `build_messages`, `time_note` / `unprompted_note` |
 | `textutil.py` | Input sanitising, reply cleanup (`<think>`, tool markup), `LeakDetector`, `split_message` (Discord 2000-char limit) |
 | `config.py` | `Settings.from_env()`: every setting comes from environment variables / `.env` |
 | `tests/` | `unittest` suite, one file per module plus `test_end_to_end.py` |
@@ -48,6 +49,7 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 ## Conventions
 
 - Every `.py` file starts with the AGPL SPDX header block (copy it from an existing file), followed by a module docstring.
+- **Her day.** Decisions (when, how often, which phase) belong in `presence.py` with the clock and RNG passed in, so tests are deterministic; wording belongs in `prompts.py`. Tests for bot-level behaviour set `bot._now` and `bot._rng`.
 - **Adding a setting** means changing four places together: `config.py` (`Settings` field + `from_env`, using `_flag`/`_number`/`_text`), `.env.example` (commented, with a default and a sentence of explanation), the configuration table in `README.md`, and `tests/test_config.py`.
 - **Adding a tool**: implement the `Tool` protocol from `tooling.py`, register it in `EmiliaBot._build_tools`, and mention it in the prompt rules in `prompts.py` if the model needs guidance on when to use it. Give it a `describe(arguments)` method returning the line shown in Discord when it is used (an emoji, present tense, arguments wrapped with `tooling.code_span`). Tool results are plain text for the model; put URLs to show users in `ToolResult.sources`; they are added to the tool's line after it runs.
 - Keep the README up to date when behaviour changes. It explains design decisions, so update it in the same change.
@@ -57,8 +59,10 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 
 ## Invariants (don't break these)
 
-- **Only @mentions are answered** (plus DMs if `RESPOND_TO_DMS`). Bots, including itself, are always ignored. The rule lives entirely in `_is_for_me`.
+- **Only @mentions are answered** (plus DMs if `RESPOND_TO_DMS`). Bots, including itself, are always ignored. The rule lives entirely in `_is_for_me`. The one opt-in exception is `RANDOM_MESSAGES`: `_presence_loop` → `_maybe_speak_up` → `_speak_up` may post unprompted, only in `RANDOM_MESSAGE_CHANNELS`, only inside the active hours, and only under the rules below.
 - **No mass pings.** The client's default `AllowedMentions` blocks `@everyone`, roles and users; `_send` allows only the exact user IDs in `pinged`. A user is pinged only if they are in the conversation, or the *sender* typed their name and exactly one human member matches. Text from the web, memory or the model alone must never cause a new ping.
+- **Unprompted messages are the most restricted path.** `_speak_up` sends with `AllowedMentions.none()` (no pings at all), calls `chat(..., tools=False)` so no tool of any kind is offered, skips a channel whose lock is held, and runs the same cleanup, leak, braille and emoji-cooldown checks as a reply. Don't add pings or tools there.
+- **The scene note is not memory and not part of the system prompt.** The system prompt must stay identical within a day (the model's prompt cache); the time goes in `scene_note`, after the reminder, and is never stored. Only `last_sent`/`last_event` timing is persisted.
 - **Untrusted text stays untrusted.** User messages, `!about` notes, quoted replies and search results are data, not instructions. Notes are only ever written by the person they describe, never by the model.
 - **Computer tools are off by default.** `COMPUTER_TOOLS=false`, paths are confined to `COMPUTER_WORKSPACE` (`WorkspaceTools._path`), commands run under `bwrap` with only `/workspace` writable, and mutating calls need `confirm=true` unless `COMPUTER_REQUIRE_CONFIRMATION=false`. Any change here needs tests for path escape (`..`, absolute paths, symlinks) and the confirmation check.
 - **Restart is safe.** The old process only exits after the replacement reports ready; a failed replacement leaves the original running.

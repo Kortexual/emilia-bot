@@ -3,7 +3,7 @@
 A Discord bot that chats through a local model running in [LM Studio](https://lmstudio.ai/).
 Everything stays on your machine, apart from the web searches the model chooses to make.
 
-- **Only answers @mentions.** Every other message (and every other bot) is ignored.
+- **Only answers @mentions.** Every other message (and every other bot) is ignored. (The one opt-in exception: she can speak up on her own in channels you list, during hours you choose; see "Her day".)
 - **Remembers the conversation**, per channel, even across restarts.
 - **Searches the web when it's unsure**: the model decides when, using LM Studio's tool calling.
 - **Can work on a local workspace** when explicitly enabled: read, write, edit and delete files, and run shell commands.
@@ -193,6 +193,39 @@ limits that without looking for specific tricks:
 
 Verbal habits (a pet phrase, a sign-off sentence) are not removed automatically; the prompt asks the model not to repeat itself.
 
+### Her day: time awareness and speaking up
+Two opt-in features give Emilia a sense of the day, a bit like a Stardew Valley or Harvest Moon villager, except that the lines are
+written fresh by the model each time. The logic is in `presence.py` (pure, so it is easy to test) and the wording in `prompts.py`.
+
+**Time awareness** (`TIME_AWARENESS=true`). Every reply gets a short system note under the message with the time where she is
+(`TIMEZONE`, or this computer's own time), so she can react to it without being scripted:
+
+- **Waking up.** Her first message of a local day, if it falls between 05:00 and 09:59, comes with "you have only just woken up":
+  a yawn or stretch and a good morning, worded however the model likes. It is once per day for the whole server, not per channel.
+- **Sleepy.** From 22:00 she is a little sleepy; from midnight to 05:00 she is drowsy and a bit surprised anyone is up.
+- **Random events.** Otherwise there is a 30% chance that whoever is talking to her has just come across her in the middle of
+  something. The model is given three random ideas from a list for that part of the day (lunch, exercise, a book, waking from a nap...)
+  as examples only and invents a new small scene. After one, there is a cooldown (`RANDOM_EVENT_COOLDOWN_MINUTES`, default 120;
+  `0` turns events off). Change the ideas in `EVENT_IDEAS` in `prompts.py`.
+
+The system prompt stays the same all day (only the date changes), so the note goes at the end of the newest message, after the
+reminder, and is never stored in memory. A reply that fails does not use up a wake-up or an event.
+
+**Speaking up on her own** (`RANDOM_MESSAGES=true`, with `RANDOM_MESSAGE_CHANNELS`). Every 5 minutes, inside `ACTIVE_START` to
+`ACTIVE_END` (the window may run past midnight), each listed channel gets a chance of a message from her. The chance is zero until
+`RANDOM_MESSAGE_MIN_MINUTES` after her last message there (answers count), then rises with the square of how far along she is towards
+`RANDOM_MESSAGE_FULL_HOURS`, where it levels off at 25% per check. With the defaults (60 minutes, 8 hours) a gap is typically about
+4 hours (80% fall between roughly 3 and 6) and rarely more than 8. The wait keeps counting while she is "asleep", so after a quiet night
+she is likely to speak up soon after her active hours begin, and at that time of day it is the wake-up message. Each message comes
+with something she is doing, so she has something to say.
+
+Messages she starts herself are held to stricter rules than answers: they never ping anyone (not even someone named in the conversation),
+the model gets no tools (no search, page reading, files, commands or restart), she skips a channel while she is busy answering in it,
+and the usual checks (cleanup, system-prompt leak, braille, emoji cooldown) apply. They are stored in memory as an exchange with a
+placeholder where the question would be, so the conversation still alternates and a reply to her has context. The time she last
+spoke is kept in `memory.db` (timing only), so a restart does not reset her wait. Until she has spoken in a channel, the wait counts
+from when the bot started.
+
 ## Configuration
 
 All settings are environment variables (or lines in `.env`).
@@ -223,6 +256,14 @@ All settings are environment variables (or lines in `.env`).
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
+| `TIME_AWARENESS` | `false` | Tell her the time of day: wake-up on the first morning message, sleepy at night, random events (see "Her day") |
+| `TIMEZONE` | empty (this computer's time) | Her time zone, e.g. `America/New_York` (needs `tzdata` on Windows, included in `requirements.txt`) |
+| `RANDOM_EVENT_COOLDOWN_MINUTES` | `120` | Least time between random events (`0` = none) |
+| `RANDOM_MESSAGES` | `false` | Let her speak up on her own in `RANDOM_MESSAGE_CHANNELS` during her active hours |
+| `RANDOM_MESSAGE_CHANNELS` | empty | Channel IDs, separated by commas; required with `RANDOM_MESSAGES` |
+| `ACTIVE_START`, `ACTIVE_END` | `08:00`, `22:00` | When she may speak up (`22:00` or `10:00PM`; may run past midnight; must differ) |
+| `RANDOM_MESSAGE_MIN_MINUTES` | `60` | Never speaks up sooner than this after her last message in that channel |
+| `RANDOM_MESSAGE_FULL_HOURS` | `8` | The wait after which speaking up is as likely as it gets (must be longer than the minimum) |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |
 | `MEMORY_MAX_CHARS` | `6000` | Cap on remembered text sent per request |
@@ -261,6 +302,7 @@ computer.py   the opt-in workspace file and terminal tools
 restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory
 styleguard.py cooldown for emoji tics, expiry of standing instructions
+presence.py  her day: time of day, wake-up and random events, active hours, how likely she is to speak up
 prompts.py    persona, rules and canned replies
 textutil.py   input sanitising, reply cleanup, message splitting
 config.py     settings from .env
@@ -282,6 +324,10 @@ tests/        run with:  python -m unittest
 - **It never searches, or posts odd JSON**: the model probably handles tools poorly. Try one with the hammer badge.
   The log line `Model called web_search(...)` shows each time it does search.
 - **Slow replies**: reasoning models think before answering, and each search adds another generation.
+- **She never speaks up on her own**: she needs `RANDOM_MESSAGES=true`, the channel's ID in `RANDOM_MESSAGE_CHANNELS` (Discord: turn on
+  Developer Mode, right-click the channel, Copy Channel ID), permission to send there, and the current time inside `ACTIVE_START` to
+  `ACTIVE_END` (in `TIMEZONE`). Right after a start she waits at least `RANDOM_MESSAGE_MIN_MINUTES`. The log says when the feature is on.
+- **"TIMEZONE must be a time zone name" on Windows**: run `pip install tzdata` (or `pip install -r requirements.txt` again).
 
 ## What changed from the first version
 
