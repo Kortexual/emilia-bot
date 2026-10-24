@@ -38,8 +38,10 @@ from typing import Any, Protocol
 
 import discord
 
+import browser
 import prompts
 import styleguard
+from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import computer_tools
 from restart import RestartTool
@@ -219,7 +221,8 @@ class EmiliaBot(discord.Client):
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True),
         )
         self.settings = settings
-        self.urls = UrlRegistry()  # links the model may open with fetch_page: search results and the sender's links
+        self.urls = UrlRegistry()  # links the model may open with fetch_page/browser_open: search results and the sender's links
+        self.browser = BrowserSessions()  # Chromium starts only when a browser tool is first used
         self.memory = memory or MemoryStore(settings.memory_db, settings.memory_turns)
         self.llm: ChatBackend = llm or LMStudioClient(
             base_url=settings.lmstudio_url,
@@ -266,6 +269,21 @@ class EmiliaBot(discord.Client):
                 log.warning("WEB_SEARCH is on but the 'ddgs' package is missing (pip install ddgs): web search disabled.")
         if self.settings.fetch_pages:
             tools.append(FetchPageTool(self.urls, max_chars=self.settings.page_max_chars))
+        if self.settings.browser_tools:
+            if playwright_installed():
+                tools.extend(
+                    browser_tools(
+                        self.browser,
+                        self.urls,
+                        max_chars=self.settings.page_max_chars,
+                        require_confirmation=self.settings.browser_require_confirmation,
+                    )
+                )
+            else:
+                log.warning(
+                    "BROWSER_TOOLS is on but Playwright is missing (pip install playwright && playwright install chromium): "
+                    "browser tools disabled."
+                )
         return tools
 
     # --- lifecycle -------------------------------------------------------------
@@ -302,6 +320,7 @@ class EmiliaBot(discord.Client):
         self._retire_task = asyncio.create_task(retire())  # keep a reference so it isn't garbage-collected
 
     async def close(self) -> None:
+        await self.browser.close()
         await self.llm.close()
         self.memory.close()
         await super().close()
@@ -396,9 +415,11 @@ class EmiliaBot(discord.Client):
                     multi_turn=self.settings.multi_turn_tools,
                     yandere=self.settings.yandere_mode,
                     fetch_pages=self.settings.fetch_pages,
+                    browser_tools=self.settings.browser_tools,
                 )
-                if self.settings.fetch_pages:  # links the sender wrote (or replied to) may be opened this turn
+                if self.settings.fetch_pages or self.settings.browser_tools:  # links the sender wrote (or replied to) may be opened
                     self.urls.allow(extract_urls(text) + extract_urls(quoted_body))
+                browser.SESSION_KEY.set(key)  # each channel browses in its own browser context
                 messages = prompts.build_messages(
                     system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
                 )
