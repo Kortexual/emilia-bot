@@ -44,6 +44,7 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 - Tests use plain `unittest` (`IsolatedAsyncioTestCase` for async), with fake Discord objects (`SimpleNamespace`, `mock`) and fake LLM backends. `test_end_to_end.py` reuses helpers from `test_bot` and `test_llm`. Never add tests that hit the network, Discord or LM Studio.
 - There is no linter, formatter or type checker configured. Follow the existing style: type hints, `from __future__ import annotations`, docstrings on modules and public classes, lines up to about 130 characters.
 - `run_command` tests need `bwrap` installed to exercise the sandbox path.
+- CI (`.github/workflows/tests.yml`) runs `python -m unittest` on Python 3.10–3.14 for pushes to `main` and every pull request, with `bwrap` installed.
 
 ## Conventions
 
