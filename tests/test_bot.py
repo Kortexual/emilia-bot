@@ -140,6 +140,11 @@ def person(display="Alice", user_id=1, username=None, global_name=None):
     return user
 
 
+def http_error(status=404):
+    """An error like the ones discord.py raises when a request fails (its constructor needs a response)."""
+    return discord.HTTPException(SimpleNamespace(status=status, reason="Not Found"), "Unknown Member")
+
+
 class FakeGuild:
     """A server with some members Discord has already told us about and some only its search finds."""
 
@@ -157,7 +162,7 @@ class FakeGuild:
         for member in self.fetchable:
             if member.id == user_id:
                 return member
-        raise discord.HTTPException()
+        raise http_error()
 
     async def search_members(self, query, limit=1):
         self.searches.append(query)
@@ -873,7 +878,7 @@ class PingByNameTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey @Jack!"])
 
     async def test_a_failed_search_still_delivers_the_reply(self):
-        guild = FakeGuild(searchable=[person("Jack", 77)], error=discord.HTTPException())
+        guild = FakeGuild(searchable=[person("Jack", 77)], error=http_error(500))
         message = await self.ask("ping Jack", "Hey @Jack!", guild)
         self.assertEqual(message.replies, ["Hey @Jack!"])
 
