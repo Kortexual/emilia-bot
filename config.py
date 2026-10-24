@@ -87,6 +87,8 @@ class Settings:
 
     # Behaviour
     respond_to_dms: bool = False  # False = strictly @mentions only
+    respond_to_bots: bool = False  # opt-in: other bots' @mentions are answered too (never her own messages)
+    bot_reply_limit: int = 3  # replies in a row to bots in one channel before a human must speak; 0 = no limit
     web_search: bool = True
     search_results: int = 4
     fetch_pages: bool = True  # let the model read whole pages (links from search results or the sender's message)
@@ -147,6 +149,8 @@ class Settings:
             request_timeout=_number("LMSTUDIO_TIMEOUT", cls.request_timeout, float, minimum=1),
             max_concurrent_requests=_number("MAX_CONCURRENT_REQUESTS", 1, int, minimum=1),
             respond_to_dms=_flag("RESPOND_TO_DMS", cls.respond_to_dms),
+            respond_to_bots=_flag("RESPOND_TO_BOTS", cls.respond_to_bots),
+            bot_reply_limit=_number("BOT_REPLY_LIMIT", cls.bot_reply_limit, int, minimum=0),
             web_search=_flag("WEB_SEARCH", cls.web_search),
             search_results=_number("SEARCH_RESULTS", cls.search_results, int, minimum=1),
             fetch_pages=_flag("FETCH_PAGES", cls.fetch_pages),

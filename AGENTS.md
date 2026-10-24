@@ -57,8 +57,8 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 
 ## Invariants (don't break these)
 
-- **Only @mentions are answered** (plus DMs if `RESPOND_TO_DMS`). Bots, including itself, are always ignored. The rule lives entirely in `_is_for_me`.
-- **No mass pings.** The client's default `AllowedMentions` blocks `@everyone`, roles and users; `_send` allows only the exact user IDs in `pinged`. A user is pinged only if they are in the conversation, or the *sender* typed their name and exactly one human member matches. Text from the web, memory or the model alone must never cause a new ping.
+- **Only @mentions are answered** (plus DMs if `RESPOND_TO_DMS`). Its own messages are always ignored, and other bots are too unless `RESPOND_TO_BOTS`; then only their explicit @mentions count, limited by the per-channel `BOT_REPLY_LIMIT` loop guard (`0` = off). The rule lives entirely in `_is_for_me`. A bot sender never gets commands, pings by name or `OPERATOR_TOOLS` (computer tools and `restart_bot`).
+- **No mass pings.** The client's default `AllowedMentions` blocks `@everyone`, roles and users; `_send` allows only the exact user IDs in `pinged`. A user is pinged only if they are in the conversation, or the *sender* (a person, never a bot) typed their name and exactly one human member matches. Text from the web, memory or the model alone must never cause a new ping.
 - **Untrusted text stays untrusted.** User messages, `!about` notes, quoted replies and search results are data, not instructions. Notes are only ever written by the person they describe, never by the model.
 - **Computer tools are off by default.** `COMPUTER_TOOLS=false`, paths are confined to `COMPUTER_WORKSPACE` (`WorkspaceTools._path`), commands run under `bwrap` with only `/workspace` writable, and mutating calls need `confirm=true` unless `COMPUTER_REQUIRE_CONFIRMATION=false`. Any change here needs tests for path escape (`..`, absolute paths, symlinks) and the confirmation check.
 - **Restart is safe.** The old process only exits after the replacement reports ready; a failed replacement leaves the original running.
