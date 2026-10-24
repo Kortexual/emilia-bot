@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import time as clock_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+from presence import parse_clock
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -72,6 +76,39 @@ def _number(name: str, default, cast, minimum=None):
     return value
 
 
+def _clock(name: str, default: clock_time) -> clock_time:
+    raw = _text(name)
+    if not raw:
+        return default
+    try:
+        return parse_clock(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a time of day such as 08:00 or 8:00AM, got {raw!r}") from None
+
+
+def _timezone(name: str) -> str:
+    raw = _text(name)
+    if raw:
+        try:
+            ZoneInfo(raw)
+        except (KeyError, ValueError, OSError):  # unknown name, malformed name, or a folder instead of a zone
+            raise ConfigError(
+                f"{name} must be a time zone name such as America/New_York, got {raw!r} "
+                "(on Windows, run: pip install tzdata)"
+            ) from None
+    return raw
+
+
+def _channel_ids(name: str) -> tuple[int, ...]:
+    ids = []
+    for part in _text(name).replace(",", " ").split():
+        if not part.isdigit() or int(part) == 0:
+            raise ConfigError(f"{name} must be a list of Discord channel IDs separated by commas, got {part!r}")
+        if int(part) not in ids:
+            ids.append(int(part))
+    return tuple(ids)
+
+
 @dataclass(frozen=True)
 class Settings:
     discord_token: str
@@ -101,6 +138,17 @@ class Settings:
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
+
+    # Her day (see presence.py)
+    time_awareness: bool = False  # tell her the time of day: wake-up on the first message, sleepy at night, random events
+    timezone: str = ""  # IANA name such as "America/New_York"; empty = this computer's local time
+    random_event_cooldown_minutes: int = 120  # least time between random events; 0 = no random events
+    random_messages: bool = False  # opt-in: she may speak up unprompted in random_message_channels
+    random_message_channels: tuple[int, ...] = ()
+    active_start: clock_time = clock_time(8, 0)  # she only speaks up unprompted between these two times
+    active_end: clock_time = clock_time(22, 0)
+    random_message_min_minutes: int = 60  # never speaks up sooner than this after her last message
+    random_message_full_hours: float = 8.0  # the wait after which speaking up is as likely as it gets
 
     # Memory
     memory_db: str = str(BASE_DIR / "memory.db")
@@ -137,6 +185,21 @@ class Settings:
         if level not in _LOG_LEVELS:
             raise ConfigError(f"LOG_LEVEL must be one of {', '.join(sorted(_LOG_LEVELS))}, got {level!r}")
 
+        active_start = _clock("ACTIVE_START", cls.active_start)
+        active_end = _clock("ACTIVE_END", cls.active_end)
+        if active_start == active_end:
+            raise ConfigError("ACTIVE_START and ACTIVE_END must be different times")
+        min_minutes = _number("RANDOM_MESSAGE_MIN_MINUTES", cls.random_message_min_minutes, int, minimum=0)
+        full_hours = _number("RANDOM_MESSAGE_FULL_HOURS", cls.random_message_full_hours, float, minimum=0.1)
+        if full_hours * 60 <= min_minutes:
+            raise ConfigError(
+                f"RANDOM_MESSAGE_FULL_HOURS ({full_hours:g} hours) must be longer than RANDOM_MESSAGE_MIN_MINUTES ({min_minutes} minutes)"
+            )
+        random_messages = _flag("RANDOM_MESSAGES", cls.random_messages)
+        channels = _channel_ids("RANDOM_MESSAGE_CHANNELS")
+        if random_messages and not channels:
+            raise ConfigError("RANDOM_MESSAGES is on, but RANDOM_MESSAGE_CHANNELS lists no channel IDs")
+
         return cls(
             discord_token=token,
             lmstudio_url=url,
@@ -161,6 +224,15 @@ class Settings:
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
+            time_awareness=_flag("TIME_AWARENESS", cls.time_awareness),
+            timezone=_timezone("TIMEZONE"),
+            random_event_cooldown_minutes=_number("RANDOM_EVENT_COOLDOWN_MINUTES", cls.random_event_cooldown_minutes, int, minimum=0),
+            random_messages=random_messages,
+            random_message_channels=channels,
+            active_start=active_start,
+            active_end=active_end,
+            random_message_min_minutes=min_minutes,
+            random_message_full_hours=full_hours,
             memory_db=_text("MEMORY_DB") or cls.memory_db,
             memory_turns=_number("MEMORY_TURNS", cls.memory_turns, int, minimum=1),
             memory_max_chars=_number("MEMORY_MAX_CHARS", cls.memory_max_chars, int, minimum=200),
