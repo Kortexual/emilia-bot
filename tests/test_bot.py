@@ -1235,7 +1235,7 @@ class ToolDisplayTests(BotTestCase):
         self.addCleanup(bot.memory.close)
         self.assertTrue(bot.llm._multi_turn)
         self.assertEqual(bot.llm._max_turns, 5)
-        self.assertNotIn("do_nothing", bot.llm._tools)  # a control the client offers itself, not a tool
+        self.assertNotIn("stop_talking", bot.llm._tools)  # a control the client offers itself, not a tool
 
         fake = self.make_bot(multi_turn_tools=True, computer_tools=True)
         await fake.on_message(self.msg(self.mention("hi")))

@@ -97,7 +97,7 @@ class Settings:
     command_timeout: float = 30.0
     computer_allow_host_access: bool = False  # opt-in: paths are not limited to computer_workspace
     computer_require_confirmation: bool = True  # each mutating call must contain confirm=true
-    multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls do_nothing
+    multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA

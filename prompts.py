@@ -176,8 +176,8 @@ MULTI_TURN_RULES = (
     "step by step. Each time you are prompted, keep going if there is more to do.\n"
     "- Anything you write is posted in the chat straight away, and so is a short note for every tool "
     "you use. Short progress notes are fine; don't repeat yourself.\n"
-    "- When the task is done and you have said what you wanted to say, call do_nothing to end your turn. "
-    "Never post the same message twice."
+    "- Once you have answered and there is no more tool work to do, call stop_talking. It ends your turn: "
+    "enough has been said, and you never need to say it again. Never post the same message twice."
 )
 
 # Built once from the static text. Used to catch replies that dump the prompt word for word.

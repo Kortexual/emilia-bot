@@ -118,12 +118,14 @@ Memory keeps everything the model said for one request as one reply; the tool li
 
 - **`MULTI_TURN_TOOLS=false` (default).** The model can write a message and call tools, gets the results, and then has to answer:
   at most two rounds of tools per message.
-- **`MULTI_TURN_TOOLS=true`.** A tool call starts a longer turn. After every step (tools, or just text) the model is prompted
-  again and can keep working and talking, until it calls `do_nothing` or reaches `MAX_TOOL_TURNS` generations. Many models
-  answer that prompt by saying their last message again instead of calling `do_nothing`, so a reply that is empty or repeats
-  something already said in this reply also ends the turn, and is not posted. `do_nothing`
-  is only offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still
-  a single generation. Each step is a full generation, so long tasks on big models take a while.
+- **`MULTI_TURN_TOOLS=true`.** A tool call starts a longer turn. After every step the model is prompted again and can keep
+  working and talking, until it calls `stop_talking` or reaches `MAX_TOOL_TURNS` generations. While it is working, every request
+  sends `tool_choice: "required"`, so it must either use another tool or call `stop_talking` (whatever it writes alongside that
+  call is its last message); it can't keep answering with plain text, which models tend to do by repeating themselves. If LM Studio
+  rejects `tool_choice`, the bot stops sending it, and then a reply that is empty or repeats something already said in this reply
+  ends the turn without being posted. `stop_talking` is only offered once it has started working, so it can't use it to skip
+  answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
+  models take a while.
 
 ### Reading pages
 Search snippets are short. With `FETCH_PAGES=true` (the default) the model also has a `fetch_page` tool that opens a web page and returns
@@ -215,7 +217,7 @@ All settings are environment variables (or lines in `.env`).
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
 | `COMPUTER_ALLOW_HOST_ACCESS` | `false` | Allow paths and command working directories outside `COMPUTER_WORKSPACE`. This grants the model the OS account's file access. |
 | `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
-| `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `do_nothing` (see "Tool use" below) |
+| `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |

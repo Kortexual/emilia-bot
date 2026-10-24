@@ -11,7 +11,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | File | Role |
 |---|---|
 | `bot.py` | `EmiliaBot(discord.Client)`: the mention rule (`_is_for_me`), handling a message (`_handle` → `_respond`), `!forget`/`!about`/`!forgetme`, member lookup and pings (`link_mentions`, `_lookup_members`), restart handoff, `main()` |
-| `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `do_nothing` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
+| `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `stop_talking` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
 | `tooling.py` | The `Tool` protocol (`name`, `schema`, `async run(arguments) -> ToolResult`), `ToolResult` |
 | `websearch.py` | `WebSearchTool` over `ddgs`; swap the engine by replacing `search_sync()` only |
 | `webpage.py` | `FetchPageTool`: reads a public web page; `UrlRegistry` limits it to links from search results or the sender's message, and addresses are checked so it can't reach the local network |
@@ -24,7 +24,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | `config.py` | `Settings.from_env()`: every setting comes from environment variables / `.env` |
 | `tests/` | `unittest` suite, one file per module plus `test_end_to_end.py` |
 
-Tools are assembled in `EmiliaBot._build_tools`. `do_nothing` is not a tool there: `LMStudioClient` offers it itself, only in multi-turn mode and only once the model has started working.
+Tools are assembled in `EmiliaBot._build_tools`. `stop_talking` is not a tool there: `LMStudioClient` offers it itself, only in multi-turn mode and only once the model has started working.
 
 ### How a reply flows
 
