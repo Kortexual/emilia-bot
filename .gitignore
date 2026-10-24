@@ -1,8 +1,9 @@
 # Python
 __pycache__/
 *.pyc
-venv/
-.venv/
+# No trailing slash, so the venv symlinks in worktrees are ignored too
+venv
+.venv
 
 # Secrets and local data
 .env
@@ -10,3 +11,7 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+
+# Claude Code
+.claude/worktrees/
+.claude/settings.local.json

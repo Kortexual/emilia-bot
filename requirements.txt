@@ -3,3 +3,4 @@ aiohttp>=3.9           # async HTTP for talking to LM Studio (already installed 
 python-dotenv>=1.0     # loads .env
 ddgs>=9.0              # web search; the old "duckduckgo_search" package was renamed to this
 tzdata>=2024.1; sys_platform == "win32"   # time zone names (TIMEZONE=...) on Windows, which has none of its own
+# playwright>=1.40     # optional, only for BROWSER_TOOLS=true; then also run: playwright install chromium
