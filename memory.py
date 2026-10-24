@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS user_aliases (
     last_seen REAL NOT NULL,
     PRIMARY KEY (user_id, alias_key)
 );
+
+-- When the bot last spoke in each channel (Unix time), and when it last had a "scene" (a wake-up or a
+-- random event, see presence.py). Timing only: no message text is kept here.
+CREATE TABLE IF NOT EXISTS presence (
+    channel_id TEXT PRIMARY KEY,
+    last_sent  REAL,
+    last_event REAL
+);
 """
 
 MAX_ALIASES_PER_USER = 12  # the newest names are kept; Discord names change, old ones go stale
@@ -73,6 +81,15 @@ class StoredMessage:
     author: str  # speaker's display name (user messages only)
     author_id: str  # speaker's Discord user ID (user messages only), so people can be told apart and pinged
     content: str
+
+
+@dataclass(frozen=True)
+class Presence:
+    """When the bot last spoke (Unix time; None = never): in one channel, and anywhere. Also the last scene."""
+
+    sent_here: float | None
+    sent_anywhere: float | None
+    event_anywhere: float | None
 
 
 class MemoryStore:
@@ -150,6 +167,23 @@ class MemoryStore:
                 (channel_id, count),
             ).fetchall()
         return [row[0] for row in reversed(rows)]
+
+    # --- when she last spoke ---------------------------------------------------------
+    def presence(self, channel_id: str) -> Presence:
+        with self._lock:
+            row = self._db.execute("SELECT last_sent FROM presence WHERE channel_id = ?", (channel_id,)).fetchone()
+            anywhere = self._db.execute("SELECT MAX(last_sent), MAX(last_event) FROM presence").fetchone()
+        return Presence(row[0] if row else None, anywhere[0], anywhere[1])
+
+    def note_sent(self, channel_id: str, when: float, event: bool = False) -> None:
+        """Record that the bot spoke in a channel at `when`, and that it was a scene if `event` is true."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO presence (channel_id, last_sent, last_event) VALUES (?, ?, ?)"
+                " ON CONFLICT(channel_id) DO UPDATE SET last_sent = excluded.last_sent,"
+                " last_event = COALESCE(excluded.last_event, last_event)",
+                (channel_id, when, when if event else None),
+            )
 
     # --- people ------------------------------------------------------------------
     def observe_users(self, people: Sequence[tuple[str, Sequence[tuple[str, str]]]]) -> None:

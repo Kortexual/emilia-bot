@@ -19,7 +19,10 @@
 """Tests the Discord layer with fake messages/channels and a fake LLM (no network needed)."""
 import asyncio
 import itertools
+import random
+import sqlite3
 import unittest
+from datetime import datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,6 +48,7 @@ class FakeLLM:
         self.text, self.sources, self.error, self.delay = text, list(sources), error, delay
         self.script = list(script)  # if given, one reply per chat() call, in order
         self.calls = []  # the message list of every chat() call
+        self.tools_offered = []  # the `tools` argument of every chat() call
 
     async def start(self):
         pass
@@ -52,8 +56,9 @@ class FakeLLM:
     async def close(self):
         pass
 
-    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, tools=True):
         self.calls.append(messages)
+        self.tools_offered.append(tools)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error:
@@ -1271,6 +1276,276 @@ class RestartHandoffTests(BotTestCase):
         bot._busy.discard(1)
         await asyncio.wait_for(bot._retire_task, 2)
         bot.close.assert_awaited_once()
+
+
+class AlwaysLuckyRNG(random.Random):
+    """Every roll succeeds."""
+
+    def random(self):
+        return 0.0
+
+
+class NeverLuckyRNG(random.Random):
+    def random(self):
+        return 0.999
+
+
+class DayTestCase(BotTestCase):
+    """A bot whose clock the test controls (a Friday)."""
+
+    def day_bot(self, hour, minute=0, *, rng=None, **settings):
+        settings.setdefault("time_awareness", True)
+        bot = self.make_bot(**settings)
+        self.clock = datetime(2026, 10, 23, hour, minute, tzinfo=timezone.utc)
+        bot._now = lambda: self.clock
+        bot._rng = rng or NeverLuckyRNG()
+        bot._started = self.clock.timestamp()
+        return bot
+
+    async def ask(self, bot, text="hi", channel=None):
+        message = self.msg(self.mention(text), **({"channel": channel} if channel else {}))
+        await bot.on_message(message)
+        return message
+
+    def last_request(self):
+        return self.llm.calls[-1][-1]["content"]
+
+
+class TimeAwarenessTests(DayTestCase):
+    async def test_it_is_off_by_default(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertNotIn("Scene note", self.last_request())
+        self.assertNotIn(prompts.TIME_RULES, self.llm.calls[0][0]["content"])
+        self.assertIsNotNone(self.memory.presence("1").sent_here)  # her timing is kept regardless
+
+    async def test_she_is_told_how_to_use_the_note(self):
+        bot = self.day_bot(15)
+        await self.ask(bot)
+        self.assertIn(prompts.TIME_RULES, self.llm.calls[0][0]["content"])
+
+    async def test_the_first_message_of_the_morning_is_a_wake_up_and_the_second_is_not(self):
+        bot = self.day_bot(7, 42, random_event_cooldown_minutes=0)
+        await self.ask(bot)
+        first = self.last_request()
+        self.assertIn("It is 7:42 AM on Friday, early morning.", first)
+        self.assertIn("only just woken up", first)
+        self.assertIn("good morning", first)
+        self.assertLess(first.index("Reminder"), first.index("Scene note"))  # after the reminder, so it isn't ignored as an instruction
+
+        self.clock += timedelta(minutes=10)
+        await self.ask(bot, "and now?")
+        second = self.last_request()
+        self.assertIn("It is 7:52 AM on Friday", second)
+        self.assertNotIn("woken up", second)
+
+    async def test_the_next_morning_she_wakes_up_again(self):
+        bot = self.day_bot(8, random_event_cooldown_minutes=0)
+        await self.ask(bot)
+        self.clock += timedelta(days=1)
+        await self.ask(bot)
+        self.assertIn("woken up", self.last_request())
+
+    async def test_waking_up_happens_once_for_the_whole_server_not_per_channel(self):
+        bot = self.day_bot(7, random_event_cooldown_minutes=0)
+        await self.ask(bot, channel=FakeChannel(channel_id=10))
+        self.assertIn("woken up", self.last_request())
+        await self.ask(bot, channel=FakeChannel(channel_id=20))
+        self.assertNotIn("woken up", self.last_request())
+
+    async def test_late_at_night_she_is_sleepy(self):
+        bot = self.day_bot(2, 30, random_event_cooldown_minutes=0)
+        await self.ask(bot)
+        note = self.last_request()
+        self.assertIn("the middle of the night", note)
+        self.assertIn("drowsy", note)
+        self.assertNotIn("woken up", note)
+
+    async def test_the_afternoon_is_plain_unless_something_happens(self):
+        bot = self.day_bot(15)
+        await self.ask(bot)
+        note = self.last_request()
+        self.assertIn("It is 3:00 PM on Friday, the afternoon.", note)
+        self.assertNotIn("in the middle of something", note)
+        self.assertNotIn("drowsy", note)
+
+    async def test_a_random_event_has_ideas_a_cooldown_and_comes_back_afterwards(self):
+        bot = self.day_bot(13, rng=AlwaysLuckyRNG(), random_event_cooldown_minutes=120)
+        await self.ask(bot)
+        first = self.last_request()
+        self.assertIn("in the middle of something", first)
+        self.assertIn("for example:", first)
+        self.assertTrue(any(idea in first for idea in prompts.EVENT_IDEAS["midday"]))
+
+        self.clock += timedelta(minutes=30)
+        await self.ask(bot)
+        self.assertNotIn("in the middle of something", self.last_request())  # cooling down
+
+        self.clock += timedelta(minutes=95)  # 125 minutes after the event
+        await self.ask(bot)
+        self.assertIn("in the middle of something", self.last_request())
+
+    async def test_notes_never_reach_memory(self):
+        bot = self.day_bot(13, rng=AlwaysLuckyRNG())
+        await self.ask(bot, "hello there")
+        stored = " ".join(m.content for m in self.memory.recent("1"))
+        self.assertIn("hello there", stored)
+        self.assertNotIn("Scene note", stored)
+        self.assertNotIn("middle of something", stored)
+
+    async def test_a_failed_reply_does_not_use_up_the_wake_up_or_the_event(self):
+        bot = self.day_bot(7, random_event_cooldown_minutes=0, llm=FakeLLM(error=LLMError("down")))
+        await self.ask(bot)
+        self.assertEqual(self.memory.presence("1").sent_here, None)
+        self.llm.error = None
+        await self.ask(bot)
+        self.assertIn("woken up", self.last_request())
+
+    async def test_an_unreadable_timing_record_means_no_scene_rather_than_a_wrong_one(self):
+        bot = self.day_bot(7)
+        with mock.patch.object(self.memory, "presence", side_effect=sqlite3.OperationalError("locked")):
+            await self.ask(bot)
+        self.assertNotIn("woken up", self.last_request())
+        self.assertNotIn("in the middle of something", self.last_request())
+
+    async def test_the_configured_time_zone_sets_the_date_in_the_prompt(self):
+        bot = self.day_bot(23, 30, timezone="Asia/Tokyo")
+        await self.ask(bot)
+        self.assertIn("October 23, 2026", self.llm.calls[0][0]["content"])
+
+
+class RandomMessageTests(DayTestCase):
+    CHANNEL_ID = 555
+
+    def random_bot(self, hour=15, *, rng=None, silence_hours=6, **settings):
+        settings.setdefault("random_messages", True)
+        settings.setdefault("random_message_channels", (self.CHANNEL_ID,))
+        bot = self.day_bot(hour, rng=rng or AlwaysLuckyRNG(), **settings)
+        bot._started -= silence_hours * 3600
+        self.channel = FakeChannel(channel_id=self.CHANNEL_ID)
+        patcher = mock.patch.object(bot, "get_channel", side_effect=lambda cid: self.channel if cid == self.CHANNEL_ID else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return bot
+
+    async def test_she_speaks_up_in_her_active_hours_without_pinging_anyone(self):
+        bot = self.random_bot(llm=FakeLLM(text="I found the nicest flower @Alice @everyone!"))
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, ["I found the nicest flower @Alice @everyone!"])
+        mentions = self.channel.allowed_mentions[0]
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
+        self.assertEqual(self.llm.tools_offered, [False])  # no search, page reading, commands or restarts on her own
+        note = self.llm.calls[0][-1]["content"]
+        self.assertTrue(note.startswith("(Note from the system"))
+        self.assertIn("nobody has spoken to you", note)
+        self.assertNotIn("USER_INPUT", note)
+
+    async def test_she_stays_quiet_outside_her_active_hours(self):
+        bot = self.random_bot(hour=23)
+        await bot._check_presence()
+        self.assertEqual((self.channel.sent, self.llm.calls), ([], []))
+        bot = self.random_bot(hour=7, active_start=time(8, 0))
+        await bot._check_presence()
+        self.assertEqual((self.channel.sent, self.llm.calls), ([], []))
+
+    async def test_a_window_past_midnight_works(self):
+        bot = self.random_bot(hour=1, active_start=time(20, 0), active_end=time(2, 0))
+        await bot._check_presence()
+        self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_she_never_speaks_up_before_the_minimum_wait(self):
+        bot = self.random_bot(silence_hours=0.5)
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, [])
+
+    async def test_a_message_resets_the_wait(self):
+        bot = self.random_bot()
+        await bot._check_presence()
+        await bot._check_presence()  # right away: she just spoke
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.memory.presence(str(self.CHANNEL_ID)).sent_here, self.clock.timestamp())
+
+    async def test_an_answer_to_someone_also_resets_the_wait(self):
+        bot = self.random_bot()
+        await bot.on_message(self.msg(self.mention("hi"), channel=self.channel))
+        replies = len(self.channel.timeline)
+        await bot._check_presence()
+        self.assertEqual(len(self.channel.timeline), replies)  # nothing new, she only just answered
+
+    async def test_she_does_not_interrupt_a_conversation_in_progress(self):
+        bot = self.random_bot()
+        async with bot._channel_lock(str(self.CHANNEL_ID)):
+            await bot._check_presence()
+        self.assertEqual(self.channel.sent, [])
+
+    async def test_only_the_listed_channels_are_used(self):
+        bot = self.random_bot(random_message_channels=(999,))
+        await bot._check_presence()  # channel 999 is not available, 555 is not listed
+        self.assertEqual((self.channel.sent, self.llm.calls), ([], []))
+
+    async def test_the_message_is_remembered_so_a_reply_to_it_has_context(self):
+        bot = self.random_bot(llm=FakeLLM(text="I found a flower!"))
+        await bot._check_presence()
+        history = self.memory.recent(str(self.CHANNEL_ID))
+        self.assertEqual([(m.role, m.content) for m in history], [("user", prompts.UNPROMPTED_MARKER), ("assistant", "I found a flower!")])
+
+        self.llm.text = "Where? By the gate."
+        await bot.on_message(self.msg(self.mention("where?"), channel=self.channel))
+        sent = self.llm.calls[-1]
+        self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "user"])
+        self.assertEqual(sent[1]["content"], prompts.UNPROMPTED_MARKER)  # shown plainly, not as a person's message
+        self.assertEqual(sent[2]["content"], "I found a flower!")
+
+    async def test_the_first_message_of_the_morning_can_be_a_good_morning(self):
+        bot = self.random_bot(hour=8, time_awareness=True)
+        await bot._check_presence()
+        self.assertIn("only just woken up", self.llm.calls[0][-1]["content"])
+        self.assertIn("good morning to everyone", self.llm.calls[0][-1]["content"])
+
+    async def test_it_counts_as_a_scene_for_the_event_cooldown(self):
+        bot = self.random_bot(hour=15, random_event_cooldown_minutes=120)
+        await bot._check_presence()
+        seen = self.memory.presence(str(self.CHANNEL_ID))
+        self.assertEqual(seen.event_anywhere, self.clock.timestamp())
+
+    async def test_unusable_output_is_not_posted_and_the_wait_continues(self):
+        for text in ("", "<think>nothing to say</think>", prompts.PERSONA, "\u2813\u2811\u2807\u2807\u2815 hello"):
+            with self.subTest(text=text[:20]):
+                bot = self.random_bot(llm=FakeLLM(text=text))
+                await bot._check_presence()
+                self.assertEqual(self.channel.sent, [])
+                self.assertEqual(self.memory.presence(str(self.CHANNEL_ID)).sent_here, None)
+
+    async def test_a_model_error_is_swallowed(self):
+        bot = self.random_bot(llm=FakeLLM(error=LLMError("down")))
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, [])
+
+    async def test_missing_permission_is_logged_not_raised(self):
+        bot = self.random_bot()
+
+        async def refuse(*args, **kwargs):
+            raise discord.Forbidden()
+
+        self.channel.send = refuse
+        await bot._check_presence()
+        self.assertEqual(self.memory.recent(str(self.CHANNEL_ID)), [])
+
+    async def test_the_emoji_cooldown_applies_to_her_own_messages_too(self):
+        bot = self.random_bot(llm=FakeLLM(text="Hello again \U0001F338"))
+        self.memory.add_turn(str(self.CHANNEL_ID), "A", "1", "hi", "Hi \U0001F338")
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, ["Hello again"])
+
+    async def test_nothing_happens_unless_it_is_switched_on(self):
+        bot = self.make_bot()
+        await bot.setup_hook()
+        self.assertIsNone(bot._presence_task)
+        bot = self.make_bot(random_messages=True, random_message_channels=(1,))
+        await bot.setup_hook()
+        self.assertIsNotNone(bot._presence_task)
+        await bot.close()
+        self.assertTrue(bot._presence_task.cancelled() or bot._presence_task.done())
 
 
 if __name__ == "__main__":
