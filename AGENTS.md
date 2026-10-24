@@ -45,6 +45,10 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 - There is no linter, formatter or type checker configured. Follow the existing style: type hints, `from __future__ import annotations`, docstrings on modules and public classes, lines up to about 130 characters.
 - `run_command` tests need `bwrap` installed to exercise the sandbox path.
 
+### Worktrees
+
+Parallel work happens in git worktrees under `.claude/worktrees/` (gitignored). `.claude/settings.json` symlinks `venv/` from the main checkout into each new worktree, and `.worktreeinclude` copies `.env`, so `python -m unittest` and `python bot.py` work there right away. `memory.db` is not shared: a bot run from a worktree starts with empty memory. Don't run a worktree's bot while the main one is running on the same `DISCORD_TOKEN`, because both would answer every mention. A worktree made by hand with `git worktree add` gets neither, so symlink the main checkout's `venv` into it and copy `.env` yourself.
+
 ## Conventions
 
 - Every `.py` file starts with the AGPL SPDX header block (copy it from an existing file), followed by a module docstring.
