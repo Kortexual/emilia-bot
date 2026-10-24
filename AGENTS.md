@@ -14,6 +14,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `stop_talking` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
 | `tooling.py` | The `Tool` protocol (`name`, `schema`, `async run(arguments) -> ToolResult`), `ToolResult` |
 | `websearch.py` | `WebSearchTool` over `ddgs`; swap the engine by replacing `search_sync()` only |
+| `browser.py` | Opt-in browser tools over Playwright: `PublicProxy` (all browser traffic, public addresses only), `BrowserSessions` (one context per channel via `SESSION_KEY`), `browser_tools()` |
 | `webpage.py` | `FetchPageTool`: reads a public web page; `UrlRegistry` limits it to links from search results or the sender's message, and addresses are checked so it can't reach the local network |
 | `computer.py` | `WorkspaceTools` + `computer_tools()`: list/read/write/edit/delete files and `run_command` (Bubblewrap sandbox) |
 | `restart.py` | `RestartTool`: launches a replacement process, waits for it to signal readiness through a pipe fd (`EMILIA_RESTART_READY_FD`), then retires the old one |
@@ -45,6 +46,11 @@ python bot.py                 # needs a .env with DISCORD_TOKEN and a running LM
 - Tests use plain `unittest` (`IsolatedAsyncioTestCase` for async), with fake Discord objects (`SimpleNamespace`, `mock`) and fake LLM backends. `test_end_to_end.py` reuses helpers from `test_bot` and `test_llm`. Never add tests that hit the network, Discord or LM Studio.
 - There is no linter, formatter or type checker configured. Follow the existing style: type hints, `from __future__ import annotations`, docstrings on modules and public classes, lines up to about 130 characters.
 - `run_command` tests need `bwrap` installed to exercise the sandbox path.
+- CI (`.github/workflows/tests.yml`) runs `python -m unittest` on Python 3.10–3.14 for pushes to `main` and every pull request, with `bwrap` installed.
+
+### Worktrees
+
+Parallel work happens in git worktrees under `.claude/worktrees/` (gitignored). `.claude/settings.json` symlinks `venv/` from the main checkout into each new worktree, and `.worktreeinclude` copies `.env`, so `python -m unittest` and `python bot.py` work there right away. `memory.db` is not shared: a bot run from a worktree starts with empty memory. Don't run a worktree's bot while the main one is running on the same `DISCORD_TOKEN`, because both would answer every mention. A worktree made by hand with `git worktree add` gets neither, so symlink the main checkout's `venv` into it and copy `.env` yourself.
 
 ## Conventions
 

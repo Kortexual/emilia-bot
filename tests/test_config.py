@@ -46,6 +46,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.command_timeout, 30.0)
         self.assertFalse(s.computer_allow_host_access)
         self.assertTrue(s.computer_require_confirmation)
+        self.assertFalse(s.browser_tools)
+        self.assertTrue(s.browser_require_confirmation)
         self.assertFalse(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 8)
         self.assertEqual(s.memory_turns, 10)
@@ -107,6 +109,8 @@ class SettingsTests(unittest.TestCase):
             COMMAND_TIMEOUT="15",
             COMPUTER_ALLOW_HOST_ACCESS="true",
             COMPUTER_REQUIRE_CONFIRMATION="false",
+            BROWSER_TOOLS="on",
+            BROWSER_REQUIRE_CONFIRMATION="no",
             MULTI_TURN_TOOLS="true",
             MAX_TOOL_TURNS="4",
         )
@@ -122,6 +126,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.command_timeout, 15.0)
         self.assertTrue(s.computer_allow_host_access)
         self.assertFalse(s.computer_require_confirmation)
+        self.assertTrue(s.browser_tools)
+        self.assertFalse(s.browser_require_confirmation)
         self.assertTrue(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 4)
 
@@ -137,6 +143,8 @@ class SettingsTests(unittest.TestCase):
             {"MAX_TOOL_TURNS": "1"},
             {"BOT_REPLY_LIMIT": "-1"},
             {"RESPOND_TO_BOTS": "sometimes"},
+            {"BROWSER_TOOLS": "sometimes"},
+            {"BROWSER_REQUIRE_CONFIRMATION": "2"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

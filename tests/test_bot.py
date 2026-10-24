@@ -28,6 +28,7 @@ from unittest import mock
 
 import discord
 
+import browser
 import prompts
 from computer import computer_tools
 from restart import RestartTool
@@ -148,6 +149,11 @@ def person(display="Alice", user_id=1, username=None, global_name=None):
     return user
 
 
+def http_error(status=404, kind=discord.HTTPException, reason="Not Found", text="Unknown Member"):
+    """An error like the ones discord.py raises when a request fails (its constructor needs a response)."""
+    return kind(SimpleNamespace(status=status, reason=reason), text)
+
+
 class FakeGuild:
     """A server with some members Discord has already told us about and some only its search finds."""
 
@@ -165,7 +171,7 @@ class FakeGuild:
         for member in self.fetchable:
             if member.id == user_id:
                 return member
-        raise discord.HTTPException()
+        raise http_error()
 
     async def search_members(self, query, limit=1):
         self.searches.append(query)
@@ -966,7 +972,7 @@ class PingByNameTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey @Jack!"])
 
     async def test_a_failed_search_still_delivers_the_reply(self):
-        guild = FakeGuild(searchable=[person("Jack", 77)], error=discord.HTTPException())
+        guild = FakeGuild(searchable=[person("Jack", 77)], error=http_error(500))
         message = await self.ask("ping Jack", "Hey @Jack!", guild)
         self.assertEqual(message.replies, ["Hey @Jack!"])
 
@@ -1207,6 +1213,52 @@ class PageReadingTests(BotTestCase):
             self.assertEqual([t.name for t in self.make_bot(fetch_pages=False)._build_tools()], ["web_search"])
             self.assertEqual([t.name for t in self.make_bot(web_search=False)._build_tools()], ["fetch_page"])
             self.assertEqual(self.make_bot(web_search=False, fetch_pages=False)._build_tools(), [])
+
+    async def test_browser_tools_are_offered_only_when_enabled_and_installed(self):
+        names = lambda bot: [t.name for t in bot._build_tools()]  # noqa: E731
+        with mock.patch("bot.ddgs_installed", return_value=True), mock.patch("bot.playwright_installed", return_value=True):
+            self.assertNotIn("browser_open", names(self.make_bot()))
+            bot = self.make_bot(web_search=False, fetch_pages=False, browser_tools=True)
+            self.assertEqual(names(bot)[0], "browser_open")
+            self.assertEqual(len(names(bot)), 8)
+        with mock.patch("bot.playwright_installed", return_value=False), self.assertLogs("emilia.bot", "WARNING"):
+            self.assertEqual(self.make_bot(web_search=False, fetch_pages=False, browser_tools=True)._build_tools(), [])
+
+    async def test_the_browser_shares_the_allowed_links_and_follows_the_confirmation_flag(self):
+        with mock.patch("bot.playwright_installed", return_value=True):
+            bot = self.make_bot(fetch_pages=False, browser_tools=True, browser_require_confirmation=False)
+            tools = {t.name: t for t in bot._build_tools()}
+        self.assertFalse(tools["browser_click"]._tools.require_confirmation)
+        await bot.on_message(self.msg(self.mention("click around on https://shop.example/")))
+        self.assertTrue(bot.urls.is_allowed("https://shop.example/"))  # registered even with FETCH_PAGES off
+
+    async def test_the_prompt_explains_the_browser_only_when_it_is_on(self):
+        bot = self.make_bot(browser_tools=True)
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertIn(prompts.BROWSER_RULES, self.llm.calls[0][0]["content"])
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertNotIn("browser_open", self.llm.calls[0][0]["content"])
+
+    async def test_each_reply_browses_in_its_channels_own_session(self):
+        seen = []
+
+        class KeyLLM(FakeLLM):
+            async def chat(self, messages, *args, **kwargs):
+                seen.append(browser.SESSION_KEY.get())
+                return await super().chat(messages, *args, **kwargs)
+
+        self.make_bot(llm=KeyLLM(), browser_tools=True)
+        bot = EmiliaBot(Settings(discord_token="x", browser_tools=True), llm=self.llm, memory=self.memory)
+        await bot.on_message(self.msg(self.mention("hi")))
+        self.assertEqual(seen, [str(self.channel.id)])
+
+    async def test_closing_the_bot_closes_the_browser(self):
+        bot = self.make_bot(browser_tools=True)
+        with mock.patch.object(bot.browser, "close", mock.AsyncMock()) as close, \
+                mock.patch("discord.Client.close", mock.AsyncMock()):
+            await bot.close()
+        close.assert_awaited_once()
 
     async def test_the_search_tool_and_the_page_tool_share_one_list_of_allowed_links(self):
         with mock.patch("bot.ddgs_installed", return_value=True):
@@ -1608,7 +1660,7 @@ class RandomMessageTests(DayTestCase):
         bot = self.random_bot()
 
         async def refuse(*args, **kwargs):
-            raise discord.Forbidden()
+            raise http_error(403, discord.Forbidden, "Forbidden", "Missing Permissions")
 
         self.channel.send = refuse
         await bot._check_presence()
