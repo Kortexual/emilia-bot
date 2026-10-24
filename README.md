@@ -13,6 +13,7 @@ Everything stays on your machine, apart from the web searches the model chooses 
 - Python 3.10 or newer
 - LM Studio with a model loaded and its local server running
 - For web search, a model with **tool use** support (it shows a hammer badge in LM Studio's model list)
+- Optional, for `BROWSER_TOOLS`: Playwright and its Chromium (`pip install playwright && playwright install chromium`)
 
 ## Setup
 
@@ -151,6 +152,34 @@ tool rounds (search first, then the page), and each tool round is an extra gener
   The same prompt-injection rules apply as for search results.
 - The page is fetched directly from your computer, so the site sees your IP address. Turn the tool off with `FETCH_PAGES=false`.
 
+### Browsing
+`fetch_page` can't run JavaScript, click or fill in forms. With `BROWSER_TOOLS=true` (off by default) the model also gets a headless
+Chromium through [Playwright](https://playwright.dev/python/): `pip install playwright && playwright install chromium`. If Playwright
+is missing the bot starts without these tools and logs a warning. The browser is started the first time it is used.
+
+- **The tools.** `browser_open` opens a page and returns its text plus a numbered list of its links, buttons and fields
+  (`[3] button "Search"`). `browser_click`, `browser_type` (optionally pressing Enter) and `browser_select` act on those numbers,
+  and each returns the page as it is afterwards. `browser_read` reads it again (with `offset` for long pages), `browser_scroll`
+  and `browser_back` move around, and `browser_close` closes it. Each shows a line in the chat like the other tools
+  (`🖱️ Clicking Search`).
+- **Where it can go.** `browser_open` takes the same links as `fetch_page`: search results and links in the sender's message. From
+  there the model can click anywhere, as a person would, so unlike `fetch_page` a page *can* lead it elsewhere. That is the point of
+  the tool, and why it is off by default.
+- **Only the public internet.** A browser makes its own connections (scripts, images, frames, redirects, WebSockets), so they all go
+  through a small proxy inside the bot that applies the same check as `fetch_page`: every address of the name must be public, and the
+  connection is made to the address that was checked. Loopback isn't exempt from the proxy, WebRTC can't send UDP around it, QUIC is
+  off, and a page that ends up on `file://` or `chrome://` is closed. Chromium's own sandbox is used when the system allows it (the log
+  says so when it doesn't).
+- **Confirmation.** With `BROWSER_REQUIRE_CONFIRMATION=true` (the default) every click, typing and dropdown choice needs
+  `confirm=true` in the tool call, and the model is told to set it only when the sender asked for that action. Opening, reading,
+  scrolling and going back don't need it. Nothing is ever typed into a password field, and downloads are refused.
+- **Separate per channel.** Each channel has its own browser context, so cookies, logins and tabs aren't shared between channels.
+  A link that opens a new tab carries on in that tab. A channel's browser closes after 15 minutes of not being used, and at most 4
+  are open at once (the least recently used one is closed).
+- **Untrusted text.** Page text and element labels are cleaned like `fetch_page`'s and marked as untrusted. A page can still try to
+  talk the model into typing something from the conversation into a form, which no filter can rule out; the confirmation rule and
+  the prompt are the defence, so only turn this on where you trust the people who can prompt the bot.
+
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
@@ -252,6 +281,8 @@ All settings are environment variables (or lines in `.env`).
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
 | `COMPUTER_ALLOW_HOST_ACCESS` | `false` | Allow paths and command working directories outside `COMPUTER_WORKSPACE`. This grants the model the OS account's file access. |
 | `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
+| `BROWSER_TOOLS` | `false` | Give the model a headless browser it can open, read and click around in (needs Playwright; see "Browsing") |
+| `BROWSER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each browser click, typing or dropdown choice. Set `false` to let the model use pages freely. |
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
@@ -298,6 +329,7 @@ bot.py        Discord side: the mention rule, replies, memory use, !forget
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
 webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
+browser.py    the opt-in browser tools (Playwright) and the proxy that keeps them on the public internet
 computer.py   the opt-in workspace file and terminal tools
 restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory

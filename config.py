@@ -134,6 +134,8 @@ class Settings:
     command_timeout: float = 30.0
     computer_allow_host_access: bool = False  # opt-in: paths are not limited to computer_workspace
     computer_require_confirmation: bool = True  # each mutating call must contain confirm=true
+    browser_tools: bool = False  # opt-in: a headless browser the model can open, read and click around in
+    browser_require_confirmation: bool = True  # each click, typing and dropdown choice must contain confirm=true
     multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
@@ -220,6 +222,8 @@ class Settings:
             command_timeout=_number("COMMAND_TIMEOUT", cls.command_timeout, float, minimum=1),
             computer_allow_host_access=_flag("COMPUTER_ALLOW_HOST_ACCESS", cls.computer_allow_host_access),
             computer_require_confirmation=_flag("COMPUTER_REQUIRE_CONFIRMATION", cls.computer_require_confirmation),
+            browser_tools=_flag("BROWSER_TOOLS", cls.browser_tools),
+            browser_require_confirmation=_flag("BROWSER_REQUIRE_CONFIRMATION", cls.browser_require_confirmation),
             multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
