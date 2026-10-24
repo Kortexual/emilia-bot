@@ -17,6 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import unittest
+from datetime import time
 from unittest import mock
 
 import config
@@ -136,6 +137,68 @@ class SettingsTests(unittest.TestCase):
             {"MAX_TOOL_TURNS": "1"},
             {"BOT_REPLY_LIMIT": "-1"},
             {"RESPOND_TO_BOTS": "sometimes"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load(DISCORD_TOKEN="a", **bad)
+
+
+class DaySettingsTests(unittest.TestCase):
+    def test_defaults_leave_everything_off(self):
+        s = load(DISCORD_TOKEN="a")
+        self.assertFalse(s.time_awareness)
+        self.assertFalse(s.random_messages)
+        self.assertEqual(s.random_message_channels, ())
+        self.assertEqual(s.timezone, "")
+        self.assertEqual((s.active_start, s.active_end), (time(8, 0), time(22, 0)))
+        self.assertEqual(s.random_event_cooldown_minutes, 120)
+        self.assertEqual(s.random_message_min_minutes, 60)
+        self.assertEqual(s.random_message_full_hours, 8.0)
+
+    def test_values_are_read(self):
+        s = load(
+            DISCORD_TOKEN="a",
+            TIME_AWARENESS="yes",
+            TIMEZONE="America/New_York",
+            RANDOM_EVENT_COOLDOWN_MINUTES="45",
+            RANDOM_MESSAGES="true",
+            RANDOM_MESSAGE_CHANNELS="123, 456 789,123",
+            ACTIVE_START="9:30AM",
+            ACTIVE_END="11:15 PM",
+            RANDOM_MESSAGE_MIN_MINUTES="30",
+            RANDOM_MESSAGE_FULL_HOURS="6.5",
+        )
+        self.assertTrue(s.time_awareness)
+        self.assertEqual(s.timezone, "America/New_York")
+        self.assertEqual(s.random_event_cooldown_minutes, 45)
+        self.assertTrue(s.random_messages)
+        self.assertEqual(s.random_message_channels, (123, 456, 789))  # duplicates dropped, order kept
+        self.assertEqual((s.active_start, s.active_end), (time(9, 30), time(23, 15)))
+        self.assertEqual(s.random_message_min_minutes, 30)
+        self.assertEqual(s.random_message_full_hours, 6.5)
+
+    def test_active_hours_may_run_past_midnight(self):
+        s = load(DISCORD_TOKEN="a", ACTIVE_START="20:00", ACTIVE_END="02:00")
+        self.assertEqual((s.active_start, s.active_end), (time(20, 0), time(2, 0)))
+
+    def test_a_cooldown_of_zero_is_allowed(self):
+        self.assertEqual(load(DISCORD_TOKEN="a", RANDOM_EVENT_COOLDOWN_MINUTES="0").random_event_cooldown_minutes, 0)
+
+    def test_bad_values_give_clear_errors(self):
+        for bad in (
+            {"TIME_AWARENESS": "maybe"},
+            {"RANDOM_MESSAGES": "sometimes"},
+            {"TIMEZONE": "Mars/Olympus"},
+            {"TIMEZONE": "../etc"},
+            {"ACTIVE_START": "8"},
+            {"ACTIVE_END": "25:00"},
+            {"ACTIVE_START": "09:00", "ACTIVE_END": "9:00AM"},  # the same time twice
+            {"RANDOM_MESSAGE_CHANNELS": "general"},
+            {"RANDOM_MESSAGE_CHANNELS": "0"},
+            {"RANDOM_EVENT_COOLDOWN_MINUTES": "-5"},
+            {"RANDOM_MESSAGE_MIN_MINUTES": "-1"},
+            {"RANDOM_MESSAGE_FULL_HOURS": "0"},
+            {"RANDOM_MESSAGE_MIN_MINUTES": "120", "RANDOM_MESSAGE_FULL_HOURS": "2"},  # must be longer than the minimum
+            {"RANDOM_MESSAGES": "true"},  # no channels listed
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

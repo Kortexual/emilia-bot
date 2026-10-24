@@ -19,7 +19,9 @@
 """Discord bot that chats through a local LM Studio model.
 
 It answers only when @mentioned (and, if you opt in with RESPOND_TO_DMS=true, in DMs), remembers
-recent conversation per channel, and can search the web when the model is unsure of something.
+recent conversation per channel, and can search the web when the model is unsure of something. If you
+opt in with RANDOM_MESSAGES=true it may also speak up on its own, in the channels you list and only
+during its active hours (see presence.py).
 
 Run with:  python bot.py     (see README.md for setup)
 """
@@ -28,23 +30,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Collection, Protocol
 
 import discord
 
+import presence
 import prompts
 import styleguard
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
-from memory import MemoryStore, StoredMessage
+from memory import MemoryStore, Presence, StoredMessage
 from textutil import clean_reply, contains_cipher_script, sanitize_user_text, split_message
 from tooling import Tool
 from webpage import FetchPageTool, UrlRegistry, extract_urls
@@ -73,6 +78,7 @@ class ChatBackend(Protocol):
         on_tool_done: ToolHandler | None = None,
         *,
         exclude: Collection[str] = (),
+        tools: bool = True,
     ) -> ChatResult: ...
 
 
@@ -211,6 +217,8 @@ class EmiliaBot(discord.Client):
         llm: ChatBackend | None = None,
         memory: MemoryStore | None = None,
         restart_ready_fd: int | None = None,
+        now: Callable[[], datetime] | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
@@ -242,6 +250,11 @@ class EmiliaBot(discord.Client):
         self._restart_ready_fd = restart_ready_fd
         self._retiring = False  # a replacement has taken over: answer no new messages, then shut down
         self._retire_task: asyncio.Task[None] | None = None
+        zone = presence.load_timezone(settings.timezone)
+        self._now = now or (lambda: presence.local_now(zone))  # her local time; tests pass a fixed clock
+        self._rng = rng or random.Random()
+        self._started = self._now().timestamp()  # until she has spoken in a channel, her wait is counted from here
+        self._presence_task: asyncio.Task[None] | None = None
 
     def _build_tools(self) -> list[Tool]:
         tools: list[Tool] = []
@@ -275,6 +288,8 @@ class EmiliaBot(discord.Client):
     # --- lifecycle -------------------------------------------------------------
     async def setup_hook(self) -> None:
         await self.llm.start()
+        if self.settings.random_messages:
+            self._presence_task = asyncio.create_task(self._presence_loop())  # keep a reference so it isn't garbage-collected
 
     async def on_ready(self) -> None:
         scope = "@mentions and DMs" if self.settings.respond_to_dms else "@mentions only"
@@ -308,6 +323,9 @@ class EmiliaBot(discord.Client):
         self._retire_task = asyncio.create_task(retire())  # keep a reference so it isn't garbage-collected
 
     async def close(self) -> None:
+        if self._presence_task is not None:
+            self._presence_task.cancel()
+            await asyncio.gather(self._presence_task, return_exceptions=True)
         await self.llm.close()
         self.memory.close()
         await super().close()
@@ -411,20 +429,20 @@ class EmiliaBot(discord.Client):
                     shown = styleguard.drop_stale_directives(shown)
                 shown = [replace(m, author=labels.get(m.author_id, m.author)) if m.role == "user" else m for m in shown]
                 profiles = await self._profiles(people, labels)
+                scene = await self._scene(key) if self.settings.time_awareness else None
 
-                system_prompt = prompts.build_system_prompt(
-                    date.today(),
-                    web_search=self.settings.web_search,
-                    show_sources=self.settings.show_sources,
-                    computer_tools=self.settings.computer_tools and not from_bot,
-                    multi_turn=self.settings.multi_turn_tools,
-                    yandere=self.settings.yandere_mode,
-                    fetch_pages=self.settings.fetch_pages,
-                )
+                system_prompt = self._system_prompt(from_bot=from_bot)
                 if self.settings.fetch_pages:  # links the sender wrote (or replied to) may be opened this turn
                     self.urls.allow(extract_urls(text) + extract_urls(quoted_body))
                 messages = prompts.build_messages(
-                    system_prompt, shown, author, user_text, others, profiles, yandere=self.settings.yandere_mode
+                    system_prompt,
+                    shown,
+                    author,
+                    user_text,
+                    others,
+                    profiles,
+                    yandere=self.settings.yandere_mode,
+                    scene_note=prompts.time_note(scene) if scene else "",
                 )
 
                 # A reply can be several Discord messages, posted as they happen: whatever the model writes
@@ -511,6 +529,140 @@ class EmiliaBot(discord.Client):
                         )
                     except sqlite3.Error:
                         log.exception("Could not save this exchange to memory")
+                    await self._record_spoke(key, bool(scene and scene.kind))
+
+    # --- her day: time awareness and speaking up unprompted ---------------------------
+    def _system_prompt(self, *, from_bot: bool = False) -> str:
+        today = self._now().date() if self.settings.timezone else date.today()
+        return prompts.build_system_prompt(
+            today,
+            web_search=self.settings.web_search,
+            show_sources=self.settings.show_sources,
+            computer_tools=self.settings.computer_tools and not from_bot,
+            multi_turn=self.settings.multi_turn_tools,
+            yandere=self.settings.yandere_mode,
+            fetch_pages=self.settings.fetch_pages,
+            time_awareness=self.settings.time_awareness,
+        )
+
+    async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
+        """What is going on around her for the message about to be written in channel `key`."""
+        now = self._now()
+        try:
+            seen = await asyncio.to_thread(self.memory.presence, key)
+        except sqlite3.Error:
+            log.exception("Could not read when she last spoke")
+            seen = Presence(None, now.timestamp(), now.timestamp())  # no wake-up or event on a guess
+        return presence.scene_for(
+            now,
+            seen.sent_anywhere,
+            seen.event_anywhere,
+            ideas=prompts.EVENT_IDEAS,
+            event_cooldown_minutes=self.settings.random_event_cooldown_minutes,
+            rng=self._rng,
+            spontaneous=spontaneous,
+        )
+
+    async def _record_spoke(self, key: str, event: bool) -> None:
+        """Remember that she just spoke in this channel (and whether it came with a scene)."""
+        try:
+            await asyncio.to_thread(self.memory.note_sent, key, self._now().timestamp(), event)
+        except sqlite3.Error:
+            log.exception("Could not save when she last spoke")
+
+    async def _presence_loop(self) -> None:
+        await self.wait_until_ready()
+        log.info(
+            "She may speak up on her own in %d channel(s), between %s and %s",
+            len(self.settings.random_message_channels),
+            self.settings.active_start.strftime("%H:%M"),
+            self.settings.active_end.strftime("%H:%M"),
+        )
+        while not self._retiring:
+            await asyncio.sleep(presence.CHECK_SECONDS)
+            try:
+                await self._check_presence()
+            except Exception:  # one bad check must not end the loop
+                log.exception("Checking whether to speak up failed")
+
+    async def _check_presence(self) -> None:
+        """One look at the clock: inside her active hours, each listed channel gets a chance to hear from her."""
+        now = self._now()
+        if not presence.is_active(now.time(), self.settings.active_start, self.settings.active_end):
+            return
+        for channel_id in self.settings.random_message_channels:
+            if self._retiring:
+                return
+            await self._maybe_speak_up(channel_id, now)
+
+    async def _maybe_speak_up(self, channel_id: int, now: datetime) -> None:
+        channel = self.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            log.debug("Channel %s is not available for random messages", channel_id)
+            return
+        key = str(channel_id)
+        if self._channel_lock(key).locked():  # she is busy answering someone there
+            return
+        try:
+            seen = await asyncio.to_thread(self.memory.presence, key)
+        except sqlite3.Error:
+            log.exception("Could not read when she last spoke")
+            return
+        waited_since = seen.sent_here if seen.sent_here is not None else self._started
+        chance = presence.send_chance(
+            now.timestamp() - waited_since,
+            self.settings.random_message_min_minutes * 60,
+            self.settings.random_message_full_hours * 3600,
+        )
+        if chance > 0 and self._rng.random() < chance:
+            await self._speak_up(channel, key)
+
+    async def _speak_up(self, channel: Any, key: str) -> None:
+        """Say something nobody asked for. It never pings anyone and the model gets no tools: there is nobody
+        to ask for a search or a command, and nobody who has confirmed anything."""
+        async with channel.typing():
+            async with self._channel_lock(key):
+                history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
+                labels = self._labels(history, [])
+                shown = history
+                if self.settings.forget_standing_instructions:
+                    shown = styleguard.drop_stale_directives(shown)
+                shown = [replace(m, author=labels.get(m.author_id, m.author)) if m.role == "user" else m for m in shown]
+                scene = await self._scene(key, spontaneous=True)
+                messages = prompts.build_unprompted_messages(self._system_prompt(), shown, prompts.unprompted_note(scene))
+                try:
+                    result = await self.llm.chat(messages, tools=False)
+                except LLMError as exc:
+                    log.error("LM Studio request failed (message of her own): %s", exc)
+                    return
+
+                text = clean_reply(result.text, self._speaker_names())
+                if not text:
+                    log.info("The model had nothing to say on its own")
+                    return
+                if prompts.LEAK_DETECTOR.leaks(text):
+                    log.warning("Blocked a message of her own that repeated the system prompt")
+                    return
+                if contains_cipher_script(text):
+                    log.warning("Dropped a message of her own written in braille/cipher script")
+                    return
+                if self.settings.style_cooldown:
+                    recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
+                    text = styleguard.cool_down(text, recent)
+                try:
+                    for chunk in split_message(text, CHUNK_SIZE):
+                        await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+                except discord.Forbidden:
+                    log.warning("Missing permission to speak in channel %s", key)
+                    return
+                except discord.HTTPException as exc:
+                    log.warning("Could not post in channel %s (%s)", key, exc)
+                    return
+                try:  # remembered as an exchange with a placeholder where the question would be
+                    await asyncio.to_thread(self.memory.add_turn, key, "", "", prompts.UNPROMPTED_MARKER, text)
+                except sqlite3.Error:
+                    log.exception("Could not save a message of her own to memory")
+                await self._record_spoke(key, True)
 
     async def _reset(self, message: discord.Message, key: str) -> None:
         if message.guild is not None and not message.channel.permissions_for(message.author).manage_messages:

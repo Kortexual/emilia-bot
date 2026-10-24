@@ -21,7 +21,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from memory import MemoryStore
+from memory import MemoryStore, Presence
 
 
 class PeopleDirectoryTests(unittest.TestCase):
@@ -100,6 +100,62 @@ class PeopleDirectoryTests(unittest.TestCase):
         self.assertEqual(self.store.last_replies("c1", 2), ["a2", "a3"])
         self.assertEqual(self.store.last_replies("c1", 0), [])
         self.assertEqual(self.store.last_replies("nobody", 3), [])
+
+
+class PresenceTests(unittest.TestCase):
+    def setUp(self):
+        self.store = MemoryStore(":memory:", max_turns=3)
+        self.addCleanup(self.store.close)
+
+    def test_nothing_is_known_at_first(self):
+        self.assertEqual(self.store.presence("c1"), Presence(None, None, None))
+
+    def test_remembers_when_she_spoke_here_and_anywhere(self):
+        self.store.note_sent("c1", 100.0)
+        self.store.note_sent("c2", 200.0)
+        self.assertEqual(self.store.presence("c1"), Presence(100.0, 200.0, None))
+        self.assertEqual(self.store.presence("c2"), Presence(200.0, 200.0, None))
+        self.assertEqual(self.store.presence("c3"), Presence(None, 200.0, None))  # never spoke there, but did elsewhere
+
+    def test_an_event_is_remembered_until_the_next_one(self):
+        self.store.note_sent("c1", 100.0, event=True)
+        self.store.note_sent("c1", 150.0)  # an ordinary message does not erase the last event
+        self.assertEqual(self.store.presence("c1"), Presence(150.0, 150.0, 100.0))
+        self.store.note_sent("c2", 300.0, event=True)
+        self.assertEqual(self.store.presence("c1").event_anywhere, 300.0)
+
+    def test_clearing_a_channel_keeps_the_timing(self):
+        self.store.add_turn("c1", "A", "1", "q", "a")
+        self.store.note_sent("c1", 100.0)
+        self.store.clear("c1")
+        self.assertEqual(self.store.presence("c1").sent_here, 100.0)
+
+    def test_it_survives_a_restart_and_an_older_database_gets_the_table(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "memory.db")
+            old = sqlite3.connect(path)
+            old.execute(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL, role TEXT NOT NULL,"
+                " author TEXT, author_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            old.commit()
+            old.close()
+            first = MemoryStore(path)
+            first.note_sent("c1", 42.0, event=True)
+            first.close()
+            second = MemoryStore(path)
+            try:
+                self.assertEqual(second.presence("c1"), Presence(42.0, 42.0, 42.0))
+            finally:
+                second.close()
+
+    def test_a_message_of_her_own_keeps_the_conversation_alternating(self):
+        self.store.add_turn("c1", "A", "1", "hi", "hello")
+        self.store.add_turn("c1", "", "", "(placeholder)", "I found a flower!")
+        self.store.add_turn("c1", "A", "1", "where?", "In the garden.")
+        history = self.store.recent("c1")
+        self.assertEqual([m.role for m in history], ["user", "assistant"] * 3)
+        self.assertEqual(history[2].author_id, "")
 
 
 class MemoryStoreTests(unittest.TestCase):

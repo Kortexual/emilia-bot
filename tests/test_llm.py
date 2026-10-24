@@ -158,6 +158,30 @@ class ChatTests(ClientTestCase):
         self.assertNotIn("temperature", sent)  # LM Studio's own UI settings apply unless configured
         self.assertNotIn("max_tokens", sent)
 
+    async def test_tools_can_be_withheld_for_one_request(self):
+        server = self.serve([text_reply("A thought of my own."), text_reply("Now with tools.")])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search])
+
+        result = await client.chat(USER, tools=False)
+
+        self.assertEqual(result.text, "A thought of my own.")
+        self.assertNotIn("tools", server.requests[0])
+        self.assertNotIn("tool_choice", server.requests[0])
+        await client.chat(USER)  # the next request offers them again
+        self.assertEqual(server.requests[1]["tools"][0], {"type": "function", "function": search.schema})
+
+    async def test_a_printed_tool_call_is_not_run_when_tools_are_withheld(self):
+        server = self.serve([text_reply('Sure<tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_call>')])
+        search = FakeSearch()
+        client = await self.client(server, tools=[search])
+
+        result = await client.chat(USER, tools=False)
+
+        self.assertEqual(search.calls, [])
+        self.assertEqual(result.text, "Sure")
+        self.assertFalse(result.used_tools)
+
     async def test_tool_round_trip(self):
         server = self.serve([tool_reply(("web_search", {"query": "weather atlanta"})), text_reply("It is sunny.")])
         search = FakeSearch()

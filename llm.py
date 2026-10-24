@@ -254,8 +254,11 @@ class LMStudioClient:
         on_tool_done: ToolHandler | None = None,
         *,
         exclude: Collection[str] = (),
+        tools: bool = True,
     ) -> ChatResult:
         """Run a conversation to completion, executing any tool calls the model makes on the way.
+        With `tools=False` the model is offered none, however many are configured (used for the messages
+        she starts herself, where nobody has asked for anything to be searched, read or run).
 
         As it goes, whatever the model writes before its last message is handed to `on_text`, and every
         tool call to `on_tool` just before the tool runs (and to `on_tool_done` after, with its sources),
@@ -265,7 +268,7 @@ class LMStudioClient:
         only offered while working, so it can't end a reply before it has started. Tools named in
         `exclude` are neither offered nor run for this conversation.
         """
-        tools = {name: tool for name, tool in self._tools.items() if name not in exclude}
+        available = {name: tool for name, tool in self._tools.items() if name not in exclude} if tools else {}
         convo = list(messages)
         sources: list[str] = []
         used_ids: set[str] = set()
@@ -274,15 +277,15 @@ class LMStudioClient:
         said: list[str] = []  # what the model wrote so far in this reply, to catch it repeating itself
         previous_calls: list[str] = []  # the last round's tool calls, to catch it repeating them
         repeated_rounds = 0
-        tools_enabled = bool(tools)
+        tools_enabled = bool(available)
         limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
 
         for round_no in range(limit):
             last = round_no + 1 >= limit
             offer = tools_enabled and not last  # the last round must be an answer
-            offered = (set(tools) | ({STOP_TALKING} if working else set())) if offer else set()
+            offered = (set(available) | ({STOP_TALKING} if working else set())) if offer else set()
             try:
-                message = await self._complete(convo, offer, finish_option=working, require_tool=working, tools=tools)
+                message = await self._complete(convo, offer, finish_option=working, require_tool=working, tools=available)
             except LLMHTTPError as exc:
                 if not (offer and exc.status in (400, 422)):
                     raise
@@ -374,7 +377,7 @@ class LMStudioClient:
                 sources.extend(result.sources)
                 note = f"\n\n{hint}" if hint and call is calls[-1] else ""
                 convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
-            working = working or (self._multi_turn and any(call.name in tools for call in calls))
+            working = working or (self._multi_turn and any(call.name in available for call in calls))
             if finished:
                 log.info("Model called stop_talking: turn over")
                 return ChatResult("", sources, used_tools)
