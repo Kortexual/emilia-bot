@@ -145,9 +145,9 @@ def person(display="Alice", user_id=1, username=None, global_name=None):
     return user
 
 
-def http_error(status=404):
+def http_error(status=404, kind=discord.HTTPException, reason="Not Found", text="Unknown Member"):
     """An error like the ones discord.py raises when a request fails (its constructor needs a response)."""
-    return discord.HTTPException(SimpleNamespace(status=status, reason="Not Found"), "Unknown Member")
+    return kind(SimpleNamespace(status=status, reason=reason), text)
 
 
 class FakeGuild:
@@ -1525,7 +1525,7 @@ class RandomMessageTests(DayTestCase):
         bot = self.random_bot()
 
         async def refuse(*args, **kwargs):
-            raise discord.Forbidden()
+            raise http_error(403, discord.Forbidden, "Forbidden", "Missing Permissions")
 
         self.channel.send = refuse
         await bot._check_presence()
