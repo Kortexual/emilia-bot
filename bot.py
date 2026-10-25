@@ -66,6 +66,8 @@ CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some h
 RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
 FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
 ABOUT_COMMAND = "!about"  # "@Emilia !about I garden and like tea" saves a note about yourself
+GIVE_UP_COMMAND = "!giveup"  # stops the replies in progress in that channel and tells her to leave the task be
+GIVE_UP_WAIT = 5.0  # seconds !giveup waits for the stopped replies to save what they had done before answering
 QUOTE_CHARS = 300  # how much of a replied-to message is shown to the model
 FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the sender wants to talk about
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
@@ -268,6 +270,8 @@ class EmiliaBot(discord.Client):
         )
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
+        self._replies: dict[str, dict[asyncio.Task[None], int]] = {}  # by channel: replies in progress -> who asked
+        self._given_up: set[asyncio.Task[None]] = set()  # replies stopped by !giveup
         self._forwards: dict[tuple[int, int], discord.Message] = {}  # (channel, user) -> their latest forward there
         self._bot_streak: dict[int, int] = {}  # by channel ID: replies to bots since a human last spoke there
         self._restart_ready_fd = restart_ready_fd
@@ -458,7 +462,8 @@ class EmiliaBot(discord.Client):
         key = str(message.channel.id)
 
         command, _, argument = text.partition(" ")
-        if message.author.bot and (text.lower() in RESET_COMMANDS | {FORGET_ME_COMMAND} or command.lower() == ABOUT_COMMAND):
+        commands = RESET_COMMANDS | {FORGET_ME_COMMAND, GIVE_UP_COMMAND}
+        if message.author.bot and (text.lower() in commands or command.lower() == ABOUT_COMMAND):
             log.info("Ignored a command from bot %s", message.author.id)  # commands are for people only
             return
         if text.lower() in RESET_COMMANDS:
@@ -466,6 +471,9 @@ class EmiliaBot(discord.Client):
             return
         if text.lower() == FORGET_ME_COMMAND:
             await self._forget_me(message)
+            return
+        if text.lower() == GIVE_UP_COMMAND:  # handled at once, without waiting for the channel lock
+            await self._give_up(message, key)
             return
         if command.lower() == ABOUT_COMMAND:
             await self._about(message, argument)
@@ -483,12 +491,27 @@ class EmiliaBot(discord.Client):
             await self._send(message, prompts.BUSY_REPLY)
             return
         self._busy.add(user_id)
-        try:
+
+        async def answer() -> None:
             quoted_body, quoted_author = await self._quoted_context(message)
             forwarded = await self._forwarded_context(forward)
             await self._respond(message, key, text, quoted_body, quoted_author, forwarded)
+
+        # Its own task, so that !giveup can cancel it (and with it the LM Studio request or tool it is waiting for).
+        reply = asyncio.create_task(answer())
+        replies = self._replies.setdefault(key, {})
+        replies[reply] = user_id
+        try:
+            await reply
+        except asyncio.CancelledError:
+            if reply not in self._given_up:
+                raise
         finally:
             self._busy.discard(user_id)
+            replies.pop(reply, None)
+            if not replies and self._replies.get(key) is replies:
+                del self._replies[key]
+            self._given_up.discard(reply)
 
     async def _respond(
         self,
@@ -629,40 +652,51 @@ class EmiliaBot(discord.Client):
                     except discord.HTTPException as exc:
                         log.info("Could not add links to a tool message (%s)", exc)
 
-                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
-                try:
-                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
-                    reply = clean_reply(result.text, self._speaker_names())
-                    if contains_cipher_script(reply) and not result.used_tools and not posted:
-                        # Someone talked the model into writing in braille (or similar). Try once more
-                        # with a nudge; nothing has run or been posted yet, so the retry is harmless.
-                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
-                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
-                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
-                        reply = clean_reply(result.text, self._speaker_names())
-                except LLMError as exc:
-                    log.error("LM Studio request failed: %s", exc)
-                    await post(prompts.ERROR_REPLY, from_model=False)
-                else:
-                    if contains_cipher_script(reply):
-                        log.warning("Reply was still in braille/cipher script; posting a canned reply")
-                        await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
-                    elif reply:
-                        await post(reply)
-                    elif not posted:
-                        log.warning("The model sent an empty reply")
-                        await post(prompts.EMPTY_REPLY, from_model=False)
-
-                if kept:
+                async def remember(reply_text: str) -> None:
                     try:  # stored with plain "@Name"s, the way the model wrote them
                         await asyncio.to_thread(
-                            self.memory.add_turn, key, author_name, str(message.author.id), user_text, "\n\n".join(kept)
+                            self.memory.add_turn, key, author_name, str(message.author.id), user_text, reply_text
                         )
                     except sqlite3.Error:
                         log.exception("Could not save this exchange to memory")
-                    await self._record_spoke(key, bool(scene and scene.kind))
-                    if context.redirect is not None:  # the thread starts out knowing where it came from
-                        await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
+                    if kept:
+                        await self._record_spoke(key, bool(scene and scene.kind))
+                        if context.redirect is not None:  # the thread starts out knowing where it came from
+                            await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
+
+                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
+                try:
+                    try:
+                        result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
+                        reply = clean_reply(result.text, self._speaker_names())
+                        if contains_cipher_script(reply) and not result.used_tools and not posted:
+                            # Someone talked the model into writing in braille (or similar). Try once more
+                            # with a nudge; nothing has run or been posted yet, so the retry is harmless.
+                            log.warning("Reply was written in braille/cipher script; retrying once in plain text")
+                            nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
+                            result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
+                            reply = clean_reply(result.text, self._speaker_names())
+                    except LLMError as exc:
+                        log.error("LM Studio request failed: %s", exc)
+                        await post(prompts.ERROR_REPLY, from_model=False)
+                    else:
+                        if contains_cipher_script(reply):
+                            log.warning("Reply was still in braille/cipher script; posting a canned reply")
+                            await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
+                        elif reply:
+                            await post(reply)
+                        elif not posted:
+                            log.warning("The model sent an empty reply")
+                            await post(prompts.EMPTY_REPLY, from_model=False)
+                except asyncio.CancelledError:
+                    if asyncio.current_task() in self._given_up:
+                        # What she was asked and how far she got; _give_up then adds the note that she gave up on it.
+                        log.info("Stopped a reply in channel %s (!giveup)", key)
+                        await remember("\n\n".join(kept) if kept else prompts.GAVE_UP_BEFORE_ANSWERING)
+                    raise
+
+                if kept:
+                    await remember("\n\n".join(kept))
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
     def _system_prompt(self, *, from_bot: bool = False) -> str:
@@ -830,6 +864,37 @@ class EmiliaBot(discord.Client):
         except sqlite3.Error:
             log.exception("Could not read or save a note for user %s", user_id)
             await self._send(message, prompts.ERROR_REPLY)
+
+    async def _give_up(self, message: discord.Message, key: str) -> None:
+        """`!giveup` stops the replies in progress in this channel right away (the LM Studio request, a tool
+        that is running, and replies still waiting their turn), then leaves a note in memory that she gave up,
+        so she doesn't pick the task back up unless someone asks again. Anyone can stop the replies to their own
+        messages; stopping other people's needs the Manage Messages permission, like !forget."""
+        replies = self._replies.get(key, {})
+        anyone = message.guild is None or message.channel.permissions_for(message.author).manage_messages
+        stopping = [task for task, asker in replies.items() if anyone or asker == message.author.id]
+        if replies and not stopping:
+            await self._send(message, prompts.GIVE_UP_DENIED)
+            return
+        for task in stopping:
+            self._given_up.add(task)
+            task.cancel()
+        if stopping:
+            await asyncio.wait(stopping, timeout=GIVE_UP_WAIT)  # each saves the exchange it was working on first
+        log.info("!giveup in channel %s stopped %d reply(s)", key, len(stopping))
+        reply = prompts.GIVE_UP_DONE if stopping else prompts.GIVE_UP_IDLE
+        try:  # remembered like an exchange, so the model sees that the work was dropped on purpose
+            await asyncio.to_thread(
+                self.memory.add_turn,
+                key,
+                prompts.safe_name(message.author.display_name),
+                str(message.author.id),
+                prompts.GIVE_UP_NOTE,
+                reply,
+            )
+        except sqlite3.Error:
+            log.exception("Could not save !giveup to memory")
+        await self._send(message, reply)
 
     async def _forget_me(self, message: discord.Message) -> None:
         await asyncio.to_thread(self.memory.forget_user, str(message.author.id))

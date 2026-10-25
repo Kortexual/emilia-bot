@@ -8,6 +8,7 @@ directories) stay below ``workspace``.  Enable the bundle explicitly with COMPUT
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 from pathlib import Path
@@ -185,6 +186,10 @@ class WorkspaceTools:
                 process.kill()
                 await process.communicate()
                 return ToolResult(f"Error: command timed out after {self.command_timeout:g} seconds.")
+            except asyncio.CancelledError:  # the reply was stopped (!giveup): don't leave the command running
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                raise
             text = output.decode("utf-8", errors="replace")
             if len(text) > MAX_OUTPUT_CHARS:
                 text = text[:MAX_OUTPUT_CHARS] + "\n(Output truncated.)"

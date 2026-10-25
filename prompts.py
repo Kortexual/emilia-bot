@@ -560,3 +560,15 @@ ABOUT_CLEARED = "Okay, I've forgotten what you told me about yourself."
 ABOUT_SHOW = "Here's what I have noted about you: {text}"
 FORGOT_YOU = "Okay, I've forgotten the notes and names I had saved for you."
 RESET_DENIED = "Sorry, only people who can manage messages here are able to make me forget."
+GIVE_UP_DONE = "Okay, I'll stop there. I won't pick it back up unless you ask me to."
+GIVE_UP_IDLE = "I wasn't working on anything just now, but okay, I'll leave it be."
+GIVE_UP_DENIED = "Sorry, only the person who asked, or someone who can manage messages here, can make me stop."
+
+# !giveup is remembered as an exchange: this as what the sender said, then GIVE_UP_DONE (or GIVE_UP_IDLE) as her
+# answer, so later replies know the task was dropped on purpose. Worded so styleguard never takes it for a
+# standing rule and hides it. A reply stopped before she had said anything is remembered with the second line.
+GIVE_UP_NOTE = (
+    "!giveup (Stop what you were doing and drop it. Don't go back to it or try it another way "
+    "unless someone asks you to again.)"
+)
+GAVE_UP_BEFORE_ANSWERING = "(I was stopped before I could answer.)"

@@ -93,6 +93,10 @@ class RestartTool:
 
         try:
             ready = await self._wait_for_ready(read_fd, process)
+        except asyncio.CancelledError:
+            # The reply was stopped (!giveup): this bot carries on, so the replacement must not come up beside it.
+            await self._stop(process)
+            raise
         finally:
             os.close(read_fd)
 

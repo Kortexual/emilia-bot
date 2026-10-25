@@ -10,7 +10,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 
 | File | Role |
 |---|---|
-| `bot.py` | `EmiliaBot(discord.Client)`: the mention rule (`_is_for_me`), handling a message (`_handle` → `_respond`), replies and forwards as context (`_quoted_context`, `_note_forward`, `_forwarded_context`), `!forget`/`!about`/`!forgetme`, member lookup and pings (`link_mentions`, `_lookup_members`), restart handoff, `main()` |
+| `bot.py` | `EmiliaBot(discord.Client)`: the mention rule (`_is_for_me`), handling a message (`_handle` → `_respond`), replies and forwards as context (`_quoted_context`, `_note_forward`, `_forwarded_context`), `!forget`/`!about`/`!forgetme`, `!giveup` (`_give_up`), member lookup and pings (`link_mentions`, `_lookup_members`), restart handoff, `main()` |
 | `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `stop_talking` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
 | `tooling.py` | The `Tool` protocol (`name`, `schema`, `async run(arguments) -> ToolResult`), `ToolResult` |
 | `websearch.py` | `WebSearchTool` over `ddgs`; swap the engine by replacing `search_sync()` only |
@@ -32,6 +32,8 @@ Tools are assembled in `EmiliaBot._build_tools`. Discord tools act as her, a mem
 ### How a reply flows
 
 `LMStudioClient.chat(messages, on_text, on_tool, on_tool_done)` runs the generations for one message. As it goes, text the model writes before its last message is passed to `on_text`, and each tool call to `on_tool` just before the tool runs (as a `ToolUse` whose `description` comes from the tool's `describe()`), then to `on_tool_done` with its `sources` filled in; the return value (`ChatResult`) is the last thing the model wrote. In `EmiliaBot._respond`, `on_text` and the final result go through `post()`, which cleans the text, checks for prompt leaks, applies the cooldown and resolves pings. `on_tool` posts `tool_line(use)` as its own channel message with no mentions allowed, and `on_tool_done` edits the links (`source_links`) into it. Everything the model said is stored in memory as one reply joined by blank lines.
+
+`_handle` runs each reply as its own task, tracked per channel in `_replies`. `!giveup` is handled before the busy check and without the channel lock: `_give_up` marks the tasks in `_given_up` and cancels them. In `_respond`, a reply cancelled that way stores what it had posted so far (or `GAVE_UP_BEFORE_ANSWERING`), then `_give_up` stores `GIVE_UP_NOTE` and the canned answer as one more exchange.
 
 ## Running and testing
 
@@ -58,7 +60,7 @@ Parallel work happens in git worktrees under `.claude/worktrees/` (gitignored). 
 - Every `.py` file starts with the AGPL SPDX header block (copy it from an existing file), followed by a module docstring.
 - **Her day.** Decisions (when, how often, which phase) belong in `presence.py` with the clock and RNG passed in, so tests are deterministic; wording belongs in `prompts.py`. Tests for bot-level behaviour set `bot._now` and `bot._rng`.
 - **Adding a setting** means changing four places together: `config.py` (`Settings` field + `from_env`, using `_flag`/`_number`/`_text`), `.env.example` (commented, with a default and a sentence of explanation), the configuration table in `README.md`, and `tests/test_config.py`.
-- **Adding a tool**: implement the `Tool` protocol from `tooling.py`, register it in `EmiliaBot._build_tools`, and mention it in the prompt rules in `prompts.py` if the model needs guidance on when to use it. Give it a `describe(arguments)` method returning the line shown in Discord when it is used (an emoji, present tense, arguments wrapped with `tooling.code_span`). Tool results are plain text for the model; put URLs to show users in `ToolResult.sources`; they are added to the tool's line after it runs.
+- **Adding a tool**: implement the `Tool` protocol from `tooling.py`, register it in `EmiliaBot._build_tools`, and mention it in the prompt rules in `prompts.py` if the model needs guidance on when to use it. Give it a `describe(arguments)` method returning the line shown in Discord when it is used (an emoji, present tense, arguments wrapped with `tooling.code_span`). Tool results are plain text for the model; put URLs to show users in `ToolResult.sources`; they are added to the tool's line after it runs. A tool must be safe to cancel (`!giveup`): anything it starts outside the event loop, such as a process, has to be stopped on `asyncio.CancelledError` (see `run_command` and `RestartTool._restart`).
 - Keep the README up to date when behaviour changes. It explains design decisions, so update it in the same change.
 - Log errors and details with `log`; never post them in Discord. Canned replies in `prompts.py` are what users see.
 - The character and canned replies stay in persona. Change the persona only in `prompts.py`.

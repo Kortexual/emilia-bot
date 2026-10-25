@@ -31,6 +31,7 @@ import discord
 import bot as bot_module
 import browser
 import prompts
+import styleguard
 from computer import computer_tools
 from restart import RestartTool
 from tooling import default_description
@@ -771,6 +772,135 @@ class ResetTests(BotTestCase):
         message = self.msg(self.mention("please !forget it"))
         await bot.on_message(message)
         self.assertEqual(message.replies, ["Hello there!"])
+
+
+class BlockingLLM(FakeLLM):
+    """A fake that posts `said` (if anything) and then keeps generating until it is released or cancelled."""
+
+    def __init__(self, said=()):
+        super().__init__()
+        self.said = list(said)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = 0
+
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True):
+        self.calls.append(messages)
+        for text in self.said:
+            await on_text(text)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return ChatResult(self.text, [], False)
+
+
+class GiveUpTests(BotTestCase):
+    async def start_request(self, bot, text="count to a million", author=None):
+        """Send a request and wait until the model is working on it."""
+        self.llm.started.clear()
+        request = self.msg(self.mention(text), author=author)
+        task = asyncio.create_task(bot.on_message(request))
+        await asyncio.wait_for(self.llm.started.wait(), 1)
+        return request, task
+
+    async def give_up(self, bot, author=None):
+        message = self.msg(self.mention("!GiveUp"), author=author)
+        await asyncio.wait_for(bot.on_message(message), 1)
+        return message
+
+    def remembered(self):
+        return [(m.role, m.content) for m in self.memory.recent("1")]
+
+    async def test_it_stops_the_reply_at_once_and_remembers_that_it_gave_up(self):
+        bot = self.make_bot(BlockingLLM())
+        request, running = await self.start_request(bot)
+        stop = await self.give_up(bot)
+        await asyncio.wait_for(running, 1)  # ends quietly, without an error
+        self.assertEqual(self.llm.cancelled, 1)
+        self.assertEqual(request.replies, [])
+        self.assertEqual(stop.replies, [prompts.GIVE_UP_DONE])
+        self.assertEqual(
+            self.remembered(),
+            [
+                ("user", "count to a million"),
+                ("assistant", prompts.GAVE_UP_BEFORE_ANSWERING),
+                ("user", prompts.GIVE_UP_NOTE),
+                ("assistant", prompts.GIVE_UP_DONE),
+            ],
+        )
+        self.assertEqual(bot._replies, {})
+        self.assertEqual(bot._busy, set())
+        self.assertEqual(bot._given_up, set())
+
+    async def test_what_she_already_said_is_kept(self):
+        bot = self.make_bot(BlockingLLM(said=["Let me look that up."]))
+        request, running = await self.start_request(bot)
+        await self.give_up(bot)
+        await running
+        self.assertEqual(request.replies, ["Let me look that up."])
+        self.assertEqual(self.remembered()[1], ("assistant", "Let me look that up."))
+
+    async def test_the_next_reply_sees_that_she_gave_up(self):
+        bot = self.make_bot(BlockingLLM())
+        _, running = await self.start_request(bot)
+        await self.give_up(bot)
+        await running
+        self.llm.release.set()
+        follow_up = self.msg(self.mention("what's up?"))
+        await bot.on_message(follow_up)
+        self.assertEqual(follow_up.replies, ["Hello there!"])
+        shown = [m["content"] for m in self.llm.calls[-1]]
+        self.assertTrue(any(prompts.GIVE_UP_NOTE in content for content in shown))
+        self.assertIn(prompts.GIVE_UP_DONE, shown)
+
+    async def test_the_note_is_never_hidden_as_a_standing_rule(self):
+        for text in (prompts.GIVE_UP_NOTE, prompts.GIVE_UP_DONE, prompts.GIVE_UP_IDLE, prompts.GAVE_UP_BEFORE_ANSWERING):
+            self.assertFalse(styleguard.is_standing_instruction(text), text)
+
+    async def test_others_need_manage_messages_to_stop_someone_elses_reply(self):
+        bot = self.make_bot(BlockingLLM())
+        request, running = await self.start_request(bot)
+        stop = await self.give_up(bot, author=person("Bob", 2))
+        self.assertEqual(stop.replies, [prompts.GIVE_UP_DENIED])
+        self.assertEqual(self.llm.cancelled, 0)
+        self.llm.release.set()
+        await asyncio.wait_for(running, 1)
+        self.assertEqual(request.replies, ["Hello there!"])
+        self.assertNotIn(("user", prompts.GIVE_UP_NOTE), self.remembered())
+
+    async def test_moderators_stop_every_reply_in_the_channel_including_queued_ones(self):
+        bot = self.make_bot(BlockingLLM())
+        self.channel.can_manage = True
+        first, running = await self.start_request(bot)
+        second = self.msg(self.mention("and you?"), author=person("Bob", 2))
+        queued = asyncio.create_task(bot.on_message(second))
+        await asyncio.sleep(0.01)  # waiting for the channel lock
+        stop = await self.give_up(bot, author=person("Carol", 3))
+        await asyncio.wait_for(asyncio.gather(running, queued), 1)
+        self.assertEqual(len(self.llm.calls), 1)  # the queued one never reached the model
+        self.assertEqual((first.replies, second.replies), ([], []))
+        self.assertEqual(stop.replies, [prompts.GIVE_UP_DONE])
+        self.assertEqual([content for _, content in self.remembered()][0::2], ["count to a million", prompts.GIVE_UP_NOTE])
+
+    async def test_with_nothing_running_it_still_leaves_the_note(self):
+        bot = self.make_bot()
+        stop = await self.give_up(bot)
+        self.assertEqual(stop.replies, [prompts.GIVE_UP_IDLE])
+        self.assertEqual(self.remembered(), [("user", prompts.GIVE_UP_NOTE), ("assistant", prompts.GIVE_UP_IDLE)])
+
+    async def test_other_bots_cannot_use_it(self):
+        bot = self.make_bot(BlockingLLM(), respond_to_bots=True)
+        _, running = await self.start_request(bot)
+        robot = person("Robo", 50)
+        robot.bot = True
+        stop = await self.give_up(bot, author=robot)
+        self.assertEqual(stop.replies, [])
+        self.assertEqual(self.llm.cancelled, 0)
+        self.llm.release.set()
+        await asyncio.wait_for(running, 1)
 
 
 class SpeakerAttributionTests(BotTestCase):
