@@ -201,6 +201,16 @@ DISCORD_ACTION_RULES = (
     "- Ask before anything that can't be undone, like deleting."
 )
 
+DISCORD_SERVER_RULES = (
+    "Other servers:\n"
+    "- You are in other Discord servers too; list_servers shows them. To look at a channel of another "
+    "server, pass its name or ID as 'server' to list_channels or read_messages."
+)
+DISCORD_SERVER_ACTION_RULES = (
+    "- send_message posts in a channel of this server. To post in a different server, use send_to_server "
+    "with that server's name or ID and the channel's name or ID."
+)
+
 MULTI_TURN_RULES = (
     "Working over several turns:\n"
     "- After you use a tool you get another turn, and another after that, so you can do longer tasks "
@@ -398,6 +408,7 @@ def build_system_prompt(
     time_awareness: bool = False,
     discord_tools: bool = False,
     discord_actions: bool = False,
+    discord_cross_server: bool = False,
 ) -> str:
     """Only the *date* goes in (not the time) so the prompt stays identical all day and
     LM Studio can reuse its cached prompt processing between requests."""
@@ -425,6 +436,8 @@ def build_system_prompt(
         parts.append(DISCORD_RULES)
         if discord_actions:
             parts.append(DISCORD_ACTION_RULES)
+        if discord_cross_server:
+            parts.append(DISCORD_SERVER_RULES + ("\n" + DISCORD_SERVER_ACTION_RULES if discord_actions else ""))
     if multi_turn and (web_search or fetch_pages or computer_tools or browser_tools or discord_tools):
         parts.append(MULTI_TURN_RULES)
     return "\n\n".join(parts)

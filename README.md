@@ -203,13 +203,22 @@ With `DISCORD_TOOLS=true` the model can look around Discord in the middle of a r
 last messages of a channel, up to 50, or those around a message), `lookup_member` (names, join date, roles), `list_pins` and
 `list_threads`, plus `member_statuses` (who is online, idle or busy, and what they are doing) when `PRESENCE_INTENT=true`; without
 it the bot logs at startup that the tool is not offered. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`, `edit_message` and `delete_message` (her
-own messages only), `start_thread`, `send_message` (another channel), `pin`/`unpin` and `create_poll`. The code is in `discord_tools.py`.
+own messages only), `start_thread`, `send_message` (another channel of this server), `pin`/`unpin` and `create_poll`. The code is
+in `discord_tools.py`.
 
 - **She acts as herself.** Every action uses the bot's own permissions, so what you allow the bot in a server is what anyone who
   can mention her can get done through her. Grant permissions with that in mind.
 - **Her own permissions.** She is treated like any other member: she can see the channels her roles let her see, whoever asks,
   and Discord refuses what her roles don't allow. A private thread is only seen once she is in it. Channels in other servers are out
   of reach unless `DISCORD_CROSS_SERVER=true`.
+- **Other servers.** With `DISCORD_CROSS_SERVER=true` she also gets `list_servers`, and `send_to_server` with `DISCORD_ACTIONS`.
+  Posting elsewhere is split in two on purpose: `send_message` is for this server and `send_to_server` (which requires a `server`)
+  for another one, because with one tool the model kept looking for the other server's channel in this one. `list_channels`,
+  `read_messages`, `list_pins` and `list_threads` take an optional `server` too. If `send_message` gets a channel name that only
+  exists in another server, the error names that server and points to `send_to_server`.
+- **Names or IDs.** A server is its name or ID; a channel is `#name`, an ID, a `<#id>` mention or a channel link. Names ignore case,
+  and if nothing matches exactly, spaces, dashes and emoji too (`Tea Time` finds `#🍵-tea-time`). A name that fits several is
+  refused with their IDs, never guessed.
 - **Handles, not IDs.** The model never sees message IDs. `read_messages` and `list_pins` label each message `[m1]`, `[m2]`, ...
   and the action tools take those, `this` (the message she is answering), `replied` (the one it replies to), `mine` / `mine-2`
   (her latest messages in this reply), or a message link the sender wrote. Anything else, like an ID the model made up, is refused.
@@ -333,7 +342,7 @@ All settings are environment variables (or lines in `.env`).
 | `DISCORD_TOOLS` | `false` | Let the model read Discord: server info, channels, recent messages, members, pins, threads (see "Discord tools") |
 | `DISCORD_ACTIONS` | `false` | Also let it react, edit or delete its own messages, start threads, post in other channels, pin and start polls (needs `DISCORD_TOOLS`) |
 | `DISCORD_MAX_ACTIONS` | `5` | Most Discord actions in one reply (minimum `1`) |
-| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach channels in other servers (ones the sender is in too) |
+| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach other servers she is in: `list_servers`, `send_to_server`, and a `server` argument on the channel tools |
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |

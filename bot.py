@@ -673,6 +673,7 @@ class EmiliaBot(discord.Client):
             time_awareness=self.settings.time_awareness,
             discord_tools=self.settings.discord_tools,
             discord_actions=self.settings.discord_actions and not from_bot,
+            discord_cross_server=self.settings.discord_cross_server,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:

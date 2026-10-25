@@ -20,8 +20,9 @@
 
 Read tools (DISCORD_TOOLS) show server info, channels, recent messages, members, pins and threads.
 Action tools (DISCORD_ACTIONS) react, edit or delete her own messages, start a thread, post in
-another channel, pin and start polls. She acts as herself, a member like any other: what her roles
-allow is what she can do, whoever asks. She acts only on messages from the conversation or that she
+another channel (send_message) or another server (send_to_server, with DISCORD_CROSS_SERVER), pin
+and start polls. Channels and servers can be named or given by ID. She acts as herself, a member
+like any other: what her roles allow is what she can do, whoever asks. She acts only on messages from the conversation or that she
 read during this reply: the model
 points at them with short handles ("m3", "this", "replied", "mine"), never with raw IDs it could
 make up. Text she writes through a tool goes through the same checks as a reply (see `Outgoing`).
@@ -61,6 +62,8 @@ MAX_POLL_HOURS = 768  # 32 days, Discord's limit
 
 _LINK = re.compile(r"https?://(?:www\.|ptb\.|canary\.)?discord(?:app)?\.com/channels/(?:\d+|@me)/(\d+)/(\d+)", re.IGNORECASE)
 _CHANNEL_MENTION = re.compile(r"<#(\d+)>")
+_CHANNEL_LINK = re.compile(r"https?://(?:www\.|ptb\.|canary\.)?discord(?:app)?\.com/channels/(?:\d+|@me)/(\d+)/?", re.IGNORECASE)
+_HERE = {"", "here", "this", "this channel", "this server"}
 _CUSTOM_EMOJI = re.compile(r"<a?:(\w+):(\d+)>")
 
 
@@ -166,6 +169,20 @@ def _is_category(channel: Any) -> bool:
     return isinstance(channel, discord.CategoryChannel) or getattr(channel, "type", None) == discord.ChannelType.category
 
 
+def _loose(name: str) -> str:
+    """A name with case, spaces, dashes and emoji left out, so "General Chat" finds "💬-general-chat"."""
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
+
+
+def _named(items: list[Any], wanted: str) -> list[Any]:
+    """The items called `wanted`: exact matches (ignoring case) if there are any, otherwise loose ones."""
+    wanted = wanted.strip().casefold()
+    exact = [item for item in items if str(item.name).casefold() == wanted]
+    if exact or not _loose(wanted):
+        return exact
+    return [item for item in items if _loose(str(item.name)) == _loose(wanted)]
+
+
 def _short(text: str, max_chars: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
@@ -226,33 +243,84 @@ class DiscordTools:
             return False  # a private thread she hasn't joined
         return bool(perms.view_channel and (perms.read_message_history or not history))
 
-    async def _channel(self, ctx: DiscordContext, value: Any, *, history: bool = True) -> Any:
-        """A channel the model named: empty for this one, "#name" in this server, or a <#id> mention or ID."""
+    def _guild(self, ctx: DiscordContext, value: Any) -> Any:
+        """A server the model named: empty for this one, or one she is in, by name or ID."""
+        raw = " ".join(str(value or "").split())
+        here = ctx.message.guild
+        if raw.lower() in _HERE or (here is not None and raw == str(here.id)):
+            if here is None:
+                raise _Refused("This conversation is a DM, not a server: say which server.")
+            return here
+        guilds = list(self.client.guilds)
+        if raw.isdigit():
+            found = [g for g in guilds if g.id == int(raw)]
+        else:
+            found = _named(guilds, raw)
+        if len(found) > 1:
+            options = ", ".join(f"{_name(g.name)} (ID {g.id})" for g in found[:5])
+            raise _Refused(f"Several servers could be {raw!r}: {options}. Use the ID of the one you mean.")
+        if not found:
+            hint = " list_servers shows the ones you are in." if self.cross_server else ""
+            raise _Refused(f"You aren't in a server called {raw!r}.{hint}")
+        if not self.cross_server and (here is None or found[0].id != here.id):
+            raise _Refused("You can only reach this server, not other ones.")
+        return found[0]
+
+    async def _channel(self, ctx: DiscordContext, value: Any, *, history: bool = True, server: Any = None) -> Any:
+        """A channel the model named: empty for this one, "#name" (in this server, or in `server`), or a
+        <#id> mention, channel link or ID. `server` is a server name or ID; empty means this one."""
         raw = str(value or "").strip()
-        if raw.lower() in {"", "here", "this", "this channel"}:
+        guild = self._guild(ctx, server) if str(server or "").strip() else None
+        if raw.lower() in _HERE:
+            if guild is not None and guild.id != getattr(ctx.message.guild, "id", None):
+                raise _Refused(f"Say which channel of {_name(guild.name)}; list_channels with that server lists them.")
             return ctx.redirect or ctx.message.channel
         channel = None
-        mention = _CHANNEL_MENTION.fullmatch(raw)
-        if mention or raw.isdigit():
-            channel_id = int(mention.group(1) if mention else raw)
+        by_id = _CHANNEL_MENTION.fullmatch(raw) or _CHANNEL_LINK.fullmatch(raw.strip("<>"))
+        if by_id or raw.isdigit():
+            channel_id = int(by_id.group(1) if by_id else raw)
             channel = self.client.get_channel(channel_id)
             if channel is None:
                 try:
                     channel = await self.client.fetch_channel(channel_id)
                 except discord.HTTPException:
                     channel = None
-        elif ctx.message.guild is not None:
-            wanted = raw.lstrip("#").strip().lower()
-            guild = ctx.message.guild
-            candidates = [*guild.text_channels, *getattr(guild, "voice_channels", []), *guild.threads]
-            matches = [c for c in candidates if c.name.lower() == wanted]
-            visible = [c for c in matches if await self._can_see(ctx, c, history=history)]
+            where = getattr(channel, "guild", None)
+            if channel is not None and guild is not None and getattr(where, "id", None) != guild.id:
+                raise _Refused(f"That channel isn't in {_name(guild.name)}; it is in {_name(getattr(where, 'name', 'a DM'))}.")
+        elif guild is not None or ctx.message.guild is not None:
+            guild = guild or ctx.message.guild
+            wanted = raw.lstrip("#").strip()
+            visible = [c for c in _named(self._channels_of(guild), wanted) if await self._can_see(ctx, c, history=history)]
             if len(visible) > 1:
                 raise _Refused(f"Several channels are called {raw!r}; use the ID that list_channels shows.")
             channel = visible[0] if visible else None
+            if channel is None and not str(server or "").strip():
+                await self._elsewhere(ctx, wanted, history=history)
         if channel is None or not await self._can_see(ctx, channel, history=history):
-            raise _Refused(f"There is no channel {raw!r} that you can see.")
+            where = f" in {_name(guild.name)}" if guild is not None else ""
+            raise _Refused(f"There is no channel {raw!r}{where} that you can see. list_channels shows them, with their IDs.")
         return channel
+
+    @staticmethod
+    def _channels_of(guild: Any) -> list[Any]:
+        return [*guild.text_channels, *getattr(guild, "voice_channels", []), *getattr(guild, "forums", []), *guild.threads]
+
+    async def _elsewhere(self, ctx: DiscordContext, wanted: str, *, history: bool) -> None:
+        """When a channel name isn't in this server, say which other servers have one, so the model asks for the right server."""
+        if not self.cross_server:
+            return
+        here = getattr(ctx.message.guild, "id", None)
+        hits = []
+        for guild in self.client.guilds:
+            if guild.id != here:
+                if any([await self._can_see(ctx, c, history=history) for c in _named(self._channels_of(guild), wanted)]):
+                    hits.append(f"{_name(guild.name)} (ID {guild.id})")
+        if hits:
+            raise _Refused(
+                f"#{_name(wanted)} isn't in this server, but there is one in {', '.join(hits[:5])}. "
+                "Name that server too (the 'server' argument; to post there, use send_to_server)."
+            )
 
     async def _message(self, ctx: DiscordContext, value: Any) -> discord.Message:
         """The message a handle points at: "this", "replied", "mine" / "mine-2", "m3" from read_messages,
@@ -351,9 +419,25 @@ class DiscordTools:
                 lines.append("Roles: " + ", ".join(roles) + ("…" if len(guild.roles) - 1 > MAX_ROLES else ""))
         return ToolResult("\n".join(lines))
 
+    async def list_servers(self, arguments: dict[str, Any]) -> ToolResult:
+        """The servers she is in. Only offered with DISCORD_CROSS_SERVER."""
+        ctx = self._context()
+        here = getattr(ctx.message.guild, "id", None)
+        lines = [
+            f"{_name(g.name)}{' (this server)' if g.id == here else ''} [ID {g.id}], {g.member_count or 'unknown'} members"
+            for g in self.client.guilds
+        ]
+        if not lines:
+            return ToolResult("You aren't in any server.")
+        header = "Servers you are in. list_channels takes one of these (by name or ID) to show its channels:"
+        return ToolResult(self._fit(header, lines[:MAX_LIST]))
+
     async def list_channels(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        guild = ctx.message.guild
+        if str(arguments.get("server") or "").strip():
+            guild = self._guild(ctx, arguments["server"])
+        else:
+            guild = ctx.message.guild
         if guild is None:
             return ToolResult("This conversation is a DM: there are no other channels here.")
         lines = []
@@ -378,7 +462,7 @@ class DiscordTools:
 
     async def read_messages(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        channel = await self._channel(ctx, arguments.get("channel"))
+        channel = await self._channel(ctx, arguments.get("channel"), server=arguments.get("server"))
         try:
             limit = min(max(int(arguments.get("limit") or DEFAULT_READ), 1), MAX_READ)
         except (TypeError, ValueError):
@@ -434,7 +518,7 @@ class DiscordTools:
 
     async def list_pins(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        channel = await self._channel(ctx, arguments.get("channel"))
+        channel = await self._channel(ctx, arguments.get("channel"), server=arguments.get("server"))
         try:
             pins = [m async for m in channel.pins(limit=MAX_READ)]
         except discord.HTTPException as exc:
@@ -447,7 +531,7 @@ class DiscordTools:
 
     async def list_threads(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        channel = await self._channel(ctx, arguments.get("channel"), history=False)
+        channel = await self._channel(ctx, arguments.get("channel"), history=False, server=arguments.get("server"))
         threads = list(getattr(channel, "threads", []))
         archived = getattr(channel, "archived_threads", None)
         if archived is not None:
@@ -600,8 +684,26 @@ class DiscordTools:
         return ToolResult(f'Started the thread "{name}". Everything else you write in this reply goes into the thread.')
 
     async def send_message(self, arguments: dict[str, Any]) -> ToolResult:
+        """Post in another channel of this server (or any channel she can reach, given by ID)."""
         ctx = self._context()
-        channel = await self._channel(ctx, arguments.get("channel"), history=False)
+        return await self._post(ctx, await self._channel(ctx, arguments.get("channel"), history=False), arguments)
+
+    async def send_to_server(self, arguments: dict[str, Any]) -> ToolResult:
+        """Post in a channel of another server. Only offered with DISCORD_CROSS_SERVER."""
+        ctx = self._context()
+        if not str(arguments.get("server") or "").strip():
+            raise _Refused("Say which server ('server': its name or ID). For a channel of this server, use send_message.")
+        channel = await self._channel(ctx, arguments.get("channel"), history=False, server=arguments["server"])
+        return await self._post(ctx, channel, arguments)
+
+    def _label(self, ctx: DiscordContext, channel: Any) -> str:
+        """#name, plus its server when that isn't the one the conversation is in."""
+        guild = getattr(channel, "guild", None)
+        if guild is not None and guild.id != getattr(ctx.message.guild, "id", None):
+            return f"{_channel_label(channel)} in {_name(guild.name)}"
+        return _channel_label(channel)
+
+    async def _post(self, ctx: DiscordContext, channel: Any, arguments: dict[str, Any]) -> ToolResult:
         if channel.id in {ctx.message.channel.id, getattr(ctx.redirect, "id", None)}:
             return ToolResult("That's the channel you are talking in: just write your reply instead.")
         if not hasattr(channel, "send"):
@@ -618,13 +720,17 @@ class DiscordTools:
         except discord.HTTPException as exc:
             log.info("Could not post in channel %s (%s)", channel.id, exc)
             if not sent:
-                return ToolResult(f"Error: you can't post in {_channel_label(channel)}.")
+                return ToolResult(f"Error: you can't post in {self._label(ctx, channel)}.")
         ctx.posted.extend(sent)
         handle = ctx.handles.add(sent[-1])
         if self.remember is not None:
-            marker = prompts.SENT_HERE_MARKER.format(who=_name(ctx.sender.display_name), channel=_channel_label(ctx.message.channel))
+            origin = _channel_label(ctx.message.channel)
+            here = getattr(ctx.message.guild, "id", None)
+            if here is not None and here != getattr(getattr(channel, "guild", None), "id", None):
+                origin += f" (in {_name(ctx.message.guild.name)})"
+            marker = prompts.SENT_HERE_MARKER.format(who=_name(ctx.sender.display_name), channel=origin)
             await self.remember(str(channel.id), marker, out.plain)
-        return ToolResult(f"Posted in {_channel_label(channel)} as [{handle}].")
+        return ToolResult(f"Posted in {self._label(ctx, channel)} as [{handle}].")
 
     async def _pin(self, arguments: dict[str, Any], pin: bool) -> ToolResult:
         ctx = self._context()
@@ -677,13 +783,24 @@ def _schema(name: str, description: str, properties: dict[str, Any] | None = Non
     return {"name": name, "description": description, "parameters": {"type": "object", "properties": properties or {}, "required": required or []}}
 
 
-_CHANNEL = {"channel": {"type": "string", "description": "A channel name like #general, or an ID from list_channels. Leave out for this channel."}}
+_CHANNEL = {
+    "channel": {
+        "type": "string",
+        "description": "A channel name like #general, a channel ID or link, or <#id>. Leave out for this channel.",
+    }
+}
+_SERVER = {
+    "server": {
+        "type": "string",
+        "description": "Only for a channel in another server: that server's name or ID (list_servers shows them). Leave out for this server.",
+    }
+}
 _MESSAGE = {"message": {"type": "string", "description": "A message handle: m3 (from read_messages), this, replied, mine, or a message link the sender wrote."}}
 _EMOJI = {"emoji": {"type": "string", "description": "A unicode emoji, or :name: of a custom emoji of this server."}}
 
 READ_TOOLS = {
     "discord_info": _schema("discord_info", "How many servers you are in, your uptime, and about this server: name, member count, roles."),
-    "list_channels": _schema("list_channels", "List the channels and threads of this server that you can see."),
+    "list_channels": _schema("list_channels", "List the channels and threads of this server that you can see, with their IDs."),
     "read_messages": _schema(
         "read_messages",
         "Read recent messages of this channel or another one, oldest first, each with a handle like [m3]. "
@@ -726,7 +843,7 @@ ACTION_TOOLS = {
     ),
     "send_message": _schema(
         "send_message",
-        "Post a message in another channel of this server.",
+        "Post a message in another channel of THIS server. To post in a different server, use send_to_server instead.",
         {**_CHANNEL, "text": {"type": "string", "description": "What to post."}},
         ["channel", "text"],
     ),
@@ -745,8 +862,26 @@ ACTION_TOOLS = {
     ),
 }
 
-READ_TOOL_NAMES = frozenset(READ_TOOLS) | frozenset(STATUS_TOOLS)
-ACTION_TOOL_NAMES = frozenset(ACTION_TOOLS)
+# Only with DISCORD_CROSS_SERVER. The channel tools then also take a 'server' argument (see _with_server).
+SERVER_READ_TOOLS = {
+    "list_servers": _schema("list_servers", "List the Discord servers you are in, with their IDs."),
+}
+SERVER_ACTION_TOOLS = {
+    "send_to_server": _schema(
+        "send_to_server",
+        "Post a message in a channel of a DIFFERENT server than this one. For a channel of this server, use send_message.",
+        {
+            "server": {"type": "string", "description": "The other server's name or ID (list_servers shows them)."},
+            "channel": {"type": "string", "description": "A channel of that server: its name like #general, or its ID."},
+            "text": {"type": "string", "description": "What to post."},
+        },
+        ["server", "channel", "text"],
+    ),
+}
+_TAKES_SERVER = ("list_channels", "read_messages", "list_pins", "list_threads")
+
+READ_TOOL_NAMES = frozenset(READ_TOOLS) | frozenset(STATUS_TOOLS) | frozenset(SERVER_READ_TOOLS)
+ACTION_TOOL_NAMES = frozenset(ACTION_TOOLS) | frozenset(SERVER_ACTION_TOOLS)
 BOT_SAFE_TOOLS = frozenset({"react", "unreact"})  # the action tools still offered when the sender is a bot
 QUIET_TOOLS = frozenset({"react", "unreact"})  # visible by themselves: no tool line in the chat
 
@@ -765,6 +900,8 @@ _LABELS = {
     "delete_message": ("🗑️ Deleting my message", None),
     "start_thread": ("🧵 Starting thread", "name"),
     "send_message": ("📨 Posting in", "channel"),
+    "list_servers": ("🗺️ Looking at my servers", None),
+    "send_to_server": ("📨 Posting in", "channel"),
     "pin": ("📌 Pinning a message", None),
     "unpin": ("📌 Unpinning a message", None),
     "create_poll": ("📊 Starting a poll:", "question"),
@@ -786,10 +923,24 @@ class _DiscordTool:
         text, key = _LABELS[self.name]
         if self.name == "read_messages" and not arguments.get("channel"):
             return "👀 Reading the chat"
+        if arguments.get("server") and (self.name == "send_to_server" or self.name in _TAKES_SERVER):
+            return f"{self.describe({k: v for k, v in arguments.items() if k != 'server'})} in {code_span(arguments['server'])}"
         return f"{text} {code_span(arguments.get(key) or '') if key else ''}".rstrip()
 
 
+def _with_server(schema: dict[str, Any]) -> dict[str, Any]:
+    """`schema` with the optional 'server' argument added, for when other servers are in reach."""
+    parameters = {**schema["parameters"], "properties": {**schema["parameters"]["properties"], **_SERVER}}
+    return {**schema, "parameters": parameters}
+
+
 def discord_tools(tools: DiscordTools, *, actions: bool = False, statuses: bool = False) -> list[_DiscordTool]:
-    """The read tools, plus member_statuses if `statuses` (it needs the Presence Intent) and the action tools if `actions`."""
+    """The read tools, plus member_statuses if `statuses` (it needs the Presence Intent) and the action tools if `actions`.
+    With `tools.cross_server`, also list_servers and send_to_server, and the channel tools take a 'server'."""
     schemas = {**READ_TOOLS, **(STATUS_TOOLS if statuses else {}), **(ACTION_TOOLS if actions else {})}
+    if tools.cross_server:
+        schemas.update(SERVER_READ_TOOLS)
+        schemas.update({name: _with_server(schemas[name]) for name in _TAKES_SERVER})
+        if actions:
+            schemas.update(SERVER_ACTION_TOOLS)
     return [_DiscordTool(tools, name, schema) for name, schema in schemas.items()]
