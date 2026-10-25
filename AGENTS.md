@@ -10,7 +10,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 
 | File | Role |
 |---|---|
-| `bot.py` | `EmiliaBot(discord.Client)`: the mention rule (`_is_for_me`), handling a message (`_handle` → `_respond`), `!forget`/`!about`/`!forgetme`, member lookup and pings (`link_mentions`, `_lookup_members`), restart handoff, `main()` |
+| `bot.py` | `EmiliaBot(discord.Client)`: the mention rule (`_is_for_me`), handling a message (`_handle` → `_respond`), replies and forwards as context (`_quoted_context`, `_note_forward`, `_forwarded_context`), `!forget`/`!about`/`!forgetme`, member lookup and pings (`link_mentions`, `_lookup_members`), restart handoff, `main()` |
 | `llm.py` | `LMStudioClient`: HTTP via aiohttp, model selection, the tool-calling loop in `chat()` (including multi-turn mode and the built-in `stop_talking` control), parsing of tool calls the model prints as text (`parse_inline_calls`) |
 | `tooling.py` | The `Tool` protocol (`name`, `schema`, `async run(arguments) -> ToolResult`), `ToolResult` |
 | `websearch.py` | `WebSearchTool` over `ddgs`; swap the engine by replacing `search_sync()` only |

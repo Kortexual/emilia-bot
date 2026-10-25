@@ -45,6 +45,10 @@ Everything stays on your machine, apart from the web searches the model chooses 
 
 - `@Emilia what's the capital of Australia?` (mention the bot *user*; `@everyone` and role pings are ignored)
 - Reply to someone's message and mention the bot, e.g. `@Emilia is this true?`: the message you replied to is included as context.
+- Forward a message with a comment that mentions the bot, e.g. `@Emilia look at what Kiwi said lmao`: Emilia sees what you forwarded,
+  with who wrote it (if she can see the original's channel), where and when. Discord posts the forward and your comment as two
+  messages, so your next message in that channel within a minute counts as the comment. In a DM a forward on its own is answered too.
+  The forward's author is only named: forwarding someone's message never lets Emilia ping them.
 - `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can ping the sender, people mentioned or replied to,
   and people in her memory of the channel. She can also ping someone in the server who is not in the conversation yet if **you type
   their name** in your message: `@Emilia ping Jack, dinner is ready` (see "Pinging" below).

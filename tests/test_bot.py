@@ -28,6 +28,7 @@ from unittest import mock
 
 import discord
 
+import bot as bot_module
 import browser
 import prompts
 from computer import computer_tools
@@ -193,6 +194,8 @@ class FakeMessage:
         guild=True,
         reference=None,
         kind=discord.MessageType.default,
+        snapshots=(),
+        created_at=None,
     ):
         self.id = next(_ids)
         self.content = content
@@ -204,6 +207,8 @@ class FakeMessage:
         self.guild = guild if guild not in (True, False, None) else (object() if guild else None)
         self.reference = reference
         self.type = kind
+        self.message_snapshots = list(snapshots)  # what a forward carries; Discord leaves its content empty
+        self.created_at = created_at or datetime.now(timezone.utc)
         self.replies = []
         self.allowed_mentions = []  # the AllowedMentions of every reply()
 
@@ -548,6 +553,156 @@ class ConversationTests(BotTestCase):
         # Whoever went second saw the first exchange in its history.
         lengths = sorted(len(call) for call in self.llm.calls)
         self.assertEqual(lengths, [2, 4])
+
+
+KIWI = person("Kiwi", 42)
+KITCHEN = SimpleNamespace(id=55, name="kitchen_slop")
+FORWARDED_AT = datetime(2026, 10, 23, 10, 29, tzinfo=timezone.utc)
+
+
+class ForwardTests(BotTestCase):
+    """Forwarded messages: Discord sends the forward and the sender's comment as two messages."""
+
+    def setUp(self):
+        super().setUp()
+        self.originals = {}  # message ID -> the original message, for fetch_message in KITCHEN
+        self.channels = {KITCHEN.id: KITCHEN, self.channel.id: self.channel}
+        KITCHEN.fetch_message = self.fetch_original
+        for name, value in (("get_channel", self.channels.get), ("get_user", lambda user_id: None)):
+            patcher = mock.patch.object(EmiliaBot, name, side_effect=value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def fetch_original(self, message_id):
+        if message_id not in self.originals:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown Message")
+        return self.originals[message_id]
+
+    def forward(self, content="<something funny>", *, author=None, channel_id=KITCHEN.id, findable=True, **kwargs):
+        """A forward of a message Kiwi wrote in #kitchen_slop, as it arrives: no text, no mentions, one snapshot."""
+        message_id = next(_ids)
+        if findable:
+            self.originals[message_id] = SimpleNamespace(id=message_id, author=KIWI)
+        snapshot = SimpleNamespace(
+            content=content, created_at=FORWARDED_AT, raw_mentions=[], raw_channel_mentions=[], cached_message=None
+        )
+        reference = SimpleNamespace(
+            type=discord.MessageReferenceType.forward, channel_id=channel_id, message_id=message_id, resolved=None
+        )
+        return self.msg("", author=author or person(), mentions=[], reference=reference, snapshots=[snapshot], **kwargs)
+
+    def last_prompt(self):
+        return self.llm.calls[-1][-1]["content"]
+
+    async def test_a_comment_after_a_forward_includes_what_was_forwarded(self):
+        bot = self.make_bot()
+        alice = person()
+        forward = self.forward(author=alice)
+        await bot.on_message(forward)
+        self.assertEqual(self.llm.calls, [])  # the forward alone doesn't mention the bot
+        comment = self.msg(self.mention("look at what Kiwi said lmao"), author=alice)
+        await bot.on_message(comment)
+        self.assertIn(
+            '(forwarded a message from Kiwi in #kitchen_slop on 2026-10-23 at 10:29 UTC: "<something funny>") '
+            "look at what Kiwi said lmao",
+            self.last_prompt(),
+        )
+        self.assertNotIn("replying to", self.last_prompt())
+        self.assertEqual(comment.replies, ["Hello there!"])
+        stored = self.memory.recent(str(self.channel.id), 10_000)
+        self.assertIn("<something funny>", stored[0].content)  # remembered like a quoted reply
+
+    async def test_the_author_is_someone_if_the_original_cannot_be_seen(self):
+        bot = self.make_bot()
+        await bot.on_message(self.forward(findable=False))
+        await bot.on_message(self.msg(self.mention("thoughts?")))
+        self.assertIn('(forwarded a message from someone in #kitchen_slop on 2026-10-23 at 10:29 UTC: "<something funny>")', self.last_prompt())
+
+    async def test_a_forward_within_the_same_channel_does_not_name_it(self):
+        bot = self.make_bot()
+        await bot.on_message(self.forward(channel_id=self.channel.id))
+        await bot.on_message(self.msg(self.mention("thoughts?")))
+        self.assertIn("forwarded a message from someone on 2026-10-23 at 10:29 UTC:", self.last_prompt())
+
+    async def test_the_forwarded_author_is_named_but_never_pinged(self):
+        bot = self.make_bot(llm=FakeLLM("@Kiwi that's hilarious"))
+        await bot.on_message(self.forward())
+        comment = self.msg(self.mention("lol"))
+        await bot.on_message(comment)
+        self.assertIn("forwarded a message from Kiwi", self.last_prompt())
+        self.assertEqual(comment.allowed_mentions[0].users, [])
+        self.assertNotIn("Kiwi is someone else", self.last_prompt())
+
+    async def test_only_the_senders_own_recent_forward_counts(self):
+        bot = self.make_bot()
+        await bot.on_message(self.forward(author=person("Bob", 2)))
+        await bot.on_message(self.msg(self.mention("hi")))  # Alice: Bob's forward is not hers
+        self.assertNotIn("forwarded", self.last_prompt())
+
+        await bot.on_message(self.forward(created_at=datetime.now(timezone.utc) - timedelta(minutes=5)))
+        await bot.on_message(self.msg(self.mention("hi again")))  # too long after her forward
+        self.assertNotIn("forwarded", self.last_prompt())
+
+        await bot.on_message(self.forward())
+        await bot.on_message(self.msg("something else first", mentions=[]))
+        await bot.on_message(self.msg(self.mention("and now?")))  # not the message right after it
+        self.assertNotIn("forwarded", self.last_prompt())
+
+    async def test_a_forward_is_used_once(self):
+        bot = self.make_bot()
+        await bot.on_message(self.forward())
+        await bot.on_message(self.msg(self.mention("first")))
+        await bot.on_message(self.msg(self.mention("second")))
+        self.assertIn("forwarded", self.llm.calls[0][-1]["content"])
+        self.assertNotIn("forwarded", self.llm.calls[1][-1]["content"])
+
+    async def test_a_forward_on_its_own_in_a_dm_is_answered(self):
+        bot = self.make_bot(respond_to_dms=True)
+        forward = self.forward(guild=False)
+        with mock.patch.object(bot_module, "FORWARD_COMMENT_WAIT", 0):
+            await bot.on_message(forward)
+        self.assertEqual(forward.replies, ["Hello there!"])
+        self.assertIn('forwarded a message from Kiwi in #kitchen_slop on 2026-10-23 at 10:29 UTC: "<something funny>")', self.last_prompt())
+
+    async def test_a_dm_forward_with_a_comment_is_answered_once(self):
+        bot = self.make_bot(respond_to_dms=True)
+        forward = self.forward(guild=False)
+        comment = self.msg("what do you think?", guild=False, mentions=[])
+        with mock.patch.object(bot_module, "FORWARD_COMMENT_WAIT", 0.05):
+            waiting = asyncio.create_task(bot.on_message(forward))
+            await asyncio.sleep(0)
+            await bot.on_message(comment)
+            await waiting
+        self.assertEqual(len(self.llm.calls), 1)
+        self.assertEqual(forward.replies, [])
+        self.assertEqual(comment.replies, ["Hello there!"])
+        self.assertIn('<something funny>") what do you think?', self.last_prompt())
+
+    async def test_forwarded_text_is_never_taken_as_a_command(self):
+        bot = self.make_bot(respond_to_dms=True)
+        await bot.on_message(self.msg("remember this", guild=False, mentions=[]))
+        with mock.patch.object(bot_module, "FORWARD_COMMENT_WAIT", 0):
+            await bot.on_message(self.forward("!forget", guild=False))
+        self.assertEqual(len(self.memory.recent(str(self.channel.id), 10_000)), 4)
+        self.assertIn('"!forget"', self.last_prompt())
+
+    async def test_replying_to_a_forward_shows_what_it_forwarded(self):
+        bot = self.make_bot()
+        bob = person("Bob", 2)
+        forward = self.forward("pineapple belongs on pizza", author=bob)
+        reference = SimpleNamespace(message_id=forward.id, resolved=forward)
+        await bot.on_message(self.msg(self.mention("is this true?"), reference=reference))
+        self.assertIn("""(replying to Bob: "pineapple belongs on pizza") is this true?""", self.last_prompt())
+
+    async def test_mentions_in_forwarded_text_are_made_readable(self):
+        bot = self.make_bot()
+        forward = self.forward(f"<@{KIWI.id}> and <@{BOT.id}> in <#{KITCHEN.id}> <@&77> <:blob:123>")
+        forward.message_snapshots[0].raw_mentions = [KIWI.id, BOT.id]
+        forward.message_snapshots[0].raw_channel_mentions = [KITCHEN.id]
+        with mock.patch.object(EmiliaBot, "get_user", side_effect={KIWI.id: KIWI}.get, create=True):
+            await bot.on_message(forward)
+            await bot.on_message(self.msg(self.mention("?")))
+        self.assertIn('"@Kiwi and @Emilia in #kitchen_slop @role :blob:"', self.last_prompt())
 
 
 class PingTests(BotTestCase):
