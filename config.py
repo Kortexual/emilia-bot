@@ -99,11 +99,11 @@ def _timezone(name: str) -> str:
     return raw
 
 
-def _channel_ids(name: str) -> tuple[int, ...]:
+def _channel_ids(name: str, kind: str = "channel") -> tuple[int, ...]:
     ids = []
     for part in _text(name).replace(",", " ").split():
         if not part.isdigit() or int(part) == 0:
-            raise ConfigError(f"{name} must be a list of Discord channel IDs separated by commas, got {part!r}")
+            raise ConfigError(f"{name} must be a list of Discord {kind} IDs separated by commas, got {part!r}")
         if int(part) not in ids:
             ids.append(int(part))
     return tuple(ids)
@@ -142,6 +142,11 @@ class Settings:
     discord_actions: bool = False  # opt-in, needs discord_tools: react, edit/delete her messages, threads, posts, pins, polls
     discord_max_actions: int = 5  # action tool calls per reply
     discord_cross_server: bool = False  # let the Discord tools reach channels in other servers the sender is in
+    discord_admin_tools: bool = False  # opt-in, needs discord_tools: moderation (timeouts, kicks, bans, roles, channel edits)
+    discord_admin_tools_require_confirmation: bool = True  # each moderation call must contain confirm=true
+    arbitrary_discord_tools: bool = False  # opt-in: discord_api, raw REST calls, for discord_owner_ids only
+    arbitrary_discord_tools_require_confirmation: bool = True  # each discord_api call other than GET must contain confirm=true
+    discord_owner_ids: tuple[int, ...] = ()  # user IDs of the bot's owners
     multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
@@ -212,6 +217,15 @@ class Settings:
         discord_actions = _flag("DISCORD_ACTIONS", cls.discord_actions)
         if discord_actions and not discord_tools:
             raise ConfigError("DISCORD_ACTIONS needs DISCORD_TOOLS=true as well")
+        discord_admin_tools = _flag("DISCORD_ADMIN_TOOLS", cls.discord_admin_tools)
+        if discord_admin_tools and not discord_tools:
+            raise ConfigError("DISCORD_ADMIN_TOOLS needs DISCORD_TOOLS=true as well")
+        arbitrary_discord_tools = _flag("ARBITRARY_DISCORD_TOOLS", cls.arbitrary_discord_tools)
+        owner_ids = _channel_ids("DISCORD_OWNER_IDS", "user")
+        if arbitrary_discord_tools and not discord_tools:
+            raise ConfigError("ARBITRARY_DISCORD_TOOLS needs DISCORD_TOOLS=true as well")
+        if arbitrary_discord_tools and not owner_ids:
+            raise ConfigError("ARBITRARY_DISCORD_TOOLS is on, but DISCORD_OWNER_IDS lists nobody to offer it to")
 
         return cls(
             discord_token=token,
@@ -241,6 +255,15 @@ class Settings:
             discord_actions=discord_actions,
             discord_max_actions=_number("DISCORD_MAX_ACTIONS", cls.discord_max_actions, int, minimum=1),
             discord_cross_server=_flag("DISCORD_CROSS_SERVER", cls.discord_cross_server),
+            discord_admin_tools=discord_admin_tools,
+            discord_admin_tools_require_confirmation=_flag(
+                "DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION", cls.discord_admin_tools_require_confirmation
+            ),
+            arbitrary_discord_tools=arbitrary_discord_tools,
+            arbitrary_discord_tools_require_confirmation=_flag(
+                "ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION", cls.arbitrary_discord_tools_require_confirmation
+            ),
+            discord_owner_ids=owner_ids,
             multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),

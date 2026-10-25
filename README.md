@@ -220,8 +220,30 @@ own messages only), `start_thread`, `send_message` (another channel), `pin`/`unp
   note about where it came from.
 - **Limits.** `DISCORD_MAX_ACTIONS` (default 5) caps the actions in one reply, so a model stuck in a loop can't spam. Reactions post
   no tool line (tools can set `quiet = True`), since they show by themselves. Read results are marked as untrusted, like search results.
-- **Bots and unprompted messages.** A bot sender (`RESPOND_TO_BOTS`) gets the read tools and reactions, but no other actions.
-  Messages she starts on her own get no tools at all, as before.
+- **Bots and unprompted messages.** A bot sender (`RESPOND_TO_BOTS`) gets the read tools and reactions, but no other actions,
+  moderation tools or `discord_api`. Messages she starts on her own get no tools at all, as before.
+
+**Moderation (`DISCORD_ADMIN_TOOLS=true`).** `remove_message` (someone else's), `timeout_member`, `kick_member`, `ban_member`,
+`unban_member`, `add_role`/`remove_role`, `edit_channel` (name, topic, slowmode) and `edit_server` (its name). These are where a
+mistake hurts, so they have more guards than the other actions:
+
+- **The sender must be allowed to do it themselves.** Kicking needs the sender to have *Kick Members*, removing a message needs
+  *Manage Messages* in that channel, and so on. A member or role is only touched if it ranks below the sender's highest role (the
+  server owner outranks everyone). She never moderates herself or the server owner.
+- **Confirmation.** With `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION=true` (the default) every call needs `confirm=true`, and the model
+  is told to set it only when the sender asked for exactly that action.
+- **Who is meant.** A member is named by a name that matches exactly one member, or by a message handle (`m3` means its author).
+  An ambiguous name is refused rather than guessed.
+- **Audit log.** Every action records who asked for it (and the reason, if given) in the server's audit log.
+
+**Raw API (`ARBITRARY_DISCORD_TOOLS=true`).** `discord_api` makes any Discord REST call (`GET /guilds/123/emojis`, ...) for things no
+curated tool covers. It is offered only to the users in `DISCORD_OWNER_IDS` (never to bots), which is required with it.
+Calls other than `GET` need `confirm=true` unless `ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION=false`, and count against
+`DISCORD_MAX_ACTIONS`. A body that can carry a message gets `allowed_mentions: {"parse": []}` forced in, so it still can't
+mass-ping, and its `content` goes through the reply checks. A few paths are always refused: OAuth2 and the bot's application,
+the gateway, interaction and webhook-token URLs, deleting or leaving a server, pruning and bulk bans (`API_DENYLIST` in
+`discord_tools.py`). The response is trimmed to `PAGE_MAX_CHARS`. Calls that keep showing up in the logs are good candidates for a
+curated tool.
 
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
@@ -332,6 +354,11 @@ All settings are environment variables (or lines in `.env`).
 | `DISCORD_ACTIONS` | `false` | Also let it react, edit or delete its own messages, start threads, post in other channels, pin and start polls (needs `DISCORD_TOOLS`) |
 | `DISCORD_MAX_ACTIONS` | `5` | Most Discord actions in one reply (minimum `1`) |
 | `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach channels in other servers (ones the sender is in too) |
+| `DISCORD_ADMIN_TOOLS` | `false` | Moderation: remove messages, time out, kick, ban, roles, channel and server edits; only for senders who have that permission (needs `DISCORD_TOOLS`) |
+| `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each moderation tool call |
+| `ARBITRARY_DISCORD_TOOLS` | `false` | Offer `discord_api`, raw Discord REST calls, to the users in `DISCORD_OWNER_IDS` (needs `DISCORD_TOOLS` and `DISCORD_OWNER_IDS`) |
+| `ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each `discord_api` call other than `GET` |
+| `DISCORD_OWNER_IDS` | empty | User IDs of the bot's owners, separated by commas |
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |

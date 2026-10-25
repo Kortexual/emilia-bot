@@ -28,6 +28,8 @@ import discord_tools
 import prompts
 from discord_tools import (
     ACTION_TOOL_NAMES,
+    ADMIN_TOOL_NAMES,
+    API_TOOL,
     BOT_SAFE_TOOLS,
     CONTEXT,
     READ_TOOL_NAMES,
@@ -635,6 +637,480 @@ class BotLevelTests(test_bot.BotTestCase):
         bot = self.make_bot(llm=test_bot.FakeLLM(text="Hello, anyone?"), discord_tools=True, discord_actions=True)
         await bot._speak_up(self.channel, str(self.channel.id))
         self.assertEqual(self.llm.tools_offered, [False])
+
+    def admin_bot(self, **settings):
+        return self.make_bot(
+            respond_to_bots=True,
+            discord_tools=True,
+            discord_actions=True,
+            discord_admin_tools=True,
+            arbitrary_discord_tools=True,
+            discord_owner_ids=(4242,),
+            **settings,
+        )
+
+    async def test_an_owner_is_offered_discord_api(self):
+        bot = self.admin_bot()
+        owner = test_bot.person("Owner", 4242)
+        await bot.on_message(self.msg(self.mention("hi"), author=owner))
+        self.assertNotIn(API_TOOL, self.llm.excludes[0])
+        system = self.llm.calls[0][0]["content"]
+        self.assertIn(prompts.DISCORD_API_RULES, system)
+        self.assertIn(prompts.DISCORD_ADMIN_RULES, system)
+
+    async def test_other_people_get_moderation_but_not_discord_api(self):
+        bot = self.admin_bot()
+        await bot.on_message(self.msg(self.mention("hi")))
+        excluded = self.llm.excludes[0]
+        self.assertIn(API_TOOL, excluded)
+        self.assertFalse(ADMIN_TOOL_NAMES & excluded)
+        system = self.llm.calls[0][0]["content"]
+        self.assertIn(prompts.DISCORD_ADMIN_RULES, system)
+        self.assertNotIn(prompts.DISCORD_API_RULES, system)
+
+    async def test_bots_get_no_moderation_and_no_discord_api_even_with_an_owner_id(self):
+        bot = self.admin_bot()
+        other = SimpleNamespace(id=4242, display_name="OtherBot", bot=True)  # an owner's ID, but a bot
+        await bot.on_message(self.msg(self.mention("hi"), author=other))
+        excluded = self.llm.excludes[0]
+        self.assertTrue(ADMIN_TOOL_NAMES <= excluded)
+        self.assertIn(API_TOOL, excluded)
+        system = self.llm.calls[0][0]["content"]
+        self.assertNotIn(prompts.DISCORD_ADMIN_RULES, system)
+        self.assertNotIn(prompts.DISCORD_API_RULES, system)
+
+
+# --- tier 3: moderation, and discord_api -----------------------------------------------------
+class Role:
+    def __init__(self, name, position, *, managed=False, default=False):
+        self.id = next(_ids)
+        self.name, self.position, self.managed, self._default = name, position, managed, default
+
+    def is_default(self):
+        return self._default
+
+    def __gt__(self, other):
+        return self.position > other.position
+
+    def __ge__(self, other):
+        return self.position >= other.position
+
+
+EVERYONE, MEMBER, MOD, ADMIN, HER_ROLE = Role("@everyone", 0, default=True), Role("Member", 1), Role("Mod", 5), Role("Admin", 8), Role("Emilia", 10)
+
+
+class Member:
+    def __init__(self, user_id, name, role, **permissions):
+        self.id, self.display_name, self.name, self.global_name, self.bot = user_id, name, name.lower(), None, False
+        self.top_role, self.roles = role, [EVERYONE, role]
+        self.guild_permissions = SimpleNamespace(**permissions)
+        self.calls = []
+
+    def __str__(self):
+        return self.name  # like a real Member: the username
+
+    async def kick(self, reason=None):
+        self.calls.append(("kick", reason))
+
+    async def timeout(self, until, reason=None):
+        self.calls.append(("timeout", until, reason))
+
+    async def add_roles(self, *roles, reason=None):
+        self.calls.append(("add", roles, reason))
+
+    async def remove_roles(self, *roles, reason=None):
+        self.calls.append(("remove", roles, reason))
+
+
+ALL = dict(kick_members=True, ban_members=True, moderate_members=True, manage_roles=True, manage_channels=True, manage_guild=True)
+
+
+class AdminGuild(Guild):
+    def __init__(self, members):
+        super().__init__(members=members)
+        self.owner_id = 3
+        self.roles = [EVERYONE, MEMBER, MOD, ADMIN, HER_ROLE]
+        self.banned = []
+        self.calls = []
+
+    async def ban(self, user, reason=None, delete_message_seconds=0):
+        self.calls.append(("ban", user.id, reason, delete_message_seconds))
+
+    async def unban(self, user, reason=None):
+        self.calls.append(("unban", user.id, reason))
+
+    async def bans(self, limit=1000):
+        for entry in self.banned:
+            yield entry
+
+    async def edit(self, name=None, reason=None):
+        self.calls.append(("edit", name, reason))
+
+
+class FakeHTTP:
+    def __init__(self, response=None, error=None):
+        self.response, self.error = response, error
+        self.requests = []  # (method, path, kwargs)
+        self.deleted = []
+
+    async def request(self, route, **kwargs):
+        self.requests.append((route.method, route.path, kwargs))
+        if self.error:
+            raise self.error
+        return self.response
+
+    async def delete_message(self, channel_id, message_id, reason=None):
+        self.deleted.append((channel_id, message_id, reason))
+
+
+class AdminToolTestCase(DiscordToolTestCase):
+    def setUp(self):
+        super().setUp()
+        self.alice = Member(1, "Alice", MOD, **ALL)  # the sender, a moderator
+        self.bob = Member(2, "Bob", MEMBER)
+        self.olive = Member(3, "Olive", ADMIN, **ALL)  # the server owner
+        self.boss = Member(4, "Boss", ADMIN)
+        self.sam1, self.sam2 = Member(5, "Sam", MEMBER), Member(6, "Sam", MEMBER)
+        self.her = Member(ME.id, "Emilia", HER_ROLE, **ALL)
+        self.guild = AdminGuild([self.alice, self.bob, self.olive, self.boss, self.sam1, self.sam2, self.her])
+        self.general = Channel(10, "general", self.guild)
+        self.client = Client(self.guild)
+        self.client.http = FakeHTTP()
+
+    def tools(self, **kwargs):
+        backend = DiscordTools(self.client, render=lambda m: m.content, owner_ids=(3,), **kwargs)
+        return {t.name: t for t in discord_tools.discord_tools(backend, actions=True, admin=True, api=True)}
+
+    def context(self, content="@Emilia hi", *, channel=None, author=None):
+        return super().context(content, channel=channel, author=author or self.alice)
+
+
+class ModerationTests(AdminToolTestCase):
+    async def test_confirmation_is_needed_by_default(self):
+        ctx = self.context()
+        result = await self.tools()["kick_member"].run({"member": "Bob"})
+        self.assertIn("Confirmation required", result.text)
+        self.assertEqual((self.bob.calls, ctx.actions), ([], 0))
+        result = await self.tools(admin_confirmation=False)["kick_member"].run({"member": "Bob"})
+        self.assertEqual(result.text, "Kicked Bob.")
+        self.assertEqual(ctx.actions, 1)
+
+    async def test_the_sender_needs_the_permission_herself_having_it_is_not_enough(self):
+        cases = [
+            ("kick_member", {"member": "Bob"}, "kick_members"),
+            ("ban_member", {"member": "Bob"}, "ban_members"),
+            ("timeout_member", {"member": "Bob", "minutes": 5}, "moderate_members"),
+            ("add_role", {"member": "Bob", "role": "Member"}, "manage_roles"),
+            ("edit_server", {"name": "Coffee Club"}, "manage_guild"),
+        ]
+        for name, arguments, permission in cases:
+            with self.subTest(tool=name):
+                setattr(self.alice.guild_permissions, permission, False)
+                ctx = self.context()
+                result = await self.tools()[name].run({**arguments, "confirm": True})
+                self.assertIn(f"doesn't have the {permission.replace('_', ' ').title()} permission", result.text)
+                self.assertEqual(ctx.actions, 0)
+                setattr(self.alice.guild_permissions, permission, True)
+        self.assertEqual((self.bob.calls, self.guild.calls), ([], []))
+
+    async def test_channel_permissions_count_for_messages_and_channels(self):
+        target = self.general.add("spam", author=self.bob)
+        self.context()
+        tools = self.tools()
+        self.general.overrides[self.alice.id] = perms(manage_messages=False, manage_channels=False)
+        result = await tools["remove_message"].run({"message": "m1", "confirm": True})
+        self.assertIn("Unknown message", result.text)  # no handle yet
+        await tools["read_messages"].run({})
+        result = await tools["remove_message"].run({"message": "m1", "confirm": True})
+        self.assertIn("Manage Messages permission", result.text)
+        result = await tools["edit_channel"].run({"topic": "tea", "confirm": True})
+        self.assertIn("Manage Channels permission", result.text)
+        self.assertEqual(self.client.http.deleted, [])
+        self.assertEqual(target.calls, [])
+
+    async def test_remove_message_with_permission(self):
+        target = self.general.add("spam", author=self.bob)
+        ctx = self.context()
+        ctx.posted.append(target)
+        self.general.overrides[self.alice.id] = perms(manage_messages=True)
+        tools = self.tools()
+        await tools["read_messages"].run({})
+        result = await tools["remove_message"].run({"message": "m1", "confirm": True, "reason": "spam"})
+        self.assertEqual(result.text, "Removed the message by Bob.")
+        (channel_id, message_id, reason), = self.client.http.deleted
+        self.assertEqual((channel_id, message_id), (10, target.id))
+        self.assertIn("alice", reason.lower())
+        self.assertIn("spam", reason)
+        self.assertEqual(ctx.posted, [])
+
+    async def test_kick_writes_who_asked_to_the_audit_log(self):
+        self.context()
+        result = await self.tools()["kick_member"].run({"member": "@Bob", "reason": "rude", "confirm": True})
+        self.assertEqual(result.text, "Kicked Bob.")
+        (kind, reason), = self.bob.calls
+        self.assertIn("(1)", reason)
+        self.assertIn("rude", reason)
+
+    async def test_target_by_mention_by_search_and_by_handle(self):
+        tools = self.tools()
+        ctx = self.context(content="@Emilia kick @Bob")
+        ctx.message.mentions = [self.bob]
+        await tools["kick_member"].run({"member": "Bob", "confirm": True})
+        self.assertEqual(len(self.bob.calls), 1)
+        ctx = self.context()
+        await tools["kick_member"].run({"member": "bob", "confirm": True})  # found by the member search
+        self.assertEqual(len(self.bob.calls), 2)
+        quoted = self.general.add("hi", author=self.bob)
+        ctx = self.context()
+        ctx.message.reference = SimpleNamespace(message_id=quoted.id, resolved=quoted)
+        result = await tools["kick_member"].run({"member": "replied", "confirm": True})
+        self.assertEqual(result.text, "Kicked Bob.")
+
+    async def test_target_by_a_message_link_the_sender_wrote(self):
+        quoted = self.general.add("hi", author=self.bob)
+        link = f"https://discord.com/channels/{self.guild.id}/{self.general.id}/{quoted.id}"
+        self.context(content=f"@Emilia kick whoever wrote {link}")
+        result = await self.tools()["kick_member"].run({"member": link, "confirm": True})
+        self.assertEqual(result.text, "Kicked Bob.")
+
+    async def test_refused_targets(self):
+        cases = {
+            "Sam": "Several members",
+            "Nobody": "No member",
+            "Emilia": "on yourself",
+            "Olive": "server owner",
+            "Boss": "isn't ranked below",
+            "Alice": "isn't ranked below",  # herself: not below her own top role
+        }
+        tools = self.tools()
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.context()
+                result = await tools["kick_member"].run({"member": name, "confirm": True})
+                self.assertIn(expected, result.text)
+        self.assertEqual(self.boss.calls, [])
+
+    async def test_the_owner_outranks_everyone(self):
+        self.context(author=self.olive)
+        result = await self.tools()["kick_member"].run({"member": "Boss", "confirm": True})
+        self.assertEqual(result.text, "Kicked Boss.")
+
+    async def test_timeouts(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["timeout_member"].run({"member": "Bob", "minutes": 90, "confirm": True})
+        self.assertEqual(result.text, "Timed out Bob for 1h 30m.")
+        result = await tools["timeout_member"].run({"member": "Bob", "minutes": 10**9, "confirm": True})
+        self.assertIn("28d", result.text)
+        result = await tools["timeout_member"].run({"member": "Bob", "minutes": 0, "confirm": True})
+        self.assertEqual(result.text, "Ended Bob's timeout.")
+        self.assertEqual([c[1] for c in self.bob.calls], [timedelta(minutes=90), timedelta(minutes=40320), None])
+        result = await tools["timeout_member"].run({"member": "Bob", "minutes": "soon", "confirm": True})
+        self.assertIn("whole number", result.text)
+
+    async def test_ban_and_unban(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["ban_member"].run({"member": "Bob", "delete_hours": 500, "confirm": True})
+        self.assertIn("last 168 hour(s)", result.text)
+        self.assertEqual(self.guild.calls[0][:2], ("ban", 2))
+        self.assertEqual(self.guild.calls[0][3], 168 * 3600)
+        gone = SimpleNamespace(id=77, name="trouble", global_name=None)
+        twins = [SimpleNamespace(id=78, name="twin", global_name=None), SimpleNamespace(id=79, name="other", global_name="twin")]
+        self.guild.banned = [SimpleNamespace(user=u) for u in (gone, *twins)]
+        result = await tools["unban_member"].run({"name": "Trouble", "confirm": True})
+        self.assertEqual(result.text, "Lifted the ban on trouble.")
+        self.assertEqual(self.guild.calls[-1][:2], ("unban", 77))
+        for name, expected in (("twin", "more than one"), ("nobody", "nobody")):
+            with self.subTest(name=name):
+                result = await tools["unban_member"].run({"name": name, "confirm": True})
+                self.assertIn(expected, result.text)
+        self.assertEqual(len(self.guild.calls), 2)
+
+    async def test_roles(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["add_role"].run({"member": "Bob", "role": "member", "confirm": True})
+        self.assertEqual(result.text, "Gave the Member role to Bob.")
+        result = await tools["remove_role"].run({"member": "Bob", "role": "Member", "confirm": True})
+        self.assertEqual(result.text, "Took the Member role from Bob.")
+        self.assertEqual([(c[0], c[1]) for c in self.bob.calls], [("add", (MEMBER,)), ("remove", (MEMBER,))])
+        self.guild.roles += [Role("Twin", 2), Role("twin", 2), Role("Bots", 3, managed=True)]
+        cases = {"Nope": "no role", "Twin": "more than one", "Bots": "managed", "Admin": "isn't below", "Mod": "isn't below", "@everyone": "no role"}
+        for role, expected in cases.items():
+            with self.subTest(role=role):
+                result = await tools["add_role"].run({"member": "Bob", "role": role, "confirm": True})
+                self.assertIn(expected, result.text)
+        self.assertEqual(len(self.bob.calls), 2)
+
+    async def test_edit_channel(self):
+        edits = []
+
+        async def edit(reason=None, **changes):
+            edits.append((changes, reason))
+
+        self.general.edit = edit
+        self.context()
+        tools = self.tools()
+        self.general.overrides[self.alice.id] = perms(manage_channels=True)
+        result = await tools["edit_channel"].run({"confirm": True})
+        self.assertIn("say what to change", result.text)
+        result = await tools["edit_channel"].run({"topic": "all about tea", "slowmode_seconds": 99999, "confirm": True})
+        self.assertEqual(result.text, "Changed topic, slowmode_delay of #general.")
+        self.assertEqual(edits[0][0], {"topic": "all about tea", "slowmode_delay": 21600})
+        self.assertIn(("all about tea", False), self.prepare.calls)
+        result = await tools["edit_channel"].run({"name": "LEAK", "confirm": True})
+        self.assertIn("can't be used", result.text)
+        self.assertEqual(len(edits), 1)
+
+    async def test_edit_server(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["edit_server"].run({"name": "Coffee Club", "confirm": True})
+        self.assertEqual(result.text, 'Renamed the server to "Coffee Club".')
+        self.assertEqual(self.guild.calls[0][:2], ("edit", "Coffee Club"))
+        self.assertIn(("Coffee Club", False), self.prepare.calls)
+        result = await tools["edit_server"].run({"name": "LEAK", "confirm": True})
+        self.assertIn("allowed", result.text)
+
+    async def test_moderation_only_in_a_server(self):
+        dm = Channel(60, "dm", None)
+        self.context(channel=dm)
+        result = await self.tools()["kick_member"].run({"member": "Bob", "confirm": True})
+        self.assertIn("only works in a server", result.text)
+
+    async def test_the_budget_counts_moderation_too(self):
+        ctx = self.context()
+        ctx.actions = 5
+        result = await self.tools()["kick_member"].run({"member": "Bob", "confirm": True})
+        self.assertIn("all 5 Discord actions", result.text)
+        self.assertEqual(self.bob.calls, [])
+
+    def test_tool_lines_and_sets(self):
+        tools = self.tools()
+        self.assertEqual(tools["ban_member"].describe({"member": "Bob"}), "🔨 Banning `Bob`")
+        self.assertEqual(tools["remove_message"].describe({"message": "m1"}), "🧹 Removing a message")
+        self.assertEqual(tools["edit_channel"].describe({}), "⚙️ Changing this channel")
+        self.assertEqual(tools[API_TOOL].describe({"method": "post", "path": "/channels/1/messages"}), "🛠️ `POST /channels/1/messages`")
+        self.assertTrue(ADMIN_TOOL_NAMES | {API_TOOL} <= set(tools))
+        self.assertFalse(any(tool.quiet for name, tool in tools.items() if name in ADMIN_TOOL_NAMES))
+        backend = DiscordTools(self.client, render=lambda m: m.content)
+        default = {t.name for t in discord_tools.discord_tools(backend, actions=True)}
+        self.assertFalse(default & (ADMIN_TOOL_NAMES | {API_TOOL}))
+
+
+class DiscordApiTests(AdminToolTestCase):
+    def api(self, **kwargs):
+        return self.tools(**kwargs)[API_TOOL]
+
+    async def test_only_owners_and_never_bots(self):
+        self.context()  # Alice is not an owner
+        result = await self.api().run({"method": "GET", "path": "/users/@me"})
+        self.assertIn("only for the bot's owners", result.text)
+        owner_bot = Member(3, "Olive", ADMIN)
+        owner_bot.bot = True
+        self.context(author=owner_bot)
+        result = await self.api().run({"method": "GET", "path": "/users/@me"})
+        self.assertIn("only for the bot's owners", result.text)
+        self.assertEqual(self.client.http.requests, [])
+
+    async def test_get_needs_no_confirmation_and_costs_no_action(self):
+        ctx = self.context(author=self.olive)
+        self.client.http.response = {"id": "1", "name": "general"}
+        result = await self.api().run({"method": "get", "path": "https://discord.com/api/v10/channels/1", "query": {"limit": 5}})
+        self.assertIn('"name": "general"', result.text)
+        self.assertIn("untrusted", result.text)
+        (method, path, kwargs), = self.client.http.requests
+        self.assertEqual((method, path), ("GET", "/channels/1"))
+        self.assertNotIn("json", kwargs)
+        self.assertEqual(kwargs["params"], {"limit": "5"})
+        self.assertIn("(3)", kwargs["reason"])
+        self.assertEqual(ctx.actions, 0)
+
+    async def test_bad_methods_and_paths(self):
+        self.context(author=self.olive)
+        api = self.api()
+        for arguments, expected in (
+            ({"method": "TRACE", "path": "/channels/1"}, "'method' must be"),
+            ({"method": "GET", "path": "channels/1"}, "'path' must be"),
+            ({"method": "GET", "path": "/channels/{channel_id}"}, "'path' must be"),
+            ({"method": "GET", "path": "/channels/1/../../oauth2"}, "'path' must be"),
+            ({"method": "GET", "path": "/channels//1"}, "'path' must be"),
+            ({"method": "GET", "path": "https://evil.example/channels/1"}, "'path' must be"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = await api.run(arguments)
+                self.assertIn(expected, result.text)
+        self.assertEqual(self.client.http.requests, [])
+
+    async def test_denylisted_paths(self):
+        self.context(author=self.olive)
+        api = self.api(api_confirmation=False)
+        for method, path in (
+            ("GET", "/oauth2/applications/@me"),
+            ("POST", "/webhooks/123/sometoken"),
+            ("DELETE", "/guilds/1"),
+            ("DELETE", "/users/@me/guilds/1"),
+            ("POST", "/guilds/1/prune"),
+            ("GET", "/applications/1/commands"),
+        ):
+            with self.subTest(method=method, path=path):
+                result = await api.run({"method": method, "path": path})
+                self.assertIn("not allowed", result.text)
+        result = await api.run({"method": "DELETE", "path": "/guilds/1/members/2"})  # a kick is fine
+        self.assertIn("OK", result.text)
+        self.assertEqual(len(self.client.http.requests), 1)
+
+    async def test_changes_need_confirmation_and_cost_an_action(self):
+        ctx = self.context(author=self.olive)
+        result = await self.api().run({"method": "PUT", "path": "/channels/1/pins/2"})
+        self.assertIn("Confirmation required", result.text)
+        self.assertEqual((self.client.http.requests, ctx.actions), ([], 0))
+        result = await self.api().run({"method": "PUT", "path": "/channels/1/pins/2", "confirm": True})
+        self.assertIn("(no content)", result.text)
+        self.assertEqual(ctx.actions, 1)
+        result = await self.api(api_confirmation=False).run({"method": "PUT", "path": "/channels/1/pins/3"})
+        self.assertIn("OK", result.text)
+        self.assertEqual(ctx.actions, 2)
+
+    async def test_message_bodies_never_mass_ping_and_go_through_the_checks(self):
+        self.context(author=self.olive)
+        api = self.api(api_confirmation=False)
+        await api.run({"method": "POST", "path": "/channels/1/messages", "body": {"content": "@everyone hi", "allowed_mentions": {"parse": ["everyone"]}}})
+        body = self.client.http.requests[0][2]["json"]
+        self.assertEqual(body["allowed_mentions"], {"parse": []})
+        self.assertEqual(body["content"], "sent:@everyone hi")
+        self.assertIn(("@everyone hi", False), self.prepare.calls)
+        await api.run({"method": "POST", "path": "/channels/5/threads", "body": '{"name": "t", "message": {"content": "yo"}}'})
+        body = self.client.http.requests[1][2]["json"]
+        self.assertEqual(body["message"]["allowed_mentions"], {"parse": []})
+        self.assertEqual(body["message"]["content"], "sent:yo")
+        self.assertNotIn("allowed_mentions", body)  # only bodies that carry message text
+        result = await api.run({"method": "POST", "path": "/channels/1/messages", "body": {"content": "LEAK"}})
+        self.assertIn("can't be posted", result.text)
+        self.assertEqual(len(self.client.http.requests), 2)
+
+    async def test_bad_bodies_and_queries(self):
+        self.context(author=self.olive)
+        api = self.api(api_confirmation=False)
+        for arguments in (
+            {"method": "POST", "path": "/channels/1/messages", "body": "not json"},
+            {"method": "POST", "path": "/channels/1/messages", "body": 5},
+            {"method": "GET", "path": "/channels/1", "query": "limit=5"},
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertTrue((await api.run(arguments)).text.startswith("Error:"))
+        self.assertEqual(self.client.http.requests, [])
+
+    async def test_long_responses_are_trimmed_and_errors_reported(self):
+        self.context(author=self.olive)
+        self.client.http.response = [{"content": "x" * 100}] * 200
+        result = await self.api(max_chars=1000).run({"method": "GET", "path": "/channels/1/messages"})
+        self.assertLess(len(result.text), 1200)
+        self.assertTrue(result.text.endswith("…"))
+        self.client.http.error = discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "Missing Access")
+        result = await self.api().run({"method": "GET", "path": "/channels/1"})
+        self.assertEqual(result.text, "Discord answered 403: Missing Access")
 
 
 if __name__ == "__main__":

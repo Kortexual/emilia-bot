@@ -50,7 +50,7 @@ import styleguard
 from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
-from discord_tools import ACTION_TOOL_NAMES, BOT_SAFE_TOOLS, DiscordContext, DiscordTools, Outgoing
+from discord_tools import ACTION_TOOL_NAMES, ADMIN_TOOL_NAMES, API_TOOL, BOT_SAFE_TOOLS, DiscordContext, DiscordTools, Outgoing
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, Presence, StoredMessage
@@ -71,7 +71,8 @@ FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the 
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
 FORWARD_COMMENT_WAIT = 2.0  # seconds a forward on its own (in a DM) waits for a comment that would answer it instead
 OPERATOR_TOOLS = COMPUTER_TOOL_NAMES | {RestartTool.name}  # never offered when the sender is a bot (RESPOND_TO_BOTS)
-BOT_EXCLUDED_TOOLS = OPERATOR_TOOLS | (ACTION_TOOL_NAMES - BOT_SAFE_TOOLS)  # bots still get the read tools and reactions
+# Never offered when the sender is a bot: they still get the Discord read tools and reactions.
+BOT_EXCLUDED_TOOLS = OPERATOR_TOOLS | (ACTION_TOOL_NAMES - BOT_SAFE_TOOLS) | ADMIN_TOOL_NAMES | {API_TOOL}
 OTHER_CHANNEL_LOCK_TIMEOUT = 10  # seconds to wait for another channel's lock before skipping its memory
 
 
@@ -329,8 +330,13 @@ class EmiliaBot(discord.Client):
                         max_chars=self.settings.page_max_chars,
                         max_actions=self.settings.discord_max_actions,
                         cross_server=self.settings.discord_cross_server,
+                        admin_confirmation=self.settings.discord_admin_tools_require_confirmation,
+                        api_confirmation=self.settings.arbitrary_discord_tools_require_confirmation,
+                        owner_ids=self.settings.discord_owner_ids,
                     ),
                     actions=self.settings.discord_actions,
+                    admin=self.settings.discord_admin_tools,
+                    api=self.settings.arbitrary_discord_tools,
                 )
             )
         return tools
@@ -516,7 +522,8 @@ class EmiliaBot(discord.Client):
                 profiles = await self._profiles(people, labels)
                 scene = await self._scene(key) if self.settings.time_awareness else None
 
-                system_prompt = self._system_prompt(from_bot=from_bot)
+                owner = not from_bot and message.author.id in self.settings.discord_owner_ids
+                system_prompt = self._system_prompt(from_bot=from_bot, owner=owner)
                 if self.settings.fetch_pages or self.settings.browser_tools:  # links the sender wrote, quoted or forwarded
                     forwarded_body = forwarded.body if forwarded is not None else ""
                     self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body))
@@ -617,7 +624,9 @@ class EmiliaBot(discord.Client):
                     except discord.HTTPException as exc:
                         log.info("Could not add links to a tool message (%s)", exc)
 
-                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
+                exclude: Collection[str] = BOT_EXCLUDED_TOOLS if from_bot else ()
+                if not owner and self.settings.arbitrary_discord_tools:
+                    exclude = {*exclude, API_TOOL}  # only for DISCORD_OWNER_IDS
                 try:
                     result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
                     reply = clean_reply(result.text, self._speaker_names())
@@ -653,7 +662,7 @@ class EmiliaBot(discord.Client):
                         await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
-    def _system_prompt(self, *, from_bot: bool = False) -> str:
+    def _system_prompt(self, *, from_bot: bool = False, owner: bool = False) -> str:
         today = self._now().date() if self.settings.timezone else date.today()
         return prompts.build_system_prompt(
             today,
@@ -667,6 +676,8 @@ class EmiliaBot(discord.Client):
             time_awareness=self.settings.time_awareness,
             discord_tools=self.settings.discord_tools,
             discord_actions=self.settings.discord_actions and not from_bot,
+            discord_admin=self.settings.discord_admin_tools and not from_bot,
+            discord_api=self.settings.arbitrary_discord_tools and owner,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
