@@ -39,6 +39,7 @@ from typing import Any, Awaitable, Callable, Collection, Sequence
 
 import aiohttp
 
+from attachments import drop_images, has_images
 from textutil import TOOL_BLOCKS, strip_reasoning, strip_tool_markup
 from tooling import Tool, ToolResult, default_description
 
@@ -433,15 +434,28 @@ class LMStudioClient:
                 payload["tool_choice"] = "required"
 
         async with self._slots:
-            try:
-                data = await self._request("POST", "/chat/completions", payload)
-            except LLMHTTPError as exc:
-                if "tool_choice" not in payload or exc.status not in (400, 422):
-                    raise
-                log.warning("LM Studio rejected tool_choice=required (%s); not sending it again.", exc)
-                self._tool_choice_ok = False
-                del payload["tool_choice"]
-                data = await self._request("POST", "/chat/completions", payload)
+            while True:  # each fallback below can only happen once, so this ends
+                try:
+                    data = await self._request("POST", "/chat/completions", payload)
+                    break
+                except LLMHTTPError as exc:
+                    if exc.status not in (400, 422):
+                        raise
+                    if "tool_choice" in payload:
+                        log.warning("LM Studio rejected tool_choice=required (%s); not sending it again.", exc)
+                        self._tool_choice_ok = False
+                        del payload["tool_choice"]
+                    elif has_images(convo):
+                        # Usually a model that can't see. The images are dropped from this conversation for
+                        # good (convo is the caller's own list), so later rounds don't fail the same way.
+                        log.warning(
+                            "LM Studio rejected a request with images (%s). Either the loaded model can't see, or it can't "
+                            "read one of the images (see the 'Sending image' lines above). Retrying without them.",
+                            exc,
+                        )
+                        drop_images(convo)
+                    else:
+                        raise
         try:
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):

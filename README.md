@@ -49,6 +49,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
   with who wrote it (if she can see the original's channel), where and when. Discord posts the forward and your comment as two
   messages, so your next message in that channel within a minute counts as the comment. In a DM a forward on its own is answered too.
   The forward's author is only named: forwarding someone's message never lets Emilia ping them.
+- Attach images or files to your message, or reply to a message that has them: `@Emilia what's in this picture?`. Emilia reads
+  text files, and sees images if you load a vision model and set `VISION=true` (see "Images and files" below).
 - `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can ping the sender, people mentioned or replied to,
   and people in her memory of the channel. She can also ping someone in the server who is not in the conversation yet if **you type
   their name** in your message: `@Emilia ping Jack, dinner is ready` (see "Pinging" below).
@@ -196,6 +198,27 @@ is missing the bot starts without these tools and logs a warning. The browser is
   talk the model into typing something from the conversation into a form, which no filter can rule out; the confirmation rule and
   the prompt are the defence, so only turn this on where you trust the people who can prompt the bot.
 
+### Images and files
+Every attachment on the message being answered, on the message it replies to, or in a forward it comments on is named in the
+prompt as a note (`[image: cat.png]`, `[file in the message replied to: main.py]`), so the model knows it is there even when it
+can't open it. A mention with only an attachment and no text is answered, not greeted.
+
+- **Images.** With `VISION=true` (off by default) PNG, JPEG and WebP images up to 8 MB are downloaded from Discord and sent to the
+  model as OpenAI-style `image_url` parts, up to 4 per message. The format is read from the file's bytes, not its name (a `.jpg` saved from a website is often WebP), and a file that isn't really an image isn't sent. This needs a vision model (LM Studio shows an eye badge): a text-only
+  model refuses them, so if LM Studio rejects a request with images the bot logs a warning and asks again without them, and the model
+  is told it couldn't see them. GIFs, bigger images and any beyond the fourth are named with the reason they weren't shown. Without
+  `VISION` images are only named, never downloaded, and the model is told it can't see images, so it says so instead of guessing.
+- **Text files.** With `READ_FILES=true` (the default) code, logs, notes, CSV, JSON and other text files up to 1 MB are downloaded and
+  their contents put into the sender's message, under the file's note. `FILE_MAX_CHARS` (default 6000) caps the text from all files of
+  one message together; a longer file is cut off and the model is told. Files with NUL bytes are treated as binary. The text is
+  sanitised like the message itself (invisible characters, forged prompt tags and braille removed) and the model is told it is
+  untrusted. Links in a file are not added to the ones `fetch_page` may open.
+- **Other files** (PDFs, audio, archives...) are named with their type and size, and not opened.
+- **Only for this reply.** Images and file contents are sent with the message they came with and nowhere else: memory keeps only the
+  notes. A picture or a long file would otherwise fill `MEMORY_MAX_CHARS` on its own, and the model is told that images from earlier
+  messages are no longer shown. Ask about an earlier image by replying to it.
+- Messages she starts herself (`RANDOM_MESSAGES`) never include attachments.
+
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
@@ -292,6 +315,9 @@ All settings are environment variables (or lines in `.env`).
 | `FETCH_PAGES` | `true` | Let the model read whole pages (links from search results or the sender's message) |
 | `PAGE_MAX_CHARS` | `6000` | Characters of page text handed to the model per fetch |
 | `SHOW_SOURCES` | `true` | Add a few result links to each web search line |
+| `VISION` | `false` | Send attached images to the model; needs a vision model (see "Images and files") |
+| `READ_FILES` | `true` | Put the contents of attached text files into the message |
+| `FILE_MAX_CHARS` | `6000` | Characters of attached text given to the model per message, across all files (minimum `500`) |
 | `FETCH_PAGES` | `true` | Let the model read whole web pages (see "Reading pages") |
 | `PAGE_MAX_CHARS` | `6000` | Characters of page text given to the model per fetch (minimum `500`) |
 | `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
@@ -347,6 +373,7 @@ bot.py        Discord side: the mention rule, replies, memory use, !forget
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
 webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
+attachments.py images and files attached to messages: notes, file text, image parts for vision models
 browser.py    the opt-in browser tools (Playwright) and the proxy that keeps them on the public internet
 computer.py   the opt-in workspace file and terminal tools
 restart.py    the restart_bot tool and its handoff

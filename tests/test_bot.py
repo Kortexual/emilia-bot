@@ -40,6 +40,7 @@ from bot import OPERATOR_TOOLS, EmiliaBot, source_links
 from config import Settings
 from llm import ChatResult, LLMError, ToolUse
 from memory import MemoryStore
+from tests.test_attachments import PNG, WEBP, FakeAttachment
 
 BOT = SimpleNamespace(id=999, display_name="Emilia", bot=True)
 _ids = itertools.count(1)
@@ -196,6 +197,7 @@ class FakeMessage:
         kind=discord.MessageType.default,
         snapshots=(),
         created_at=None,
+        attachments=(),
     ):
         self.id = next(_ids)
         self.content = content
@@ -208,6 +210,7 @@ class FakeMessage:
         self.reference = reference
         self.type = kind
         self.message_snapshots = list(snapshots)  # what a forward carries; Discord leaves its content empty
+        self.attachments = list(attachments)
         self.created_at = created_at or datetime.now(timezone.utc)
         self.replies = []
         self.allowed_mentions = []  # the AllowedMentions of every reply()
@@ -555,6 +558,69 @@ class ConversationTests(BotTestCase):
         self.assertEqual(lengths, [2, 4])
 
 
+class AttachmentTests(BotTestCase):
+    """Images and files on the message being answered, or on the one it replies to."""
+
+    def image(self, name="cat.png"):
+        return FakeAttachment(name, PNG, "image/png")
+
+    async def test_an_image_is_sent_to_a_vision_model_and_remembered_as_a_note(self):
+        bot = self.make_bot(vision=True)
+        await bot.on_message(self.msg(self.mention("what is this?"), attachments=[self.image()]))
+        content = self.llm.calls[0][-1]["content"]
+        self.assertIn("what is this?\n[image: cat.png]", content[0]["text"])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertIn(prompts.VISION_NOTE, self.llm.calls[0][0]["content"])
+        self.assertEqual(self.memory.recent("1")[0].content, "what is this?\n[image: cat.png]")
+
+        await bot.on_message(self.msg(self.mention("and now?")))
+        self.assertIsInstance(self.llm.calls[1][-1]["content"], str)  # an image is only shown with its own message
+        self.assertIn("[image: cat.png]", self.llm.calls[1][1]["content"])
+
+    async def test_without_vision_the_model_only_hears_about_the_image(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(self.mention("what is this?"), attachments=[self.image()]))
+        content = self.llm.calls[0][-1]["content"]
+        self.assertIsInstance(content, str)
+        self.assertIn("what is this?\n[image: cat.png]", content)
+        self.assertIn(prompts.NO_VISION_NOTE, self.llm.calls[0][0]["content"])
+
+    async def test_a_mention_with_only_an_attachment_is_not_a_bare_greeting(self):
+        bot = self.make_bot(vision=True)
+        message = self.msg(self.mention(""), attachments=[self.image()])
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hello there!"])
+        self.assertIn("[image: cat.png]", self.llm.calls[0][-1]["content"][0]["text"])
+
+    async def test_a_text_file_is_read_for_the_reply_but_not_remembered(self):
+        bot = self.make_bot()
+        notes = FakeAttachment("todo.txt", b"buy milk\nwalk the dog", "text/plain")
+        await bot.on_message(self.msg(self.mention("summarise this"), attachments=[notes]))
+        self.assertIn("summarise this\n[file: todo.txt]\n```\nbuy milk\nwalk the dog\n```", self.llm.calls[0][-1]["content"])
+        self.assertEqual(self.memory.recent("1")[0].content, "summarise this\n[file: todo.txt]")
+
+    async def test_replying_to_an_image_shows_that_image(self):
+        bot = self.make_bot(vision=True)
+        original = SimpleNamespace(
+            id=7, content="", author=person("Bob", 2), mentions=[], role_mentions=[], channel_mentions=[],
+            attachments=[self.image("sunset.webp")],
+        )
+        original.attachments[0] = FakeAttachment("sunset.webp", WEBP, "image/webp")
+        await bot.on_message(self.msg(self.mention("where is this?"), reference=SimpleNamespace(message_id=7, resolved=original)))
+        content = self.llm.calls[0][-1]["content"]
+        self.assertIn("(replying to Bob) where is this?\n[image in the message replied to: sunset.webp]", content[0]["text"])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/webp;base64,"))
+
+    async def test_the_plain_text_retry_keeps_the_images(self):
+        bot = self.make_bot(llm=FakeLLM(script=["\u2813\u2811\u2807\u2807\u2815 \u2813\u2811\u2807\u2807\u2815", "A cat!"]), vision=True)
+        message = self.msg(self.mention("what is this?"), attachments=[self.image()])
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["A cat!"])
+        retry = self.llm.calls[1][-1]["content"]
+        self.assertIn(prompts.PLAIN_TEXT_HINT, retry[0]["text"])
+        self.assertEqual(retry[1]["type"], "image_url")
+
+
 KIWI = person("Kiwi", 42)
 KITCHEN = SimpleNamespace(id=55, name="kitchen_slop")
 FORWARDED_AT = datetime(2026, 10, 23, 10, 29, tzinfo=timezone.utc)
@@ -578,13 +644,14 @@ class ForwardTests(BotTestCase):
             raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown Message")
         return self.originals[message_id]
 
-    def forward(self, content="<something funny>", *, author=None, channel_id=KITCHEN.id, findable=True, **kwargs):
+    def forward(self, content="<something funny>", *, author=None, channel_id=KITCHEN.id, findable=True, files=(), **kwargs):
         """A forward of a message Kiwi wrote in #kitchen_slop, as it arrives: no text, no mentions, one snapshot."""
         message_id = next(_ids)
         if findable:
             self.originals[message_id] = SimpleNamespace(id=message_id, author=KIWI)
         snapshot = SimpleNamespace(
-            content=content, created_at=FORWARDED_AT, raw_mentions=[], raw_channel_mentions=[], cached_message=None
+            content=content, created_at=FORWARDED_AT, raw_mentions=[], raw_channel_mentions=[], cached_message=None,
+            attachments=list(files),
         )
         reference = SimpleNamespace(
             type=discord.MessageReferenceType.forward, channel_id=channel_id, message_id=message_id, resolved=None
@@ -611,6 +678,16 @@ class ForwardTests(BotTestCase):
         self.assertEqual(comment.replies, ["Hello there!"])
         stored = self.memory.recent(str(self.channel.id), 10_000)
         self.assertIn("<something funny>", stored[0].content)  # remembered like a quoted reply
+
+    async def test_a_forwarded_image_is_shown_with_the_comment(self):
+        bot = self.make_bot(vision=True)
+        alice = person()
+        await bot.on_message(self.forward("", author=alice, files=[FakeAttachment("meme.png", PNG, "image/png")]))
+        await bot.on_message(self.msg(self.mention("lmao look"), author=alice))
+        content = self.last_prompt()
+        self.assertIn("(forwarded a message from Kiwi in #kitchen_slop on 2026-10-23 at 10:29 UTC) lmao look", content[0]["text"])
+        self.assertIn("[image in the forwarded message: meme.png]", content[0]["text"])
+        self.assertEqual(content[1]["type"], "image_url")
 
     async def test_the_author_is_someone_if_the_original_cannot_be_seen(self):
         bot = self.make_bot()

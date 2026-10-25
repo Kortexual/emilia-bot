@@ -54,6 +54,18 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.style_cooldown, 4)
         self.assertTrue(s.forget_standing_instructions)
         self.assertFalse(s.yandere_mode)
+        self.assertFalse(s.vision)  # a text-only model would refuse images
+        self.assertTrue(s.read_files)
+        self.assertEqual(s.file_max_chars, 6000)
+
+    def test_attachment_settings(self):
+        s = load(DISCORD_TOKEN="a", VISION="true", READ_FILES="no", FILE_MAX_CHARS="1200")
+        self.assertTrue(s.vision)
+        self.assertFalse(s.read_files)
+        self.assertEqual(s.file_max_chars, 1200)
+        for bad in ({"VISION": "maybe"}, {"READ_FILES": "sometimes"}, {"FILE_MAX_CHARS": "100"}, {"FILE_MAX_CHARS": "lots"}):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load(DISCORD_TOKEN="a", **bad)
 
     def test_members_intent_flag(self):
         self.assertFalse(load(DISCORD_TOKEN="a").members_intent)
