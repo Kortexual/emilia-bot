@@ -243,6 +243,7 @@ class EmiliaBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
         intents.members = settings.members_intent  # privileged: Server Members Intent, only if MEMBERS_INTENT=true
+        intents.presences = settings.presence_intent  # privileged: Presence Intent, only if PRESENCE_INTENT=true
         super().__init__(
             intents=intents,
             # Whatever the model writes can never ping @everyone, roles or arbitrary users. Replies
@@ -332,9 +333,9 @@ class EmiliaBot(discord.Client):
                         cross_server=self.settings.discord_cross_server,
                         admin_confirmation=self.settings.discord_admin_tools_require_confirmation,
                         api_confirmation=self.settings.arbitrary_discord_tools_require_confirmation,
-                        owner_ids=self.settings.discord_owner_ids,
                     ),
                     actions=self.settings.discord_actions,
+                    statuses=self.settings.presence_intent,
                     admin=self.settings.discord_admin_tools,
                     api=self.settings.arbitrary_discord_tools,
                 )
@@ -352,6 +353,10 @@ class EmiliaBot(discord.Client):
         if self.settings.respond_to_bots:
             scope += ", including from other bots"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
+        if self.settings.discord_tools and not self.settings.presence_intent:
+            log.info("Discord tools are on without PRESENCE_INTENT: the member_statuses tool is not offered")
+        elif self.settings.discord_tools and not self.settings.members_intent:
+            log.info("PRESENCE_INTENT is on without MEMBERS_INTENT: member_statuses only sees members Discord has sent")
         if self._restart_ready_fd is not None:
             try:
                 os.write(self._restart_ready_fd, b"1")
@@ -522,8 +527,7 @@ class EmiliaBot(discord.Client):
                 profiles = await self._profiles(people, labels)
                 scene = await self._scene(key) if self.settings.time_awareness else None
 
-                owner = not from_bot and message.author.id in self.settings.discord_owner_ids
-                system_prompt = self._system_prompt(from_bot=from_bot, owner=owner)
+                system_prompt = self._system_prompt(from_bot=from_bot)
                 if self.settings.fetch_pages or self.settings.browser_tools:  # links the sender wrote, quoted or forwarded
                     forwarded_body = forwarded.body if forwarded is not None else ""
                     self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body))
@@ -624,9 +628,7 @@ class EmiliaBot(discord.Client):
                     except discord.HTTPException as exc:
                         log.info("Could not add links to a tool message (%s)", exc)
 
-                exclude: Collection[str] = BOT_EXCLUDED_TOOLS if from_bot else ()
-                if not owner and self.settings.arbitrary_discord_tools:
-                    exclude = {*exclude, API_TOOL}  # only for DISCORD_OWNER_IDS
+                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
                 try:
                     result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
                     reply = clean_reply(result.text, self._speaker_names())
@@ -662,7 +664,7 @@ class EmiliaBot(discord.Client):
                         await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
-    def _system_prompt(self, *, from_bot: bool = False, owner: bool = False) -> str:
+    def _system_prompt(self, *, from_bot: bool = False) -> str:
         today = self._now().date() if self.settings.timezone else date.today()
         return prompts.build_system_prompt(
             today,
@@ -677,7 +679,7 @@ class EmiliaBot(discord.Client):
             discord_tools=self.settings.discord_tools,
             discord_actions=self.settings.discord_actions and not from_bot,
             discord_admin=self.settings.discord_admin_tools and not from_bot,
-            discord_api=self.settings.arbitrary_discord_tools and owner,
+            discord_api=self.settings.arbitrary_discord_tools and not from_bot,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -1182,7 +1184,8 @@ def main() -> None:
         raise SystemExit("Discord rejected DISCORD_TOKEN. Reset the token in the Developer Portal and update .env.") from None
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true): "
+            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true, "
+            "'Presence Intent' if PRESENCE_INTENT=true): "
             "Developer Portal > your app > Bot > Privileged Gateway Intents."
         ) from None
 

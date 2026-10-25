@@ -99,11 +99,11 @@ def _timezone(name: str) -> str:
     return raw
 
 
-def _channel_ids(name: str, kind: str = "channel") -> tuple[int, ...]:
+def _channel_ids(name: str) -> tuple[int, ...]:
     ids = []
     for part in _text(name).replace(",", " ").split():
         if not part.isdigit() or int(part) == 0:
-            raise ConfigError(f"{name} must be a list of Discord {kind} IDs separated by commas, got {part!r}")
+            raise ConfigError(f"{name} must be a list of Discord channel IDs separated by commas, got {part!r}")
         if int(part) not in ids:
             ids.append(int(part))
     return tuple(ids)
@@ -144,12 +144,12 @@ class Settings:
     discord_cross_server: bool = False  # let the Discord tools reach channels in other servers the sender is in
     discord_admin_tools: bool = False  # opt-in, needs discord_tools: moderation (timeouts, kicks, bans, roles, channel edits)
     discord_admin_tools_require_confirmation: bool = True  # each moderation call must contain confirm=true
-    arbitrary_discord_tools: bool = False  # opt-in: discord_api, raw REST calls, for discord_owner_ids only
+    arbitrary_discord_tools: bool = False  # opt-in, needs discord_tools: discord_api, raw REST calls with her permissions
     arbitrary_discord_tools_require_confirmation: bool = True  # each discord_api call other than GET must contain confirm=true
-    discord_owner_ids: tuple[int, ...] = ()  # user IDs of the bot's owners
     multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
+    presence_intent: bool = False  # see members' statuses (the member_statuses tool); needs the Presence Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
     # Her day (see presence.py)
@@ -221,11 +221,8 @@ class Settings:
         if discord_admin_tools and not discord_tools:
             raise ConfigError("DISCORD_ADMIN_TOOLS needs DISCORD_TOOLS=true as well")
         arbitrary_discord_tools = _flag("ARBITRARY_DISCORD_TOOLS", cls.arbitrary_discord_tools)
-        owner_ids = _channel_ids("DISCORD_OWNER_IDS", "user")
         if arbitrary_discord_tools and not discord_tools:
             raise ConfigError("ARBITRARY_DISCORD_TOOLS needs DISCORD_TOOLS=true as well")
-        if arbitrary_discord_tools and not owner_ids:
-            raise ConfigError("ARBITRARY_DISCORD_TOOLS is on, but DISCORD_OWNER_IDS lists nobody to offer it to")
 
         return cls(
             discord_token=token,
@@ -263,10 +260,10 @@ class Settings:
             arbitrary_discord_tools_require_confirmation=_flag(
                 "ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION", cls.arbitrary_discord_tools_require_confirmation
             ),
-            discord_owner_ids=owner_ids,
             multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
+            presence_intent=_flag("PRESENCE_INTENT", cls.presence_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             time_awareness=_flag("TIME_AWARENESS", cls.time_awareness),
             timezone=_timezone("TIMEZONE"),

@@ -56,7 +56,6 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(s.discord_admin_tools_require_confirmation)
         self.assertFalse(s.arbitrary_discord_tools)
         self.assertTrue(s.arbitrary_discord_tools_require_confirmation)
-        self.assertEqual(s.discord_owner_ids, ())
         self.assertFalse(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 8)
         self.assertEqual(s.memory_turns, 10)
@@ -69,6 +68,12 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(load(DISCORD_TOKEN="a", MEMBERS_INTENT="yes").members_intent)
         with self.assertRaises(ConfigError):
             load(DISCORD_TOKEN="a", MEMBERS_INTENT="maybe")
+
+    def test_presence_intent_flag(self):
+        self.assertFalse(load(DISCORD_TOKEN="a").presence_intent)
+        self.assertTrue(load(DISCORD_TOKEN="a", PRESENCE_INTENT="on").presence_intent)
+        with self.assertRaises(ConfigError):
+            load(DISCORD_TOKEN="a", PRESENCE_INTENT="maybe")
 
     def test_yandere_mode_flag(self):
         self.assertTrue(load(DISCORD_TOKEN="a", YANDERE_MODE="true").yandere_mode)
@@ -128,7 +133,6 @@ class SettingsTests(unittest.TestCase):
             DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION="false",
             ARBITRARY_DISCORD_TOOLS="true",
             ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION="false",
-            DISCORD_OWNER_IDS="123, 456,123",
             MULTI_TURN_TOOLS="true",
             MAX_TOOL_TURNS="4",
         )
@@ -154,7 +158,6 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(s.discord_admin_tools_require_confirmation)
         self.assertTrue(s.arbitrary_discord_tools)
         self.assertFalse(s.arbitrary_discord_tools_require_confirmation)
-        self.assertEqual(s.discord_owner_ids, (123, 456))
         self.assertTrue(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 4)
 
@@ -176,9 +179,7 @@ class SettingsTests(unittest.TestCase):
             {"DISCORD_TOOLS": "true", "DISCORD_MAX_ACTIONS": "0"},
             {"DISCORD_ACTIONS": "true"},  # needs DISCORD_TOOLS
             {"DISCORD_ADMIN_TOOLS": "true"},  # needs DISCORD_TOOLS
-            {"DISCORD_TOOLS": "true", "ARBITRARY_DISCORD_TOOLS": "true"},  # needs DISCORD_OWNER_IDS
-            {"ARBITRARY_DISCORD_TOOLS": "true", "DISCORD_OWNER_IDS": "123"},  # needs DISCORD_TOOLS
-            {"DISCORD_OWNER_IDS": "jack"},
+            {"ARBITRARY_DISCORD_TOOLS": "true"},  # needs DISCORD_TOOLS
             {"DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION": "perhaps"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
