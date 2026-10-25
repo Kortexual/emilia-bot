@@ -94,6 +94,23 @@ class RestartSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(self.handoffs, 0)
 
+    async def test_a_restart_that_is_stopped_halfway_stops_the_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            pid_file = os.path.join(folder, "pid")
+            script = f"import os, time; open({pid_file!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+            tool = RestartTool([sys.executable, "-c", script], self.handoff, ready_timeout=30)
+            restarting = asyncio.create_task(tool.run({"confirm": True}))
+            while not os.path.exists(pid_file) or not os.path.getsize(pid_file):
+                await asyncio.sleep(0.05)
+            with open(pid_file) as f:
+                pid = int(f.read())
+            restarting.cancel()  # !giveup
+            with self.assertRaises(asyncio.CancelledError):
+                await restarting
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(self.handoffs, 0)
+
     async def test_a_command_that_cannot_start_is_reported(self):
         tool = RestartTool(["/nonexistent/python"], self.handoff)
         result = await tool.run({"confirm": True})

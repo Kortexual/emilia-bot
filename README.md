@@ -56,6 +56,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
 - `@Emilia !about I garden and like tea` saves a short note about **yourself** (up to 160 characters). `!about` shows it and
   `!about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
 - `@Emilia !forgetme` deletes the note and the names saved about you.
+- `@Emilia !giveup` makes her drop what she is doing in that channel, right away, and not pick it back up unless someone asks
+  again (see "Giving up" below). You can stop the replies to your own messages; stopping someone else's needs *Manage Messages*.
 - DMs are ignored unless you set `RESPOND_TO_DMS=true`.
 - Other bots are ignored unless you set `RESPOND_TO_BOTS=true` (see "Talking to other bots" below).
 
@@ -74,7 +76,7 @@ By default every bot is ignored. With `RESPOND_TO_BOTS=true`, another bot that @
 - **A loop guard.** Two bots that answer each other's pings would never stop. After `BOT_REPLY_LIMIT` replies to bots in a row in one
   channel (default 3), Emilia ignores bots there until a person posts anything in that channel. `BOT_REPLY_LIMIT=0` turns the guard
   off; only do that if the other bots can't get into a loop with her.
-- **Less power than a person.** Bots can't use `!forget`, `!about` or `!forgetme` (they are ignored), can't make her ping someone by
+- **Less power than a person.** Bots can't use `!forget`, `!about`, `!forgetme` or `!giveup` (they are ignored), can't make her ping someone by
   name (only people already in the conversation can be pinged), and never get the computer tools or `restart_bot`, whatever
   `COMPUTER_TOOLS` says. Web search and page reading work as usual.
 
@@ -145,6 +147,20 @@ Memory keeps everything the model said for one request as one reply; the tool li
   end the turn. The console logs how each turn ended (`stop_talking`, repeats, or running out of turns). `stop_talking` is only
   offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
   models take a while.
+
+### Giving up
+`@Emilia !giveup` is for when she is stuck on something, or working on something you no longer want. It is handled the moment it
+arrives, without waiting for the reply in progress: each reply runs as its own asyncio task, and `!giveup` cancels the ones in that
+channel. Cancelling closes the request to LM Studio (which stops the generation), kills a `run_command` that is still running, stops a
+replacement bot that `restart_bot` was starting (so the old bot keeps running alone), and drops replies still waiting their turn.
+Messages she already posted stay.
+
+So that she doesn't go straight back to it the next time someone mentions her, it is remembered: the interrupted request is saved
+with whatever she had said so far (or a note that she was stopped before answering), followed by an exchange where the sender says
+`!giveup` with a short explanation (drop it, don't go back to it unless someone asks again) and she agrees. The wording is chosen
+so "Keeping habits from sticking" never hides it. Anyone can stop the replies to their own messages; stopping someone else's needs the
+*Manage Messages* permission, like `!forget` (in a DM anyone can). With nothing running, `!giveup` still leaves the note, for a task
+she had promised to keep at.
 
 ### Reading pages
 Search snippets are short. With `FETCH_PAGES=true` (the default) the model also has a `fetch_page` tool that opens a web page and returns
