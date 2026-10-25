@@ -48,6 +48,8 @@ MAX_IMAGES = 4  # per message, across the message itself, the one it replies to 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 1024 * 1024  # a text file bigger than this isn't downloaded at all
 NAME_CHARS = 80
+# Python's built-in table only: mimetypes.guess_type also reads the system's mime.types, which differs between machines.
+_GUESSER = mimetypes.MimeTypes()
 
 # Text files that don't announce themselves as text/*.
 TEXT_TYPES = {
@@ -73,7 +75,9 @@ def safe_filename(name: str) -> str:
 
 def content_type(attachment: Any) -> str:
     """The attachment's media type without parameters, guessed from its name when Discord doesn't say."""
-    raw = getattr(attachment, "content_type", None) or mimetypes.guess_type(attachment.filename)[0] or ""
+    raw = getattr(attachment, "content_type", None) or _GUESSER.guess_type(attachment.filename)[0] or ""
+    if not raw and os.path.splitext(attachment.filename)[1].lower() in TEXT_EXTENSIONS:
+        raw = "text/plain"
     return raw.split(";")[0].strip().lower()
 
 
