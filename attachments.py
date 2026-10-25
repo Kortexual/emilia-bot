@@ -81,6 +81,20 @@ def content_type(attachment: Any) -> str:
     return raw.split(";")[0].strip().lower()
 
 
+def sniff_image(data: bytes) -> str:
+    """The image format the bytes really are, from their signature, or "" if they aren't one we know.
+    What Discord reports comes from the file name, and a ".jpg" saved from a website is often WebP."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return ""
+
+
 def is_text(attachment: Any) -> bool:
     kind = content_type(attachment)
     extension = os.path.splitext(attachment.filename)[1].lower()
@@ -150,11 +164,19 @@ class AttachmentReader:
             reason = "too many images"
         else:
             data = await self._download(attachment)
-            if data is not None and len(data) <= MAX_IMAGE_BYTES:
-                self.images.append(f"data:{kind};base64,{base64.b64encode(data).decode('ascii')}")
+            real = sniff_image(data) if data is not None else ""
+            if data is None or len(data) > MAX_IMAGE_BYTES:
+                reason = "could not be loaded"
+            elif real not in IMAGE_TYPES:
+                log.info("Attachment %r says it is %s but its bytes are %s; not sent", name, kind, real or "not an image we know")
+                reason = "not a format you can view"
+            else:
+                if real != kind:
+                    log.info("Attachment %r says it is %s but is really %s; sending it as %s", name, kind, real, real)
+                log.info("Sending image %r to the model (%s, %s)", name, real, human_size(len(data)))
+                self.images.append(f"data:{real};base64,{base64.b64encode(data).decode('ascii')}")
                 self._note(f"[image{where}: {name}]")
                 return
-            reason = "could not be loaded"
         self._note(f"[image{where}: {name}, not shown: {reason}]")
 
     async def _add_text(self, attachment: Any, where: str) -> None:

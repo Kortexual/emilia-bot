@@ -40,7 +40,7 @@ from bot import OPERATOR_TOOLS, EmiliaBot, source_links
 from config import Settings
 from llm import ChatResult, LLMError, ToolUse
 from memory import MemoryStore
-from tests.test_attachments import PNG, FakeAttachment
+from tests.test_attachments import PNG, WEBP, FakeAttachment
 
 BOT = SimpleNamespace(id=999, display_name="Emilia", bot=True)
 _ids = itertools.count(1)
@@ -605,7 +605,7 @@ class AttachmentTests(BotTestCase):
             id=7, content="", author=person("Bob", 2), mentions=[], role_mentions=[], channel_mentions=[],
             attachments=[self.image("sunset.webp")],
         )
-        original.attachments[0].content_type = "image/webp"
+        original.attachments[0] = FakeAttachment("sunset.webp", WEBP, "image/webp")
         await bot.on_message(self.msg(self.mention("where is this?"), reference=SimpleNamespace(message_id=7, resolved=original)))
         content = self.llm.calls[0][-1]["content"]
         self.assertIn("(replying to Bob) where is this?\n[image in the message replied to: sunset.webp]", content[0]["text"])

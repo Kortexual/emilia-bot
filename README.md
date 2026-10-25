@@ -204,7 +204,7 @@ prompt as a note (`[image: cat.png]`, `[file in the message replied to: main.py]
 can't open it. A mention with only an attachment and no text is answered, not greeted.
 
 - **Images.** With `VISION=true` (off by default) PNG, JPEG and WebP images up to 8 MB are downloaded from Discord and sent to the
-  model as OpenAI-style `image_url` parts, up to 4 per message. This needs a vision model (LM Studio shows an eye badge): a text-only
+  model as OpenAI-style `image_url` parts, up to 4 per message. The format is read from the file's bytes, not its name (a `.jpg` saved from a website is often WebP), and a file that isn't really an image isn't sent. This needs a vision model (LM Studio shows an eye badge): a text-only
   model refuses them, so if LM Studio rejects a request with images the bot logs a warning and asks again without them, and the model
   is told it couldn't see them. GIFs, bigger images and any beyond the fourth are named with the reason they weren't shown. Without
   `VISION` images are only named, never downloaded, and the model is told it can't see images, so it says so instead of guessing.

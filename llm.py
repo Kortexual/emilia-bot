@@ -448,7 +448,11 @@ class LMStudioClient:
                     elif has_images(convo):
                         # Usually a model that can't see. The images are dropped from this conversation for
                         # good (convo is the caller's own list), so later rounds don't fail the same way.
-                        log.warning("LM Studio rejected the images (%s); is the loaded model a vision model? Retrying without them.", exc)
+                        log.warning(
+                            "LM Studio rejected a request with images (%s). Either the loaded model can't see, or it can't "
+                            "read one of the images (see the 'Sending image' lines above). Retrying without them.",
+                            exc,
+                        )
                         drop_images(convo)
                     else:
                         raise

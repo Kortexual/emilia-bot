@@ -45,6 +45,8 @@ class FakeAttachment:
 
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
+JPEG = b"\xff\xd8\xff\xe0fake"
+WEBP = b"RIFF\x00\x00\x00\x00WEBPfake"
 
 
 def reader(**kwargs):
@@ -72,8 +74,28 @@ class ImageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_type_is_guessed_from_the_name_when_discord_does_not_say(self):
         attached = reader()
-        await attached.add([FakeAttachment("photo.JPG", PNG)])
+        await attached.add([FakeAttachment("photo.JPG", JPEG)])
         self.assertTrue(attached.images[0].startswith("data:image/jpeg;base64,"))
+
+    async def test_the_data_url_uses_the_format_the_bytes_really_are(self):
+        attached = reader()
+        await attached.add([FakeAttachment("saved.jpg", WEBP, "image/jpeg"), FakeAttachment("shot.png", JPEG, "image/png")])
+        self.assertTrue(attached.images[0].startswith("data:image/webp;base64,"))
+        self.assertTrue(attached.images[1].startswith("data:image/jpeg;base64,"))
+
+    async def test_bytes_that_are_not_a_viewable_image_are_not_sent(self):
+        attached = reader()
+        await attached.add(
+            [
+                FakeAttachment("cat.png", b"<html>This content is no longer available.</html>", "image/png"),
+                FakeAttachment("anim.png", b"GIF89a....", "image/png"),
+            ]
+        )
+        self.assertEqual(attached.images, [])
+        self.assertEqual(
+            attached.notes,
+            ["[image: cat.png, not shown: not a format you can view]", "[image: anim.png, not shown: not a format you can view]"],
+        )
 
     async def test_unsupported_too_big_too_many_and_broken_images_are_explained(self):
         attached = reader()
