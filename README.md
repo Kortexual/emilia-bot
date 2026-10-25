@@ -270,7 +270,9 @@ written fresh by the model each time. The logic is in `presence.py` (pure, so it
 
 - **Waking up.** Her first message of a local day, if it falls between 05:00 and 09:59, comes with "you have only just woken up":
   a yawn or stretch and a good morning, worded however the model likes. It is once per day for the whole server, not per channel.
-- **Sleepy.** From 22:00 she is a little sleepy; from midnight to 05:00 she is drowsy and a bit surprised anyone is up.
+- **Sleepy.** From 22:00 to 05:00 she can be a little sleepy (from midnight drowsy, and a bit surprised anyone is up), but it is only
+  mentioned in about one reply in five; otherwise she is told not to bring it up, so it doesn't turn into a refrain. Change the odds with
+  `SLEEPY_CHANCE` in `presence.py`.
 - **Random events.** Otherwise there is a 30% chance that whoever is talking to her has just come across her in the middle of
   something. The model is given three random ideas from a list for that part of the day (lunch, exercise, a book, waking from a nap...)
   as examples only and invents a new small scene. After one, there is a cooldown (`RANDOM_EVENT_COOLDOWN_MINUTES`, default 120;

@@ -44,6 +44,8 @@ CHECK_SECONDS = 300  # how often the bot considers saying something unprompted
 MAX_CHANCE = 0.25  # the most likely a single check can be, reached once the wait is as long as it gets
 EVENT_CHANCE = 0.3  # chance that an eligible reply (cooldown over) comes with a random event
 IDEAS_PER_EVENT = 3  # how many activities are suggested to the model as a starting point
+SLEEPY_CHANCE = 0.2  # at the sleepy hours, the chance that a message is told to let tiredness show (otherwise it is told not to)
+SLEEPY_PHASES = frozenset({"night", "late_night"})
 
 # The first hour of each phase, in order. 22:00 to 23:59 is "night", midnight to 04:59 "late at night".
 PHASES = (
@@ -65,6 +67,7 @@ class Scene:
     phase: str  # a key of PHASES
     kind: str = ""  # "" (nothing special), "wake_up" (first message of the morning) or "event"
     ideas: tuple[str, ...] = ()  # a few activities to start from when kind == "event"
+    sleepy: bool = True  # at the sleepy hours: whether she lets tiredness show this time (scene_for rolls it); no effect by day
 
 
 # --- Clock and time zone -------------------------------------------------------------------
@@ -140,6 +143,7 @@ def scene_for(
     rng: random.Random,
     spontaneous: bool = False,
     event_chance: float = EVENT_CHANCE,
+    sleepy_chance: float = SLEEPY_CHANCE,
 ) -> Scene:
     """Decide what is happening around her for this message.
 
@@ -148,7 +152,9 @@ def scene_for(
     wake-up. Otherwise a random event happens with probability `event_chance`, but only once
     `event_cooldown_minutes` have passed since the last scene (0 turns events off). A message she
     starts herself (`spontaneous`) always comes with something she is doing, since she has nothing
-    to answer, and the cooldown does not apply.
+    to answer, and the cooldown does not apply. At the sleepy hours (`SLEEPY_PHASES`) tiredness only
+    shows with probability `sleepy_chance`; otherwise the scene says so, so that she does not keep
+    announcing it in every message.
     """
     phase = phase_of(now.hour)
     clock = clock_text(now)
@@ -156,8 +162,10 @@ def scene_for(
     if first_today and phase == "early_morning":
         return Scene(clock, phase, "wake_up")
 
+    sleepy = phase in SLEEPY_PHASES and rng.random() >= 1.0 - sleepy_chance
+
     cooled = event_cooldown_minutes > 0 and (last_event is None or now.timestamp() - last_event >= event_cooldown_minutes * 60)
     pool = list(ideas.get(phase, ()))
     if pool and (spontaneous or (cooled and rng.random() < event_chance)):
-        return Scene(clock, phase, "event", tuple(rng.sample(pool, min(IDEAS_PER_EVENT, len(pool)))))
-    return Scene(clock, phase)
+        return Scene(clock, phase, "event", tuple(rng.sample(pool, min(IDEAS_PER_EVENT, len(pool)))), sleepy)
+    return Scene(clock, phase, sleepy=sleepy)

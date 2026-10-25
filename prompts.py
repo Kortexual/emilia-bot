@@ -218,7 +218,10 @@ TIME_RULES = (
     "unless someone asks, and never mention the note.\n"
     "- When it says you were in the middle of something, invent that yourself: one small, specific "
     "thing that fits your world and the hour, and different from what you did before. Keep it to a "
-    "sentence or two, and still answer what the person actually said."
+    "sentence or two, and still answer what the person actually said.\n"
+    "- Being sleepy comes and goes. Only let tiredness show when the note says you are tired, and keep it "
+    "small. When it says not to bring it up, don't, and don't keep telling people you are sleepy or what "
+    "time it is."
 )
 
 # Built once from the static text. Used to catch replies that dump the prompt word for word.
@@ -255,14 +258,20 @@ PHASE_LABELS = {
     "night": "night, nearly bedtime",
 }
 
-# How awake she is at the sleepy hours.
+# How awake she is at the sleepy hours. It is only said some of the time (presence.SLEEPY_CHANCE): a model
+# told "you are sleepy" in every message announces it in every message.
 DROWSINESS = {
-    "night": " You are getting sleepy.",
+    "night": (
+        " You are getting a little sleepy. If it shows, keep it small (a yawn, a softer tone), "
+        "and skip it if you already mentioned it a moment ago."
+    ),
     "late_night": (
         " You are tired and drowsy, and a little surprised that anyone is still awake. "
-        "Let it show lightly in how you write, without making it the whole reply."
+        "Let it show in a small way, such as a yawn or slower words, without describing it at length or making "
+        "it the whole reply, and skip it if you already did a moment ago."
     ),
 }
+NOT_SLEEPY = " Don't bring up being tired or sleepy this time."
 
 # Starting points for a random event. A few are picked at random for each one and offered to the model
 # as examples only: it invents the actual scene, so every event is new. Edit freely to change her day.
@@ -344,7 +353,8 @@ UNPROMPTED_MARKER = "(You spoke up on your own here; nobody had said anything to
 
 def _scene_clause(scene: Scene, *, unprompted: bool) -> str:
     """The sentences that tell her what time it is and what is going on, for a reply or for a message of her own."""
-    text = f"It is {scene.clock}, {PHASE_LABELS[scene.phase]}.{DROWSINESS.get(scene.phase, '')}"
+    mood = (DROWSINESS[scene.phase] if scene.sleepy else NOT_SLEEPY) if scene.phase in DROWSINESS else ""
+    text = f"It is {scene.clock}, {PHASE_LABELS[scene.phase]}.{mood}"
     if scene.kind == "wake_up":
         text += (
             " You have only just woken up. Start with a yawn or a stretch, in your own words and not always the "

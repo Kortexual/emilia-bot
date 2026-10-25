@@ -234,6 +234,36 @@ class SceneTests(unittest.TestCase):
         self.assertEqual(self.scene(now, now - timedelta(hours=10), spontaneous=True).kind, "wake_up")
 
 
+class SleepyTests(unittest.TestCase):
+    def scene(self, hour, rng, **kwargs):
+        now = datetime(2026, 10, 23, hour, 0, tzinfo=UTC)
+        return scene_for(now, now.timestamp() - 600, None, ideas=prompts.EVENT_IDEAS, event_cooldown_minutes=0, rng=rng, **kwargs)
+
+    def test_tiredness_shows_only_some_of_the_time_at_the_sleepy_hours(self):
+        for hour in (22, 23, 0, 2, 4):
+            rng = random.Random(hour)
+            shown = sum(self.scene(hour, rng).sleepy for _ in range(2000))
+            with self.subTest(hour=hour):
+                self.assertTrue(0.15 < shown / 2000 < 0.25, shown)
+
+    def test_the_rolls_decide_and_the_chance_can_be_changed(self):
+        self.assertTrue(self.scene(2, NeverLuckyRNG()).sleepy)  # 0.999 is in the top fifth of the range
+        self.assertFalse(self.scene(2, AlwaysLuckyRNG()).sleepy)  # 0.0 is not
+        self.assertTrue(self.scene(2, AlwaysLuckyRNG(), sleepy_chance=1.0).sleepy)
+        self.assertFalse(self.scene(2, NeverLuckyRNG(), sleepy_chance=0.0).sleepy)
+
+    def test_by_day_it_is_never_sleepy(self):
+        for hour in (6, 11, 13, 16, 20):
+            with self.subTest(hour=hour):
+                self.assertFalse(self.scene(hour, NeverLuckyRNG()).sleepy)
+
+    def test_a_random_event_at_night_carries_the_same_roll(self):
+        now = datetime(2026, 10, 23, 23, 0, tzinfo=UTC)
+        scene = scene_for(now, None, None, ideas=prompts.EVENT_IDEAS, event_cooldown_minutes=120, rng=AlwaysLuckyRNG())
+        self.assertEqual(scene.kind, "event")
+        self.assertFalse(scene.sleepy)  # a lucky roll means the event happens and she stays quiet about being tired
+
+
 class NoteTextTests(unittest.TestCase):
     def test_every_scene_kind_and_phase_renders(self):
         for phase in prompts.PHASE_LABELS:
@@ -250,6 +280,19 @@ class NoteTextTests(unittest.TestCase):
         self.assertIn("sleepy", prompts.time_note(Scene("11:00 PM on Friday", "night")))
         self.assertNotIn("sleepy", prompts.time_note(Scene("1:00 PM on Friday", "midday")))
         self.assertNotIn("drowsy", prompts.time_note(Scene("1:00 PM on Friday", "midday")))
+
+    def test_tiredness_is_only_mentioned_when_the_scene_says_so(self):
+        for phase, clock, word in (("night", "11:00 PM on Friday", "sleepy"), ("late_night", "2:00 AM on Friday", "drowsy")):
+            tired = prompts.time_note(Scene(clock, phase, sleepy=True))
+            quiet = prompts.time_note(Scene(clock, phase, sleepy=False))
+            with self.subTest(phase=phase):
+                self.assertIn(word, tired)
+                self.assertNotIn("Don't bring up being tired", tired)
+                self.assertIn("Don't bring up being tired or sleepy this time.", quiet)
+                self.assertNotIn("drowsy", quiet)
+                self.assertNotIn("a yawn", quiet)
+        day = prompts.time_note(Scene("1:00 PM on Friday", "midday", sleepy=False))
+        self.assertNotIn("tired", day)  # nothing to say by day, whatever the flag
 
     def test_a_wake_up_asks_for_a_yawn_and_a_good_morning_and_an_event_gives_examples(self):
         wake = prompts.time_note(Scene("7:00 AM on Friday", "early_morning", "wake_up"))
