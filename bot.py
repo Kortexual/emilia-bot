@@ -226,6 +226,27 @@ def _name_span(reading_words: list[str], candidate: _Candidate, anchor_n: str) -
     return None
 
 
+class BackgroundTyping:
+    """The "typing..." indicator, started without making the reply wait for it. Entering `channel.typing()`
+    waits for Discord's answer to the typing request (a round trip), and nothing in the reply depends on that.
+    If Discord refuses the request, the reply goes ahead without the indicator."""
+
+    def __init__(self, channel: Any) -> None:
+        self._typing = channel.typing()
+        self._started: asyncio.Future[None] | None = None
+
+    async def __aenter__(self) -> None:
+        self._started = asyncio.ensure_future(self._typing.__aenter__())
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        try:
+            await self._started
+        except discord.HTTPException as exc:
+            log.info("Could not show the typing indicator (%s)", exc)
+            return
+        await self._typing.__aexit__(*exc_info)
+
+
 class EmiliaBot(discord.Client):
     def __init__(
         self,
@@ -249,7 +270,14 @@ class EmiliaBot(discord.Client):
         self.settings = settings
         self.urls = UrlRegistry()  # links the model may open with fetch_page/browser_open: search results and the sender's links
         self.browser = BrowserSessions()  # Chromium starts only when a browser tool is first used
-        self.memory = memory or MemoryStore(settings.memory_db, settings.memory_turns)
+        # The remembered conversation is cut back a third at a time, not by one exchange per message, so that the
+        # start of the prompt stays the same for several messages and LM Studio can reuse its processed prompt.
+        self.memory = memory or MemoryStore(
+            settings.memory_db,
+            settings.memory_turns,
+            max_chars=settings.memory_max_chars,
+            trim_chunk=max(1, settings.memory_turns // 3),
+        )
         self.llm: ChatBackend = llm or LMStudioClient(
             base_url=settings.lmstudio_url,
             model=settings.lmstudio_model,
@@ -446,7 +474,7 @@ class EmiliaBot(discord.Client):
             await asyncio.sleep(FORWARD_COMMENT_WAIT)
             if self._forwards.get((message.channel.id, message.author.id)) is not message:
                 return
-        elif not text and not getattr(message, "attachments", None):  # a bare @mention
+        elif not text and forward is None and not getattr(message, "attachments", None):  # a bare @mention
             await self._send(message, prompts.GREETING)
             return
 
@@ -484,7 +512,7 @@ class EmiliaBot(discord.Client):
         from_bot = message.author.bot  # only possible with RESPOND_TO_BOTS: no computer tools, no pings by name
         people = self._people(message, quoted_author)
         author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
-        async with message.channel.typing():  # keeps "typing..." showing, even while queued
+        async with BackgroundTyping(message.channel):  # keeps "typing..." showing, even while queued
             async with self._channel_lock(key):
                 await self._attach_ids(key, people)
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
@@ -709,7 +737,7 @@ class EmiliaBot(discord.Client):
     async def _speak_up(self, channel: Any, key: str) -> None:
         """Say something nobody asked for. It never pings anyone and the model gets no tools: there is nobody
         to ask for a search or a command, and nobody who has confirmed anything."""
-        async with channel.typing():
+        async with BackgroundTyping(channel):
             async with self._channel_lock(key):
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
                 labels = self._labels(history, [])

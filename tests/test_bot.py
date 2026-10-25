@@ -276,6 +276,21 @@ class MentionRuleTests(BotTestCase):
         self.assertEqual(len(self.llm.calls), 1)
         self.assertGreaterEqual(self.channel.typing_count, 1)
 
+    async def test_a_typing_indicator_that_discord_refuses_does_not_stop_the_reply(self):
+        class Refused:
+            async def __aenter__(self):
+                raise http_error(403, discord.Forbidden, "Forbidden", "Missing Access")
+
+            async def __aexit__(self, *exc):
+                raise AssertionError("never entered")
+
+        bot = self.make_bot()
+        channel = FakeChannel()
+        channel.typing = Refused
+        message = self.msg(self.mention("hi there"), channel=channel)
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hello there!"])
+
     async def test_a_reply_that_pings_the_bot_counts_as_a_mention(self):
         # Discord lists the bot in `mentions` for pinging replies, but puts no <@id> in the text.
         bot = self.make_bot()
@@ -732,6 +747,15 @@ class ForwardTests(BotTestCase):
         await bot.on_message(self.msg(self.mention("second")))
         self.assertIn("forwarded", self.llm.calls[0][-1]["content"])
         self.assertNotIn("forwarded", self.llm.calls[1][-1]["content"])
+
+    async def test_a_bare_mention_after_a_forward_is_about_the_forward_not_a_greeting(self):
+        bot = self.make_bot()
+        alice = person()
+        await bot.on_message(self.forward(author=alice))
+        comment = self.msg(f"<@{BOT.id}>", author=alice)
+        await bot.on_message(comment)
+        self.assertEqual(comment.replies, ["Hello there!"])
+        self.assertIn("forwarded a message from Kiwi", self.last_prompt())
 
     async def test_a_forward_on_its_own_in_a_dm_is_answered(self):
         bot = self.make_bot(respond_to_dms=True)

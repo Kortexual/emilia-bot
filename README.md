@@ -228,6 +228,11 @@ It keeps the last `MEMORY_TURNS` exchanges and sends as many as fit in `MEMORY_M
   Discord user ID), so the bot keeps people apart and can ping them later. Memory files from older versions are upgraded automatically.
 - Only messages addressed to the bot, and its replies, are stored. It does not log the rest of the channel.
 - It is a window, not a permanent record: older exchanges drop off. Raise the limits if your model's context allows.
+- The window moves in steps. Once a channel is full (`MEMORY_TURNS` exchanges, or `MEMORY_MAX_CHARS` of text) the oldest third
+  is forgotten in one go, instead of one exchange per message. LM Studio can reuse the part of the prompt it has already processed
+  only while the start of the prompt is unchanged, so a window that slides by one exchange with every message would make it read the
+  whole history again each time (the main cause of a slow first token in a busy channel). With steps it reuses the history for several
+  messages in a row. The cost: the bot remembers between about two thirds of the limit and all of it.
 - `@Emilia !forget` clears one channel; deleting `memory.db` clears everything.
 
 ### People
@@ -320,8 +325,6 @@ All settings are environment variables (or lines in `.env`).
 | `VISION` | `false` | Send attached images to the model; needs a vision model (see "Images and files") |
 | `READ_FILES` | `true` | Put the contents of attached text files into the message |
 | `FILE_MAX_CHARS` | `6000` | Characters of attached text given to the model per message, across all files (minimum `500`) |
-| `FETCH_PAGES` | `true` | Let the model read whole web pages (see "Reading pages") |
-| `PAGE_MAX_CHARS` | `6000` | Characters of page text given to the model per fetch (minimum `500`) |
 | `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
 | `COMPUTER_WORKSPACE` | folder containing `bot.py` | The only folder those tools can access; direct paths cannot escape it and commands see it as `/workspace` in a Bubblewrap filesystem sandbox. |
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |

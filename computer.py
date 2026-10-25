@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -107,7 +108,7 @@ class WorkspaceTools:
             old, new = arguments.get("old"), arguments.get("new")
             if not isinstance(old, str) or not isinstance(new, str) or not old:
                 return ToolResult("Error: 'old' must be a non-empty string and 'new' must be a string.")
-            content = path.read_text(encoding="utf-8", errors="replace")
+            content = path.read_text(encoding="utf-8")  # strict: a file that isn't UTF-8 must not be rewritten with "\ufffd"s
             count = content.count(old)
             if count != 1:
                 return ToolResult(f"Error: expected 'old' exactly once, found it {count} times; file was not changed.")
@@ -137,6 +138,17 @@ class WorkspaceTools:
         except (OSError, ValueError) as exc:
             return ToolResult(f"Error: {exc}")
 
+    @staticmethod
+    def _kill(process: asyncio.subprocess.Process) -> None:
+        """Stop a command and everything it started."""
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)  # the command was started as the leader of its own group
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+
     async def run_command(self, arguments: dict[str, Any]) -> ToolResult:
         if denied := self._confirmed(arguments):
             return denied
@@ -148,10 +160,12 @@ class WorkspaceTools:
             if not cwd.is_dir():
                 return ToolResult("Error: cwd must be a directory inside the configured workspace.")
             env = {**os.environ, "TERM": "dumb"}
+            # Own process group, so a timeout can stop everything the command started, not just its shell.
+            group = {"start_new_session": True} if os.name == "posix" else {}
             if self.allow_host_access:
                 # This is intentionally the unrestricted mode selected by COMPUTER_ALLOW_HOST_ACCESS.
                 process = await asyncio.create_subprocess_shell(
-                    command, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
+                    command, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env, **group
                 )
             else:
                 sandbox = shutil.which("bwrap")
@@ -178,12 +192,16 @@ class WorkspaceTools:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     env=sandbox_env,
+                    **group,
                 )
             try:
                 output, _ = await asyncio.wait_for(process.communicate(), self.command_timeout)
             except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
+                self._kill(process)
+                try:  # a background process that kept the output open would otherwise make this wait for it
+                    await asyncio.wait_for(process.communicate(), 5)
+                except asyncio.TimeoutError:
+                    pass
                 return ToolResult(f"Error: command timed out after {self.command_timeout:g} seconds.")
             text = output.decode("utf-8", errors="replace")
             if len(text) > MAX_OUTPUT_CHARS:
