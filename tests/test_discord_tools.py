@@ -576,12 +576,14 @@ class ActionToolTests(DiscordToolTestCase):
         self.assertEqual(tools["send_message"].describe({"channel": "#random"}), "📨 Posting in `#random`")
 
     def test_tool_sets(self):
-        self.assertEqual(set(discord_tools.READ_TOOLS) | {"member_statuses"}, READ_TOOL_NAMES)
+        self.assertEqual(set(discord_tools.READ_TOOLS) | {"member_statuses", "list_servers"}, READ_TOOL_NAMES)
         self.assertTrue(BOT_SAFE_TOOLS <= ACTION_TOOL_NAMES)
+        self.assertIn("send_to_server", ACTION_TOOL_NAMES)  # so bot senders don't get it
         backend = DiscordTools(self.client, render=lambda m: m.content)
         self.assertEqual({t.name for t in discord_tools.discord_tools(backend)}, set(discord_tools.READ_TOOLS))
         with_statuses = {t.name for t in discord_tools.discord_tools(backend, statuses=True)}
-        self.assertEqual(with_statuses, READ_TOOL_NAMES)
+        self.assertEqual(with_statuses, set(discord_tools.READ_TOOLS) | {"member_statuses"})
+        self.assertNotIn("send_to_server", {t.name for t in discord_tools.discord_tools(backend, actions=True)})
 
     async def test_member_statuses_groups_people_and_marks_custom_status_untrusted(self):
         self.guild.members = [  # a list, as discord.py has it
@@ -623,6 +625,19 @@ class BotLevelTests(test_bot.BotTestCase):
         self.assertIn(prompts.DISCORD_RULES, system)
         self.assertIn(prompts.DISCORD_ACTION_RULES, system)
         self.assertEqual(self.llm.excludes[0], set())
+
+    async def test_cross_server_rules(self):
+        bot = self.make_bot(discord_tools=True, discord_actions=True, discord_cross_server=True)
+        await bot.on_message(self.msg(self.mention("hi")))
+        system = self.llm.calls[0][0]["content"]
+        self.assertIn(prompts.DISCORD_SERVER_RULES, system)
+        self.assertIn(prompts.DISCORD_SERVER_ACTION_RULES, system)
+        bot = self.make_bot(respond_to_bots=True, discord_tools=True, discord_actions=True, discord_cross_server=True)
+        await bot.on_message(self.msg(self.mention("hi"), author=SimpleNamespace(id=4242, display_name="OtherBot", bot=True)))
+        system = self.llm.calls[-1][0]["content"]
+        self.assertIn(prompts.DISCORD_SERVER_RULES, system)
+        self.assertNotIn(prompts.DISCORD_SERVER_ACTION_RULES, system)  # bots don't get send_to_server
+        self.assertIn("send_to_server", self.llm.excludes[-1])
 
     async def test_no_discord_rules_when_off(self):
         bot = self.make_bot()
@@ -1260,6 +1275,199 @@ class DiscordApiTests(AdminToolTestCase):
         self.client.http.error = discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "Missing Access")
         result = await self.api().run({"method": "GET", "path": "/channels/1"})
         self.assertEqual(result.text, "Discord answered 403: Missing Access")
+
+
+class ServerTests(DiscordToolTestCase):
+    """Other servers: named or given by ID, with list_servers and send_to_server, only with cross_server."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = Guild(200, "Book Nook", members=(BOB,))
+        self.lounge = Channel(60, "💬-the-lounge", self.other)
+        self.lounge.add("hello from the nook", author=BOB)
+        self.other_general = Channel(70, "general", self.other)
+        self.client.guilds.append(self.other)
+
+    def test_server_tools_and_arguments_only_with_cross_server(self):
+        plain = self.tools()
+        self.assertNotIn("list_servers", plain)
+        self.assertNotIn("send_to_server", plain)
+        self.assertNotIn("server", plain["list_channels"].schema["parameters"]["properties"])
+        cross = self.tools(cross_server=True)
+        self.assertIn("list_servers", cross)
+        self.assertEqual(cross["send_to_server"].schema["parameters"]["required"], ["server", "channel", "text"])
+        for name in ("list_channels", "read_messages", "list_pins", "list_threads"):
+            self.assertIn("server", cross[name].schema["parameters"]["properties"])
+        self.assertNotIn("server", cross["send_message"].schema["parameters"]["properties"])
+        self.assertIn("send_to_server", cross["send_message"].schema["description"])
+        self.assertIn("send_message", cross["send_to_server"].schema["description"])
+
+    async def test_list_servers_shows_names_and_ids(self):
+        self.context()
+        text = (await self.tools(cross_server=True)["list_servers"].run({})).text
+        self.assertIn("Tea Club (this server) [ID 100]", text)
+        self.assertIn("Book Nook [ID 200]", text)
+
+    async def test_a_server_by_name_or_id(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        for server in ("Book Nook", "book nook", "booknook", "200"):
+            text = (await tools["list_channels"].run({"server": server})).text
+            self.assertIn("Channels in Book Nook", text)
+            self.assertIn("id 60", text)
+        result = await tools["list_channels"].run({"server": "Nowhere"})
+        self.assertIn("aren't in a server called 'Nowhere'", result.text)
+        self.assertIn("list_servers", result.text)
+
+    async def test_two_servers_with_one_name_need_the_id(self):
+        self.client.guilds.append(Guild(300, "Book Nook"))
+        self.context()
+        result = await self.tools(cross_server=True)["list_channels"].run({"server": "Book Nook"})
+        self.assertIn("Several servers", result.text)
+        self.assertIn("(ID 200)", result.text)
+        self.assertIn("(ID 300)", result.text)
+
+    async def test_other_servers_are_refused_without_cross_server(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["list_channels"].run({"server": "Book Nook"})
+        self.assertIn("only reach this server", result.text)
+        result = await tools["read_messages"].run({"channel": "#general", "server": "100"})  # this server, by ID, is fine
+        self.assertIn("@Emilia hi", result.text)
+
+    async def test_send_to_server_by_names_and_ids(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        result = await tools["send_to_server"].run({"server": "Book Nook", "channel": "the lounge", "text": "hi all"})
+        self.assertEqual(result.text, "Posted in #💬-the-lounge in Book Nook as [m1].")
+        self.assertEqual(self.lounge.sent[0][0], "sent:hi all")
+        marker = prompts.SENT_HERE_MARKER.format(who="Alice", channel="#general (in Tea Club)")
+        self.assertEqual(self.remembered, [("60", marker, "hi all")])
+        result = await tools["send_to_server"].run({"server": "200", "channel": "70", "text": "again"})
+        self.assertEqual(result.text, "Posted in #general in Book Nook as [m2].")
+
+    async def test_send_to_server_names_a_channel_in_that_server(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        await tools["send_to_server"].run({"server": "Book Nook", "channel": "#general", "text": "hi"})
+        self.assertEqual(len(self.other_general.sent), 1)
+        self.assertEqual(self.general.sent, [])
+        result = await tools["send_to_server"].run({"server": "Book Nook", "channel": "20", "text": "hi"})  # #random is here
+        self.assertIn("isn't in Book Nook", result.text)
+        self.assertEqual(self.random.sent, [])
+        result = await tools["send_to_server"].run({"server": "", "channel": "#random", "text": "hi"})
+        self.assertIn("use send_message", result.text)
+
+    async def test_send_message_points_to_the_other_server(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        result = await tools["send_message"].run({"channel": "#the-lounge", "text": "hi"})
+        self.assertIn("isn't in this server, but there is one in Book Nook (ID 200)", result.text)
+        self.assertIn("send_to_server", result.text)
+        self.assertEqual(self.lounge.sent, [])
+        result = await self.tools()["send_message"].run({"channel": "#the-lounge", "text": "hi"})  # no hint without cross_server
+        self.assertNotIn("Book Nook", result.text)
+
+    async def test_channels_by_link_and_loose_name(self):
+        self.context()
+        tools = self.tools()
+        result = await tools["send_message"].run({"channel": "https://discord.com/channels/100/20", "text": "hi"})
+        self.assertEqual(result.text, "Posted in #random as [m1].")
+        Channel(80, "🍵-tea-time", self.guild)
+        result = await tools["send_message"].run({"channel": "Tea Time", "text": "hi"})
+        self.assertEqual(result.text, "Posted in #🍵-tea-time as [m2].")
+
+    async def test_an_exact_name_wins_over_a_loose_one(self):
+        Channel(81, "Ran-dom", self.guild)
+        self.context()
+        result = await self.tools()["send_message"].run({"channel": "#random", "text": "hi"})
+        self.assertEqual(result.text, "Posted in #random as [m1].")
+
+    async def test_reading_another_server_and_tool_lines(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        result = await tools["read_messages"].run({"channel": "the-lounge", "server": "Book Nook"})
+        self.assertIn("hello from the nook", result.text)
+        result = await tools["read_messages"].run({"server": "Book Nook"})
+        self.assertIn("Say which channel of Book Nook", result.text)
+        self.assertEqual(
+            tools["send_to_server"].describe({"server": "Book Nook", "channel": "#general"}), "📨 Posting in `#general` in `Book Nook`"
+        )
+        self.assertEqual(tools["read_messages"].describe({"server": "200", "channel": "#x"}), "👀 Reading `#x` in `200`")
+
+
+class FindingUsersTests(DiscordToolTestCase):
+    """lookup_member for people who aren't in this server: by ID, by message handle, and (cross-server) by name."""
+
+    def setUp(self):
+        super().setUp()
+        self.cara = SimpleNamespace(
+            id=123456789012345678, display_name="Cara", name="cara", global_name=None, bot=False, joined_at=None, roles=[]
+        )
+        self.other = Guild(200, "Book Nook", members=(self.cara,))
+        self.other.members = [self.cara]  # a list, as discord.py has it
+        self.other.get_member = lambda user_id: self.cara if user_id == self.cara.id else None
+
+        async def query_members(query, limit=5):
+            return [m for m in self.other.members if m.name.startswith(query.lower())][:limit]
+
+        self.other.query_members = query_members
+        self.nook = Channel(60, "nook", self.other)
+        self.client.guilds.append(self.other)
+        self.dana = SimpleNamespace(id=223456789012345678, display_name="Dana", name="dana", global_name=None, bot=False)
+        self.client.get_user = lambda user_id: {self.cara.id: self.cara, self.dana.id: self.dana}.get(user_id)
+        self.directory = {"dana": [self.dana.id]}
+
+    def tools(self, **kwargs):
+        async def people(name):
+            return self.directory.get(name.casefold(), [])
+
+        backend = DiscordTools(self.client, render=lambda m: m.content, people=people, **kwargs)
+        return {tool.name: tool for tool in discord_tools.discord_tools(backend, actions=True)}
+
+    async def test_a_user_id_finds_anyone(self):
+        self.context()
+        for value in (str(self.cara.id), f"<@{self.cara.id}>"):
+            text = (await self.tools()["lookup_member"].run({"name": value})).text
+            self.assertEqual(text, f"Cara (username cara, user ID {self.cara.id}): not in this server")
+
+    async def test_a_message_handle_means_its_author(self):
+        self.nook.add("hi", author=self.cara)
+        ctx = self.context()
+        await self.tools(cross_server=True)["read_messages"].run({"channel": "nook", "server": "Book Nook"})
+        self.assertEqual(ctx.handles.get("m1").author, self.cara)
+        text = (await self.tools()["lookup_member"].run({"name": "m1"})).text
+        self.assertIn(f"user ID {self.cara.id}): not in this server", text)
+
+    async def test_names_elsewhere_only_with_cross_server(self):
+        self.context()
+        text = (await self.tools()["lookup_member"].run({"name": "Cara"})).text
+        self.assertIn("No member of this server is called 'Cara'", text)
+        self.assertIn("Copy User ID", text)
+        self.assertNotIn("Book Nook", text)
+        tools = self.tools(cross_server=True)
+        text = (await tools["lookup_member"].run({"name": "cara"})).text
+        self.assertEqual(text, f"Cara (username cara, user ID {self.cara.id}): not in this server; a member of Book Nook")
+        text = (await tools["lookup_member"].run({"name": "Dana"})).text
+        self.assertIn(f"user ID {self.dana.id}): not in this server; you have talked with them before", text)
+        text = (await tools["lookup_member"].run({"name": "Zed"})).text
+        self.assertIn("nobody by that name in your other servers", text)
+
+    async def test_lookup_in_another_server(self):
+        self.context()
+        tools = self.tools(cross_server=True)
+        self.assertIn("server", tools["lookup_member"].schema["parameters"]["properties"])
+        text = (await tools["lookup_member"].run({"name": "Cara", "server": "Book Nook"})).text
+        self.assertEqual(text, f"Cara (username cara, user ID {self.cara.id}); roles: none")
+        self.assertIn("only reach this server", (await self.tools()["lookup_member"].run({"name": "Cara", "server": "200"})).text)
+
+
+class PeopleDirectoryTests(test_bot.BotTestCase):
+    async def test_people_named_matches_whole_saved_names(self):
+        bot = self.make_bot()
+        self.memory.observe_users([("42", [("display", "Jack Papel")]), ("43", [("display", "Jackie")])])
+        self.assertEqual(await bot._people_named("jack  papel"), [42])
+        self.assertEqual(await bot._people_named("Jack"), [])  # a prefix isn't a name
 
 
 if __name__ == "__main__":

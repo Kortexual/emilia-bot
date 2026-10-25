@@ -328,6 +328,7 @@ class EmiliaBot(discord.Client):
                         self,
                         render=self._render,
                         remember=self._remember_elsewhere,
+                        people=self._people_named,
                         max_chars=self.settings.page_max_chars,
                         max_actions=self.settings.discord_max_actions,
                         cross_server=self.settings.discord_cross_server,
@@ -680,6 +681,7 @@ class EmiliaBot(discord.Client):
             discord_actions=self.settings.discord_actions and not from_bot,
             discord_admin=self.settings.discord_admin_tools and not from_bot,
             discord_api=self.settings.arbitrary_discord_tools and not from_bot,
+            discord_cross_server=self.settings.discord_cross_server,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -904,6 +906,18 @@ class EmiliaBot(discord.Client):
         if lock is None:
             lock = self._locks[key] = asyncio.Lock()
         return lock
+
+    async def _people_named(self, name: str) -> list[int]:
+        """User IDs the people directory has saved under exactly `name` (ignoring case and spacing), newest
+        first: how lookup_member finds someone who isn't in this server."""
+        wanted = " ".join(name.casefold().split())
+        try:
+            ids = await asyncio.to_thread(self.memory.find_by_alias, wanted)
+            aliases = await asyncio.to_thread(self.memory.aliases, ids)
+        except sqlite3.Error:
+            log.exception("Could not search the people directory")
+            return []
+        return [int(i) for i in ids if any(" ".join(a.casefold().split()) == wanted for a in aliases.get(i, []))]
 
     async def _remember_elsewhere(self, key: str, marker: str, text: str) -> None:
         """Remember a message she posted in another channel than the one she is answering in (send_message,

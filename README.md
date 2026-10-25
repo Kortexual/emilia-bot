@@ -203,13 +203,27 @@ With `DISCORD_TOOLS=true` the model can look around Discord in the middle of a r
 last messages of a channel, up to 50, or those around a message), `lookup_member` (names, join date, roles), `list_pins` and
 `list_threads`, plus `member_statuses` (who is online, idle or busy, and what they are doing) when `PRESENCE_INTENT=true`; without
 it the bot logs at startup that the tool is not offered. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`, `edit_message` and `delete_message` (her
-own messages only), `start_thread`, `send_message` (another channel), `pin`/`unpin` and `create_poll`. The code is in `discord_tools.py`.
+own messages only), `start_thread`, `send_message` (another channel of this server), `pin`/`unpin` and `create_poll`. The code is
+in `discord_tools.py`.
 
 - **She acts as herself.** Every action uses the bot's own permissions, so what you allow the bot in a server is what anyone who
   can mention her can get done through her. Grant permissions with that in mind.
 - **Her own permissions.** She is treated like any other member: she can see the channels her roles let her see, whoever asks,
   and Discord refuses what her roles don't allow. A private thread is only seen once she is in it. Channels in other servers are out
   of reach unless `DISCORD_CROSS_SERVER=true`.
+- **Other servers.** With `DISCORD_CROSS_SERVER=true` she also gets `list_servers`, and `send_to_server` with `DISCORD_ACTIONS`.
+  Posting elsewhere is split in two on purpose: `send_message` is for this server and `send_to_server` (which requires a `server`)
+  for another one, because with one tool the model kept looking for the other server's channel in this one. `list_channels`,
+  `read_messages`, `list_pins` and `list_threads` take an optional `server` too. If `send_message` gets a channel name that only
+  exists in another server, the error names that server and points to `send_to_server`.
+- **Names or IDs.** A server is its name or ID; a channel is `#name`, an ID, a `<#id>` mention or a channel link. Names ignore case,
+  and if nothing matches exactly, spaces, dashes and emoji too (`Tea Time` finds `#🍵-tea-time`). A name that fits several is
+  refused with their IDs, never guessed.
+- **Finding people.** `lookup_member` takes a name, a user ID, a mention or a message handle (`m3` means its author), and shows
+  user IDs. A user ID or handle works for someone who isn't in this server. With `DISCORD_CROSS_SERVER=true`, a name not found here
+  is looked for among the members of her other servers that Discord has sent, then in the people directory (anyone she has talked
+  with), and the result says where they were found. Discord has no way for a bot to search everyone by name, so beyond that the
+  tool tells the model to ask for a user ID (Copy User ID with Developer Mode), a mention or a link to one of their messages.
 - **Handles, not IDs.** The model never sees message IDs. `read_messages` and `list_pins` label each message `[m1]`, `[m2]`, ...
   and the action tools take those, `this` (the message she is answering), `replied` (the one it replies to), `mine` / `mine-2`
   (her latest messages in this reply), or a message link the sender wrote. Anything else, like an ID the model made up, is refused.
@@ -248,7 +262,8 @@ own messages only), `start_thread`, `send_message` (another channel), `pin`/`unp
 curated tool covers, with her own permissions, for anyone but other bots. Calls other than `GET` need `confirm=true` unless
 `ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION=false` (that flag is the safety: switch it off once her permissions are what you
 want), and count against
-`DISCORD_MAX_ACTIONS`. Paths take numeric IDs, which `lookup_member` (user IDs), `discord_info` (the server's and her own) and
+`DISCORD_MAX_ACTIONS`. Its description and the prompt point posting at `send_message`/`send_to_server` instead. Paths take numeric
+IDs, which `lookup_member` (user IDs), `discord_info` (the server's and her own), `list_servers` (other servers') and
 `list_channels` show; a name where an ID belongs (`/bans/jackpapel`) is refused with that hint. A body that can carry a message gets `allowed_mentions: {"parse": []}` forced in, so it still can't
 mass-ping, and its `content` goes through the reply checks. A few paths are always refused: OAuth2 and the bot's application,
 the gateway, interaction and webhook-token URLs, deleting a server, pruning and bulk bans (`API_DENYLIST` in
@@ -363,7 +378,7 @@ All settings are environment variables (or lines in `.env`).
 | `DISCORD_TOOLS` | `false` | Let the model read Discord: server info, channels, recent messages, members, pins, threads (see "Discord tools") |
 | `DISCORD_ACTIONS` | `false` | Also let it react, edit or delete its own messages, start threads, post in other channels, pin and start polls (needs `DISCORD_TOOLS`) |
 | `DISCORD_MAX_ACTIONS` | `5` | Most Discord actions in one reply (minimum `1`) |
-| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach channels in other servers (ones the sender is in too) |
+| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach other servers she is in: `list_servers`, `send_to_server`, and a `server` argument on the channel tools |
 | `DISCORD_ADMIN_TOOLS` | `false` | Moderation: remove messages, time out, kick, ban, roles, channel and server edits, with her own permissions (needs `DISCORD_TOOLS`) |
 | `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each moderation tool call |
 | `ARBITRARY_DISCORD_TOOLS` | `false` | Offer `discord_api`, raw Discord REST calls with her own permissions (needs `DISCORD_TOOLS`) |
