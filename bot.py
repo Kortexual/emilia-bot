@@ -43,12 +43,14 @@ from typing import Any, Collection, Protocol
 import discord
 
 import browser
+import discord_tools
 import presence
 import prompts
 import styleguard
 from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
+from discord_tools import ACTION_TOOL_NAMES, BOT_SAFE_TOOLS, DiscordContext, DiscordTools, Outgoing
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, Presence, StoredMessage
@@ -69,6 +71,8 @@ FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the 
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
 FORWARD_COMMENT_WAIT = 2.0  # seconds a forward on its own (in a DM) waits for a comment that would answer it instead
 OPERATOR_TOOLS = COMPUTER_TOOL_NAMES | {RestartTool.name}  # never offered when the sender is a bot (RESPOND_TO_BOTS)
+BOT_EXCLUDED_TOOLS = OPERATOR_TOOLS | (ACTION_TOOL_NAMES - BOT_SAFE_TOOLS)  # bots still get the read tools and reactions
+OTHER_CHANNEL_LOCK_TIMEOUT = 10  # seconds to wait for another channel's lock before skipping its memory
 
 
 class ChatBackend(Protocol):
@@ -315,6 +319,20 @@ class EmiliaBot(discord.Client):
                     "BROWSER_TOOLS is on but Playwright is missing (pip install playwright && playwright install chromium): "
                     "browser tools disabled."
                 )
+        if self.settings.discord_tools:
+            tools.extend(
+                discord_tools.discord_tools(
+                    DiscordTools(
+                        self,
+                        render=self._render,
+                        remember=self._remember_elsewhere,
+                        max_chars=self.settings.page_max_chars,
+                        max_actions=self.settings.discord_max_actions,
+                        cross_server=self.settings.discord_cross_server,
+                    ),
+                    actions=self.settings.discord_actions,
+                )
+            )
         return tools
 
     # --- lifecycle -------------------------------------------------------------
@@ -521,7 +539,37 @@ class EmiliaBot(discord.Client):
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
                 kept: list[str] = []  # what was posted, as the model wrote it (plain "@Name"s): this is remembered
+                in_thread: list[str] = []  # the part of it posted in a thread she started (start_thread)
                 posted = False
+
+                async def finish(reply: str, *, pings: bool, lookup: bool = False) -> Outgoing:
+                    """The last steps for text the model wrote: the emoji cooldown, then pings for people in the
+                    conversation (and, with `lookup`, people the sender asked for by name)."""
+                    if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
+                        reply = styleguard.cool_down(reply, [*recent, *kept])
+                    if not pings:
+                        return Outgoing(reply, reply)
+                    pingable = self._pingable(labels, known)
+                    if lookup and not from_bot:  # "the sender typed their name" only counts for people
+                        pingable.update(await self._lookup_members(message, reply, text, pingable))
+                    linked, pinged = link_mentions(reply, pingable)
+                    return Outgoing(linked, reply, pinged)
+
+                async def prepare(draft: str, pings: bool) -> Outgoing | None:
+                    """Text a Discord tool is about to post: the same checks as a reply; None if nothing is left of it."""
+                    reply = clean_reply(draft, self._speaker_names())
+                    if contains_cipher_script(reply):
+                        log.warning("Blocked tool text written in braille/cipher script")
+                        return None
+                    if reply and prompts.LEAK_DETECTOR.leaks(reply):
+                        log.warning("Blocked tool text that repeated the system prompt")
+                        return None
+                    out = await finish(reply, pings=pings) if reply else None
+                    return out if out is not None and out.plain.strip() else None
+
+                context = DiscordContext(message, prepare)  # what the Discord tools work from
+                context.handles.allow_links(message.content)
+                discord_tools.CONTEXT.set(context)
 
                 async def post(reply: str, *, from_model: bool = True) -> None:
                     """Post one message. Canned lines (from_model=False) are neither remembered nor allowed to ping anyone."""
@@ -532,16 +580,14 @@ class EmiliaBot(discord.Client):
                             log.warning("Blocked a reply that repeated the system prompt")
                             reply, from_model = prompts.BLOCKED_REPLY, False
                         else:
-                            if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
-                                reply = styleguard.cool_down(reply, [*recent, *kept])
-                            kept.append(reply)
-                            pingable = self._pingable(labels, known)
-                            if not from_bot:  # "the sender typed their name" only counts for people
-                                pingable.update(await self._lookup_members(message, reply, text, pingable))
-                            reply, pinged = link_mentions(reply, pingable)
+                            out = await finish(reply, pings=True, lookup=True)
+                            kept.append(out.plain)
+                            if context.redirect is not None:
+                                in_thread.append(out.plain)
+                            reply, pinged = out.text, out.pinged
                     if reply:
                         posted = True
-                        await self._send(message, reply, pinged)
+                        context.posted.extend(await self._send(message, reply, pinged, into=context.redirect))
 
                 async def on_text(draft: str) -> None:
                     reply = clean_reply(draft, self._speaker_names())
@@ -555,7 +601,11 @@ class EmiliaBot(discord.Client):
                 async def on_tool(use: ToolUse) -> None:
                     nonlocal posted
                     posted = True
-                    sent = await message.channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
+                    if use.quiet:  # e.g. a reaction: it shows by itself
+                        log.info("Quiet tool: %s", use.description)
+                        return
+                    channel = context.redirect or message.channel
+                    sent = await channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
                     tool_messages[id(use)] = sent
 
                 async def on_tool_done(use: ToolUse) -> None:
@@ -567,7 +617,7 @@ class EmiliaBot(discord.Client):
                     except discord.HTTPException as exc:
                         log.info("Could not add links to a tool message (%s)", exc)
 
-                exclude = OPERATOR_TOOLS if from_bot else ()
+                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
                 try:
                     result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
                     reply = clean_reply(result.text, self._speaker_names())
@@ -599,6 +649,8 @@ class EmiliaBot(discord.Client):
                     except sqlite3.Error:
                         log.exception("Could not save this exchange to memory")
                     await self._record_spoke(key, bool(scene and scene.kind))
+                    if context.redirect is not None:  # the thread starts out knowing where it came from
+                        await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
     def _system_prompt(self, *, from_bot: bool = False) -> str:
@@ -613,6 +665,8 @@ class EmiliaBot(discord.Client):
             fetch_pages=self.settings.fetch_pages,
             browser_tools=self.settings.browser_tools,
             time_awareness=self.settings.time_awareness,
+            discord_tools=self.settings.discord_tools,
+            discord_actions=self.settings.discord_actions and not from_bot,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -838,6 +892,23 @@ class EmiliaBot(discord.Client):
             lock = self._locks[key] = asyncio.Lock()
         return lock
 
+    async def _remember_elsewhere(self, key: str, marker: str, text: str) -> None:
+        """Remember a message she posted in another channel than the one she is answering in (send_message,
+        or the start of a thread), under that channel's lock. The current channel's lock is already held, so
+        the other one is only waited for so long: two replies posting into each other's channels can't deadlock."""
+        lock = self._channel_lock(key)
+        try:
+            await asyncio.wait_for(lock.acquire(), OTHER_CHANNEL_LOCK_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("Channel %s stayed busy; not remembering the message posted there", key)
+            return
+        try:
+            await asyncio.to_thread(self.memory.add_turn, key, "", "", marker, text)
+        except sqlite3.Error:
+            log.exception("Could not save a message posted in channel %s to memory", key)
+        finally:
+            lock.release()
+
     async def _lookup_members(
         self, message: discord.Message, reply: str, typed: str, already: dict[str, int]
     ) -> dict[str, int]:
@@ -1053,20 +1124,25 @@ class EmiliaBot(discord.Client):
             return "", None
         return body, quoted.author
 
-    async def _send(self, message: discord.Message, text: str, pinged: list[int] | None = None) -> None:
-        """Reply to the message, spilling over into follow-up messages if it is long.
-        Only the users in `pinged` are actually notified by mentions in the text."""
+    async def _send(
+        self, message: discord.Message, text: str, pinged: list[int] | None = None, *, into: Any = None
+    ) -> list[Any]:
+        """Reply to the message, spilling over into follow-up messages if it is long, and return what was sent.
+        Only the users in `pinged` are actually notified by mentions in the text. With `into` (a thread she
+        started during this reply), everything is posted there instead."""
         allowed = discord.AllowedMentions(users=[discord.Object(user_id) for user_id in pinged or []])
+        sent = []
         for index, chunk in enumerate(split_message(text, CHUNK_SIZE)):
-            if index == 0:
+            if index == 0 and into is None:
                 try:
-                    await message.reply(chunk, allowed_mentions=allowed)
+                    sent.append(await message.reply(chunk, allowed_mentions=allowed))
                     continue
                 except discord.Forbidden:
                     raise
                 except discord.HTTPException as exc:  # e.g. the original message was deleted meanwhile
                     log.info("Could not reply to message %s (%s); posting normally instead", message.id, exc)
-            await message.channel.send(chunk, allowed_mentions=allowed)
+            sent.append(await (into or message.channel).send(chunk, allowed_mentions=allowed))
+        return sent
 
 
 def main() -> None:

@@ -380,7 +380,7 @@ class BotSenderTests(BotTestCase):
     async def test_computer_and_restart_tools_are_withheld_from_bots(self):
         bot = self.make_bot(respond_to_bots=True, computer_tools=True)
         await bot.on_message(self.from_bot("delete everything"))
-        self.assertEqual(self.llm.excludes[0], set(OPERATOR_TOOLS))
+        self.assertTrue(OPERATOR_TOOLS <= self.llm.excludes[0])
         self.assertIn("restart_bot", OPERATOR_TOOLS)
         self.assertEqual(OPERATOR_TOOLS - {"restart_bot"}, {tool.name for tool in computer_tools(".")})
         self.assertNotIn(prompts.COMPUTER_RULES, self.llm.calls[0][0]["content"])
@@ -1785,6 +1785,19 @@ class RandomMessageTests(DayTestCase):
         self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "user"])
         self.assertEqual(sent[1]["content"], prompts.UNPROMPTED_MARKER)  # shown plainly, not as a person's message
         self.assertEqual(sent[2]["content"], "I found a flower!")
+
+    async def test_a_message_posted_from_another_channel_is_remembered_with_a_marker(self):
+        bot = self.random_bot(llm=FakeLLM(text="Hi!"))
+        marker = prompts.SENT_HERE_MARKER.format(who="Alice", channel="#kitchen")
+        await bot._remember_elsewhere(str(self.CHANNEL_ID), marker, "Dinner is ready!")
+        await bot.on_message(self.msg(self.mention("(You said dinner?)"), channel=self.channel))
+        sent = self.llm.calls[-1]
+        self.assertEqual(sent[1]["content"], marker)  # shown plainly, like the marker for speaking up
+        self.assertEqual(sent[2]["content"], "Dinner is ready!")
+        await bot.on_message(self.msg(self.mention("thanks"), channel=self.channel))
+        remembered = self.llm.calls[-1][3]["content"]
+        self.assertIn("(You said dinner?)", remembered)
+        self.assertIn('name="Alice"', remembered)  # a person writing "(You ..." is still a person
 
     async def test_the_first_message_of_the_morning_can_be_a_good_morning(self):
         bot = self.random_bot(hour=8, time_awareness=True)

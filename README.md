@@ -196,6 +196,33 @@ is missing the bot starts without these tools and logs a warning. The browser is
   talk the model into typing something from the conversation into a form, which no filter can rule out; the confirmation rule and
   the prompt are the defence, so only turn this on where you trust the people who can prompt the bot.
 
+### Discord tools
+With `DISCORD_TOOLS=true` the model can look around Discord in the middle of a reply, through the same tool loop as web search:
+`discord_info` (how many servers she is in, uptime, this server's member count and roles), `list_channels`, `read_messages` (the
+last messages of a channel, up to 50, or those around a message), `lookup_member` (names, join date, roles), `list_pins` and
+`list_threads`. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`, `edit_message` and `delete_message` (her
+own messages only), `start_thread`, `send_message` (another channel), `pin`/`unpin` and `create_poll`. The code is in `discord_tools.py`.
+
+- **She acts as herself.** Every action uses the bot's own permissions, so what you allow the bot in a server is what anyone who
+  can mention her can get done through her. Grant permissions with that in mind.
+- **Only what the sender can see.** Channels (and their messages, pins and threads) are only listed, read or posted to if both she
+  and the sender can see them. Pinning also needs the sender to be allowed to pin there. Channels in other servers are out of
+  reach unless `DISCORD_CROSS_SERVER=true`, and then only in servers the sender is in too.
+- **Handles, not IDs.** The model never sees message IDs. `read_messages` and `list_pins` label each message `[m1]`, `[m2]`, ...
+  and the action tools take those, `this` (the message she is answering), `replied` (the one it replies to), `mine` / `mine-2`
+  (her latest messages in this reply), or a message link the sender wrote. Anything else, like an ID the model made up, is refused.
+  Handles last for one reply.
+- **Text goes through the reply checks.** Messages, edits, thread names and poll text are cleaned and checked for prompt leaks,
+  braille and the emoji cooldown like a reply. A message posted elsewhere can ping people in this conversation only; an edit pings
+  nobody new. A message posted in another channel is remembered there (marked as posted on someone's request); edits and deletes
+  don't rewrite memory, which keeps the conversation as it happened.
+- **Threads.** After `start_thread`, the rest of the reply (text and tool lines) goes into the new thread, whose memory starts with a
+  note about where it came from.
+- **Limits.** `DISCORD_MAX_ACTIONS` (default 5) caps the actions in one reply, so a model stuck in a loop can't spam. Reactions post
+  no tool line (tools can set `quiet = True`), since they show by themselves. Read results are marked as untrusted, like search results.
+- **Bots and unprompted messages.** A bot sender (`RESPOND_TO_BOTS`) gets the read tools and reactions, but no other actions.
+  Messages she starts on her own get no tools at all, as before.
+
 ### Memory
 Language models remember nothing between requests, so "memory" means re-sending recent messages. After each successful
 reply the bot saves the exchange (who said what, and the answer) to `memory.db` (SQLite), per channel, thread or DM.
@@ -301,6 +328,10 @@ All settings are environment variables (or lines in `.env`).
 | `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
 | `BROWSER_TOOLS` | `false` | Give the model a headless browser it can open, read and click around in (needs Playwright; see "Browsing") |
 | `BROWSER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each browser click, typing or dropdown choice. Set `false` to let the model use pages freely. |
+| `DISCORD_TOOLS` | `false` | Let the model read Discord: server info, channels, recent messages, members, pins, threads (see "Discord tools") |
+| `DISCORD_ACTIONS` | `false` | Also let it react, edit or delete its own messages, start threads, post in other channels, pin and start polls (needs `DISCORD_TOOLS`) |
+| `DISCORD_MAX_ACTIONS` | `5` | Most Discord actions in one reply (minimum `1`) |
+| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach channels in other servers (ones the sender is in too) |
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
@@ -349,6 +380,7 @@ websearch.py  the web_search tool (swap search engines here)
 webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
 browser.py    the opt-in browser tools (Playwright) and the proxy that keeps them on the public internet
 computer.py   the opt-in workspace file and terminal tools
+discord_tools.py  the opt-in Discord tools: reading channels and members, reacting, threads, posting
 restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory
 styleguard.py cooldown for emoji tics, expiry of standing instructions
