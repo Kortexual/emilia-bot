@@ -72,6 +72,9 @@ API_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
 _LINK = re.compile(r"https?://(?:www\.|ptb\.|canary\.)?discord(?:app)?\.com/channels/(?:\d+|@me)/(\d+)/(\d+)", re.IGNORECASE)
 _CHANNEL_MENTION = re.compile(r"<#(\d+)>")
 _CUSTOM_EMOJI = re.compile(r"<a?:(\w+):(\d+)>")
+_USER_MENTION = re.compile(r"<@!?(\d+)>")
+_LABEL_SUFFIX = re.compile(r"(.+?)\s+#(\d{4})")  # "Alex #4821": how the prompt tells two people with one name apart
+_ID_BEFORE = {"guilds", "channels", "users", "members", "bans", "roles"}  # in an API path, what follows these is an ID
 
 
 @dataclass
@@ -108,6 +111,10 @@ class MessageHandles:
 
     def get(self, handle: str) -> discord.Message | None:
         return self._messages.get(handle)
+
+    def authors(self) -> list[Any]:
+        """Who wrote the messages read during this reply: people the model may well name next."""
+        return [message.author for message in self._messages.values()]
 
     def allow_links(self, text: str) -> None:
         """Message links in what the sender wrote may be used like handles."""
@@ -174,6 +181,25 @@ def _is_thread(channel: Any) -> bool:
 
 def _is_category(channel: Any) -> bool:
     return isinstance(channel, discord.CategoryChannel) or getattr(channel, "type", None) == discord.ChannelType.category
+
+
+def _norm_name(text: Any) -> str:
+    return " ".join(str(text).casefold().split())
+
+
+def _member_names(user: Any) -> set[str]:
+    """Every name someone goes by, as typed or as the prompt shows it (cleaned by prompts.safe_name)."""
+    raw = [user.display_name, getattr(user, "name", None), getattr(user, "global_name", None), getattr(user, "nick", None)]
+    names = {_norm_name(n) for n in raw if n} | {_norm_name(prompts.safe_name(str(n), default="")) for n in raw if n}
+    return names - {""}
+
+
+def _why(exc: Exception) -> str:
+    """Discord's own reason for refusing, for the model to pass on."""
+    status = getattr(exc, "status", None)
+    text = _short(str(getattr(exc, "text", "") or exc or status), 200)
+    hint = " Your highest role may be too low, or you may lack the permission." if status == 403 else ""
+    return f" Discord said: {text}" + (f" ({status})." if status else ".") + hint
 
 
 def _short(text: str, max_chars: int) -> str:
@@ -306,6 +332,56 @@ class DiscordTools:
             "or a message link the sender wrote."
         )
 
+    async def _members_named(self, ctx: DiscordContext, guild: Any, value: Any, *, prefix: bool = False) -> list[Any]:
+        """The members `value` could mean. A mention (<@id>) or numeric user ID is looked up directly.
+        A name is compared with every name people go by (display name, username, global name, nickname) among
+        everyone known: people in this conversation, authors of messages read during this reply, members Discord
+        has sent, and Discord's member search (which only matches the start of usernames and nicknames). An exact
+        name wins; then a first word ("Jack" for "Jack Papel"); then, with `prefix` (for searching, never for
+        moderation), the start of a name. "Alex #4821", the prompt's way to tell two Alexes apart, picks the one
+        whose ID ends in 4821."""
+        raw = " ".join(str(value or "").split())
+        mention = _USER_MENTION.fullmatch(raw)
+        if mention or (raw.isdigit() and len(raw) >= 15):
+            user_id = int(mention.group(1) if mention else raw)
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.HTTPException:
+                    member = None
+            return [member] if member is not None else []
+        raw = raw.lstrip("@")[:64]
+        tail = None
+        labelled = _LABEL_SUFFIX.fullmatch(raw)
+        if labelled:
+            raw, tail = labelled.group(1), labelled.group(2)
+        wanted = _norm_name(raw)
+        if not wanted:
+            return []
+        pool: dict[int, Any] = {}
+        for user in [*ctx.message.mentions, ctx.sender, *ctx.handles.authors(), *list(getattr(guild, "members", []) or [])]:
+            if getattr(user, "id", None) is not None:
+                pool.setdefault(user.id, user)
+        named = guild.get_member_named(raw) if hasattr(guild, "get_member_named") else None
+        if named is not None:
+            pool.setdefault(named.id, named)
+        for query in dict.fromkeys([raw, raw.split()[0]]):
+            try:
+                for member in await guild.query_members(query, limit=10):
+                    pool.setdefault(member.id, member)
+            except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException, ValueError) as exc:
+                log.info("Member search for %r failed (%s)", query, exc)
+        people = [user for user in pool.values() if tail is None or str(user.id).endswith(tail)]
+        exact = [user for user in people if wanted in _member_names(user)]
+        if exact:
+            return exact
+        first = wanted.split()[0]
+        by_first = [user for user in people if any(name.split()[0] == first for name in _member_names(user))]
+        if by_first or not prefix:
+            return by_first
+        return [user for user in people if any(name.startswith(wanted) for name in _member_names(user))]
+
     def _spend(self, ctx: DiscordContext) -> None:
         """Count one action against the per-reply budget."""
         if ctx.actions >= self.max_actions:
@@ -349,6 +425,7 @@ class DiscordTools:
         lines = [
             f"You are in {len(self.client.guilds)} server(s). Online for {_duration(self._clock() - self._started)}"
             + (f", latency {latency * 1000:.0f} ms." if latency == latency and latency != float("inf") else ".")
+            + (f" Your user ID is {self.client.user.id}." if self.client.user is not None else "")
         ]
         guild = ctx.message.guild
         if guild is None:
@@ -358,7 +435,7 @@ class DiscordTools:
             visible = [c for c in channels if await self._can_see(ctx, c, history=False)]
             roles = [_name(role.name) for role in reversed(guild.roles) if not role.is_default()][:MAX_ROLES]
             lines.append(
-                f"This server: {_name(guild.name)}, {guild.member_count or 'unknown'} members, "
+                f"This server: {_name(guild.name)} (ID {guild.id}), {guild.member_count or 'unknown'} members, "
                 f"created {guild.created_at:%Y-%m-%d}. Channels you can see: {len(visible)}."
             )
             if roles:
@@ -425,19 +502,13 @@ class DiscordTools:
         if query.lower() in {"", "me", "sender"}:
             found = [ctx.sender]
         else:
-            found = [user for user in ctx.message.mentions if query.lower() in {user.display_name.lower(), user.name.lower()}]
-            if not found:
-                try:
-                    found = await guild.query_members(query, limit=5)
-                except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException) as exc:
-                    log.info("Member search for %r failed (%s)", query, exc)
-                    return ToolResult("Error: the member search failed.")
+            found = await self._members_named(ctx, guild, query, prefix=True)
         if not found:
             return ToolResult(f"No member of this server is called {query!r}.")
         lines = []
         for user in found[:5]:
             member = user if isinstance(user, discord.Member) else guild.get_member(user.id)
-            line = f"{_name(user.display_name)} (username {_name(user.name)}{', a bot' if user.bot else ''})"
+            line = f"{_name(user.display_name)} (username {_name(user.name)}, user ID {user.id}{', a bot' if user.bot else ''})"
             if member is not None:
                 if member.joined_at:
                     line += f": joined {member.joined_at:%Y-%m-%d}"
@@ -694,11 +765,18 @@ class DiscordTools:
                 "Confirmation required: repeat this call with confirm=true, but only if the sender clearly asked for exactly this."
             )
 
-    def _moderating(self, ctx: DiscordContext, arguments: dict[str, Any]) -> None:
-        """Moderation happens in a server and, unless turned off, needs confirm=true. Whether she may do it is
-        up to her own roles, like for any other member: Discord refuses what they don't allow."""
-        if ctx.message.guild is None:
+    def _moderating(self, ctx: DiscordContext, arguments: dict[str, Any], permission: str, channel: Any = None) -> None:
+        """Moderation happens in a server, needs her to have `permission` (in `channel`, if given) and, unless
+        turned off, confirm=true. It is her own permission that counts, like for any other member; checking it
+        first tells the model why instead of leaving it to guess from Discord's refusal."""
+        guild = ctx.message.guild
+        if guild is None:
             raise _Refused("That only works in a server.")
+        me = guild.me
+        perms = channel.permissions_for(me) if channel is not None else getattr(me, "guild_permissions", None)
+        if perms is not None and not getattr(perms, permission, False):
+            where = f"in {_channel_label(channel)}" if channel is not None else "in this server"
+            raise _Refused(f"You don't have the {permission.replace('_', ' ').title()} permission {where}, so Discord won't let you.")
         self._confirmed(arguments, self.admin_confirmation)
 
     @staticmethod
@@ -712,9 +790,9 @@ class DiscordTools:
         name that matches exactly one member. Never herself or the server owner, and only someone ranked
         below her."""
         guild = ctx.message.guild
-        raw = " ".join(str(value or "").split()).lstrip("@")
+        raw = " ".join(str(value or "").split())
         if not raw:
-            raise _Refused("Say who: a name, or a message handle like m3 to mean its author.")
+            raise _Refused("Say who: a name, a user ID, or a message handle like m3 to mean its author.")
         found: Any = None
         if re.fullmatch(r"\[?(m\d+|this|replied|mine(-\d+)?)\]?", raw.lower()) or ctx.handles.link(raw):
             author = (await self._message(ctx, raw)).author
@@ -725,27 +803,15 @@ class DiscordTools:
                 except discord.HTTPException:
                     raise _Refused("The author of that message isn't in this server anymore.") from None
         else:
-            raw = raw[:64]  # only names are cut: a message link is longer
-            wanted = raw.lower()
-
-            def names(user: Any) -> set[str]:
-                return {str(n).lower() for n in (user.display_name, user.name, getattr(user, "global_name", None)) if n}
-
-            matches = [user for user in ctx.message.mentions if wanted in names(user)]
-            if not matches:
-                try:
-                    matches = [m for m in await guild.query_members(raw, limit=10) if wanted in names(m)]
-                except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException) as exc:
-                    log.info("Member search for %r failed (%s)", raw, exc)
-                    raise _Refused("The member search failed.") from None
-            matches = list({m.id: m for m in matches}.values())
+            matches = await self._members_named(ctx, guild, raw)
             if len(matches) > 1:
-                raise _Refused(f"Several members are called {raw!r}; point at one of their messages with a handle instead.")
+                options = ", ".join(f"{_name(m.display_name)} (user ID {m.id})" for m in matches[:5])
+                raise _Refused(f"Several members could be {raw!r}: {options}. Use the user ID of the one you mean.")
             found = matches[0] if matches else None
-            if found is not None and not hasattr(found, "top_role"):
+            if found is not None and not hasattr(found, "top_role"):  # a user from a message, not a member
                 found = guild.get_member(found.id)
         if found is None:
-            raise _Refused(f"No member of this server is called {raw!r}.")
+            raise _Refused(f"No member of this server is called {raw!r}. lookup_member can search, or use their user ID.")
         me = self.client.user
         if me is not None and found.id == me.id:
             raise _Refused("You won't use moderation tools on yourself.")
@@ -777,50 +843,52 @@ class DiscordTools:
     async def remove_message(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
         target = await self._message(ctx, arguments.get("message"))
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "manage_messages", target.channel)
         self._spend(ctx)
         try:
             # Message.delete() can't carry an audit log reason; the HTTP call can.
             await self.client.http.delete_message(target.channel.id, target.id, reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not remove message %s (%s)", target.id, exc)
-            return ToolResult("Error: that message couldn't be removed.")
+            return ToolResult("Error: that message couldn't be removed." + _why(exc))
         ctx.posted = [m for m in ctx.posted if m.id != target.id]
         return ToolResult(f"Removed the message by {_name(target.author.display_name)}.")
 
     async def timeout_member(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "moderate_members")
         target = await self._target(ctx, arguments.get("member"))
         try:
             minutes = min(max(int(arguments.get("minutes") if arguments.get("minutes") is not None else 10), 0), MAX_TIMEOUT_MINUTES)
         except (TypeError, ValueError):
             return ToolResult("Error: 'minutes' must be a whole number (0 ends a timeout).")
+        if minutes and getattr(getattr(target, "guild_permissions", None), "administrator", False):
+            return ToolResult(f"Error: {_name(target.display_name)} is an administrator, and Discord doesn't let anyone time out administrators.")
         self._spend(ctx)
         try:
             await target.timeout(timedelta(minutes=minutes) if minutes else None, reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not time out member %s (%s)", target.id, exc)
-            return ToolResult("Error: the timeout couldn't be changed.")
+            return ToolResult("Error: the timeout couldn't be changed." + _why(exc))
         if not minutes:
             return ToolResult(f"Ended {_name(target.display_name)}'s timeout.")
         return ToolResult(f"Timed out {_name(target.display_name)} for {_duration(minutes * 60)}.")
 
     async def kick_member(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "kick_members")
         target = await self._target(ctx, arguments.get("member"))
         self._spend(ctx)
         try:
             await target.kick(reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not kick member %s (%s)", target.id, exc)
-            return ToolResult("Error: the member couldn't be kicked.")
+            return ToolResult("Error: the member couldn't be kicked." + _why(exc))
         return ToolResult(f"Kicked {_name(target.display_name)}.")
 
     async def ban_member(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "ban_members")
         target = await self._target(ctx, arguments.get("member"))
         try:
             hours = min(max(int(arguments.get("delete_hours") or 0), 0), 168)
@@ -831,13 +899,15 @@ class DiscordTools:
             await ctx.message.guild.ban(target, reason=self._reason(ctx, arguments), delete_message_seconds=hours * 3600)
         except discord.HTTPException as exc:
             log.info("Could not ban member %s (%s)", target.id, exc)
-            return ToolResult("Error: the member couldn't be banned.")
+            return ToolResult("Error: the member couldn't be banned." + _why(exc))
         return ToolResult(f"Banned {_name(target.display_name)}" + (f" and deleted their last {hours} hour(s) of messages." if hours else "."))
 
     async def unban_member(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "ban_members")
         wanted = " ".join(str(arguments.get("name") or "").split()).lstrip("@").lower()
+        mention = _USER_MENTION.fullmatch(wanted)
+        wanted = mention.group(1) if mention else wanted
         if not wanted:
             return ToolResult("Error: say whose ban to lift.")
         guild = ctx.message.guild
@@ -845,8 +915,8 @@ class DiscordTools:
             entries = [e async for e in guild.bans(limit=1000)]
         except discord.HTTPException as exc:
             log.info("Could not list the bans of server %s (%s)", guild.id, exc)
-            return ToolResult("Error: the ban list couldn't be read.")
-        matches = [e for e in entries if wanted in {e.user.name.lower(), str(getattr(e.user, "global_name", "") or "").lower()}]
+            return ToolResult("Error: the ban list couldn't be read." + _why(exc))
+        matches = [e for e in entries if wanted in {e.user.name.lower(), str(getattr(e.user, "global_name", "") or "").lower(), str(e.user.id)}]
         if len(matches) != 1:
             return ToolResult(f"Error: {'nobody' if not matches else 'more than one person'} called {wanted!r} is banned here.")
         self._spend(ctx)
@@ -854,12 +924,12 @@ class DiscordTools:
             await guild.unban(matches[0].user, reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not unban user %s (%s)", matches[0].user.id, exc)
-            return ToolResult("Error: the ban couldn't be lifted.")
+            return ToolResult("Error: the ban couldn't be lifted." + _why(exc))
         return ToolResult(f"Lifted the ban on {_name(matches[0].user.name)}.")
 
     async def _change_role(self, arguments: dict[str, Any], add: bool) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "manage_roles")
         target = await self._target(ctx, arguments.get("member"))
         role = self._role(ctx, arguments.get("role"))
         self._spend(ctx)
@@ -868,7 +938,7 @@ class DiscordTools:
             await change(role, reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not change roles of member %s (%s)", target.id, exc)
-            return ToolResult("Error: the role couldn't be changed (your own role may be too low).")
+            return ToolResult("Error: the role couldn't be changed." + _why(exc))
         verb = "Gave" if add else "Took"
         return ToolResult(f"{verb} the {_name(role.name)} role {'to' if add else 'from'} {_name(target.display_name)}.")
 
@@ -881,7 +951,7 @@ class DiscordTools:
     async def edit_channel(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
         channel = await self._channel(ctx, arguments.get("channel"), history=False)
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "manage_channels", channel)
         changes: dict[str, Any] = {}
         for key, limit in (("name", 100), ("topic", 1024)):
             if arguments.get(key) is not None:
@@ -901,12 +971,12 @@ class DiscordTools:
             await channel.edit(reason=self._reason(ctx, arguments), **changes)
         except (discord.HTTPException, TypeError) as exc:
             log.info("Could not edit channel %s (%s)", channel.id, exc)
-            return ToolResult("Error: the channel couldn't be changed.")
+            return ToolResult("Error: the channel couldn't be changed." + _why(exc))
         return ToolResult(f"Changed {', '.join(changes)} of {_channel_label(channel)}.")
 
     async def edit_server(self, arguments: dict[str, Any]) -> ToolResult:
         ctx = self._context()
-        self._moderating(ctx, arguments)
+        self._moderating(ctx, arguments, "manage_guild")
         out = await ctx.prepare(str(arguments.get("name") or ""), False)
         if out is None:
             return ToolResult("Error: the server needs a (allowed) name.")
@@ -918,7 +988,7 @@ class DiscordTools:
             await ctx.message.guild.edit(name=name, reason=self._reason(ctx, arguments))
         except discord.HTTPException as exc:
             log.info("Could not rename server %s (%s)", ctx.message.guild.id, exc)
-            return ToolResult("Error: the server couldn't be renamed.")
+            return ToolResult("Error: the server couldn't be renamed." + _why(exc))
         return ToolResult(f'Renamed the server to "{name}".')
 
     # --- escape hatch: raw API calls ---------------------------------------------------------
@@ -949,6 +1019,13 @@ class DiscordTools:
         path = re.sub(r"^(?:https?://(?:www\.)?discord(?:app)?\.com)?(?:/api)?(?:/v\d+)?", "", str(arguments.get("path") or "").strip())
         if not re.fullmatch(r"/[\w@.\-/]{1,300}", path) or ".." in path or "//" in path:
             raise _Refused("'path' must be an API path such as /channels/123/messages.")
+        segments = path.strip("/").split("/")
+        for before, segment in zip(segments, segments[1:]):
+            if before in _ID_BEFORE and not (segment.isdigit() or segment in {"@me", "search"}):
+                raise _Refused(
+                    f"{segment!r} in the path isn't an ID. Paths take numeric IDs: lookup_member shows a member's user ID, "
+                    "discord_info the server's and yours, list_channels the channels'."
+                )
         if any(re.search(pattern, path) for pattern in API_DENYLIST.get(method, ()) + API_DENYLIST["*"]):
             raise _Refused(f"{method} {path} is not allowed through discord_api.")
         body = arguments.get("body")
@@ -1006,7 +1083,7 @@ READ_TOOLS = {
     ),
     "lookup_member": _schema(
         "lookup_member",
-        "Look up a member of this server: their names, when they joined and their roles.",
+        "Look up a member of this server: their names, user ID, when they joined and their roles.",
         {"name": {"type": "string", "description": "Their name, or 'me' for the sender."}},
         ["name"],
     ),
@@ -1057,7 +1134,7 @@ ACTION_TOOLS = {
 
 _CONFIRM = {"confirm": {"type": "boolean", "description": "Set true only when the sender clearly asked for exactly this."}}
 _REASON = {"reason": {"type": "string", "description": "Why, for the server's audit log."}}
-_MEMBER = {"member": {"type": "string", "description": "Their name, or a message handle (like m3) to mean its author."}}
+_MEMBER = {"member": {"type": "string", "description": "Their name, their user ID, or a message handle (like m3) to mean its author."}}
 
 ADMIN_TOOLS = {
     "remove_message": _schema(
@@ -1077,7 +1154,7 @@ ADMIN_TOOLS = {
         ["member"],
     ),
     "unban_member": _schema(
-        "unban_member", "Lift a ban.", {"name": {"type": "string", "description": "Their username."}, **_REASON, **_CONFIRM}, ["name"]
+        "unban_member", "Lift a ban.", {"name": {"type": "string", "description": "Their username or user ID."}, **_REASON, **_CONFIRM}, ["name"]
     ),
     "add_role": _schema("add_role", "Give a member a role.", {**_MEMBER, "role": {"type": "string"}, **_REASON, **_CONFIRM}, ["member", "role"]),
     "remove_role": _schema(
@@ -1097,7 +1174,11 @@ API_SCHEMA = _schema(
     "Call the Discord REST API (v10) directly, for things no other tool does. Prefer the other tools when one fits.",
     {
         "method": {"type": "string", "enum": sorted(API_METHODS)},
-        "path": {"type": "string", "description": "An API path such as /channels/123/messages or /guilds/123/emojis."},
+        "path": {
+            "type": "string",
+            "description": "An API path with numeric IDs, such as /channels/123/messages. lookup_member shows user IDs, "
+            "discord_info the server's ID and list_channels channel IDs.",
+        },
         "body": {"type": "object", "description": "The JSON body, for POST, PATCH and PUT."},
         "query": {"type": "object", "description": "Query string parameters, e.g. {\"limit\": 10}."},
         **_REASON,

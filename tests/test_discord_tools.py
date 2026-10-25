@@ -388,7 +388,7 @@ class ReadToolTests(DiscordToolTestCase):
         self.guild.members[BOB.id] = SimpleNamespace(**vars(BOB), joined_at=T0, roles=[everyone, mod])
         self.context()
         text = (await self.tools()["lookup_member"].run({"name": "bo"})).text
-        self.assertIn("Bob (username bob): joined 2026-10-25; roles: Mod", text)
+        self.assertIn(f"Bob (username bob, user ID {BOB.id}): joined 2026-10-25; roles: Mod", text)
         text = (await self.tools()["lookup_member"].run({"name": "zed"})).text
         self.assertIn("No member", text)
 
@@ -751,6 +751,7 @@ class Member:
     def __init__(self, user_id, name, role, **permissions):
         self.id, self.display_name, self.name, self.global_name, self.bot = user_id, name, name.lower(), None, False
         self.top_role, self.roles = role, [EVERYONE, role]
+        self.joined_at = None
         self.guild_permissions = SimpleNamespace(**permissions)
         self.calls = []
 
@@ -865,13 +866,18 @@ class ModerationTests(AdminToolTestCase):
         self.bob.kick = refuse
         ctx = self.context()
         result = await self.tools()["kick_member"].run({"member": "Bob", "confirm": True})
-        self.assertEqual(result.text, "Error: the member couldn't be kicked.")
+        self.assertEqual(
+            result.text,
+            "Error: the member couldn't be kicked. Discord said: Missing Permissions (403). "
+            "Your highest role may be too low, or you may lack the permission.",
+        )
         self.assertEqual(ctx.actions, 1)
 
     async def test_remove_message_with_permission(self):
         target = self.general.add("spam", author=self.bob)
         ctx = self.context()
         ctx.posted.append(target)
+        self.general.overrides[ME.id] = perms(manage_messages=True)
         tools = self.tools()
         await tools["read_messages"].run({})
         result = await tools["remove_message"].run({"message": "m1", "confirm": True, "reason": "spam"})
@@ -993,6 +999,7 @@ class ModerationTests(AdminToolTestCase):
         self.general.edit = edit
         self.context()
         tools = self.tools()
+        self.general.overrides[ME.id] = perms(manage_channels=True)
         result = await tools["edit_channel"].run({"confirm": True})
         self.assertIn("say what to change", result.text)
         result = await tools["edit_channel"].run({"topic": "all about tea", "slowmode_seconds": 99999, "confirm": True})
@@ -1039,7 +1046,108 @@ class ModerationTests(AdminToolTestCase):
         self.assertFalse(default & (ADMIN_TOOL_NAMES | {API_TOOL}))
 
 
+class FindingMembersTests(AdminToolTestCase):
+    """Moderation targets as the model actually writes them: display names, "@Name", mentions, IDs."""
+
+    def setUp(self):
+        super().setUp()
+        self.jack = Member(123617042679000001, "Jack Papel", MEMBER)
+        self.jack.name, self.jack.global_name = "jackpapel", "Jack Papel"  # a display name that isn't the username
+        self.guild.members[self.jack.id] = self.jack
+        self.searches = []
+
+        async def search(query, limit=5):  # like Discord: only the start of usernames and nicknames
+            self.searches.append(query)
+            return [m for m in self.guild.members.values() if m.name.startswith(query.lower())][:limit]
+
+        self.guild.query_members = search
+
+    async def kick(self, member, **ctx_kwargs):
+        self.context(**ctx_kwargs)
+        return (await self.tools()["kick_member"].run({"member": member, "confirm": True})).text
+
+    async def test_a_display_name_discords_search_cant_find(self):
+        self.assertEqual(await self.kick("Jack Papel"), "Kicked Jack Papel.")  # found as "jack" -> jackpapel
+        self.assertEqual(len(self.jack.calls), 1)
+
+    async def test_an_at_sign_a_mention_and_an_id(self):
+        for value in ("@Jack Papel", f"<@{self.jack.id}>", f"<@!{self.jack.id}>", str(self.jack.id)):
+            with self.subTest(value=value):
+                self.assertEqual(await self.kick(value), "Kicked Jack Papel.")
+        self.assertEqual(len(self.jack.calls), 4)
+
+    async def test_a_first_name(self):
+        self.assertEqual(await self.kick("jack"), "Kicked Jack Papel.")
+
+    async def test_an_author_of_a_message_she_read(self):
+        async def nothing(query, limit=5):
+            return []
+
+        self.guild.query_members = nothing
+        del self.guild.members[self.jack.id]  # not cached, not found by the search: only seen in read_messages
+        self.guild.fetch_member = lambda user_id: self._fetch(user_id)
+        self.general.add("hello", author=self.jack)
+        self.context()
+        tools = self.tools()
+        await tools["read_messages"].run({})
+        result = await tools["kick_member"].run({"member": "Jack Papel", "confirm": True})
+        self.assertEqual(result.text, "Kicked Jack Papel.")
+
+    async def _fetch(self, user_id):
+        if user_id == self.jack.id:
+            return self.jack
+        raise http_error()
+
+    async def test_the_prompts_name_suffix_picks_one_of_two(self):
+        alex1, alex2 = Member(900000004821, "Alex", MEMBER), Member(900000007777, "Alex", MEMBER)
+        self.guild.members.update({alex1.id: alex1, alex2.id: alex2})
+        text = await self.kick("Alex")
+        self.assertIn("Several members could be 'Alex'", text)
+        self.assertIn(f"user ID {alex1.id}", text)
+        self.assertEqual(await self.kick("Alex #4821"), "Kicked Alex.")
+        self.assertEqual((len(alex1.calls), len(alex2.calls)), (1, 0))
+
+    async def test_an_unknown_id_is_refused(self):
+        self.assertIn("No member", await self.kick("999999999999999999"))
+
+    async def test_lookup_member_shows_the_user_id(self):
+        self.context()
+        text = (await self.tools()["lookup_member"].run({"name": "@Jack Papel"})).text
+        self.assertIn(f"user ID {self.jack.id}", text)
+
+    async def test_her_missing_permission_is_said_plainly(self):
+        self.her.guild_permissions.kick_members = False
+        text = await self.kick("Jack Papel")
+        self.assertEqual(text, "Error: You don't have the Kick Members permission in this server, so Discord won't let you.")
+        self.assertEqual(self.jack.calls, [])
+
+    async def test_administrators_can_be_kicked_but_not_timed_out(self):
+        self.jack.guild_permissions.administrator = True
+        self.context()
+        tools = self.tools()
+        result = await tools["timeout_member"].run({"member": "Jack Papel", "minutes": 10, "confirm": True})
+        self.assertIn("doesn't let anyone time out administrators", result.text)
+        self.assertEqual(await self.kick("Jack Papel"), "Kicked Jack Papel.")  # rank matters for kicks, not Administrator
+
+    async def test_discord_info_gives_the_ids_discord_api_needs(self):
+        self.context()
+        text = (await self.tools()["discord_info"].run({})).text
+        self.assertIn(f"Your user ID is {ME.id}.", text)
+        self.assertIn(f"(ID {self.guild.id})", text)
+
+
 class DiscordApiTests(AdminToolTestCase):
+    async def test_a_name_where_an_id_belongs_gets_a_hint(self):
+        self.context()
+        api = self.tools(api_confirmation=False)[API_TOOL]
+        result = await api.run({"method": "PUT", "path": "/guilds/100/bans/jackpapel"})
+        self.assertIn("'jackpapel' in the path isn't an ID", result.text)
+        self.assertIn("lookup_member", result.text)
+        self.assertEqual(self.client.http.requests, [])
+        for path in ("/guilds/100/bans/123617042679", "/users/@me", "/guilds/100/members/search", "/guilds/100/roles"):
+            with self.subTest(path=path):
+                self.assertIn("OK", (await api.run({"method": "GET", "path": path})).text)
+
     def api(self, **kwargs):
         return self.tools(**kwargs)[API_TOOL]
 

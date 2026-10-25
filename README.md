@@ -234,15 +234,22 @@ own messages only), `start_thread`, `send_message` (another channel), `pin`/`unp
   herself or the server owner.
 - **Confirmation.** With `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION=true` (the default) every call needs `confirm=true`, and the model
   is told to set it only when the sender asked for exactly that action. Turn it off once her permissions are what you want.
-- **Who is meant.** A member is named by a name that matches exactly one member, or by a message handle (`m3` means its author).
-  An ambiguous name is refused rather than guessed.
+- **Who is meant.** A member is named the way the model tends to write it: a display name, username, global name or nickname (with
+  or without `@`), a mention, a user ID, or a message handle (`m3` means its author). Names are looked up among the people in the
+  conversation, authors of messages she read, members Discord has sent and Discord's member search (which only matches the start of
+  usernames and nicknames, so a first word is tried too). An exact name wins, then a first name; if that still fits several people the
+  call is refused with their user IDs, rather than guessed.
+- **Clear refusals.** Her own permission is checked first, so the model hears "you don't have Kick Members" instead of a bare
+  failure, and when Discord refuses, its reason is passed on. Administrators can be kicked and banned (only role order and server
+  ownership protect anyone), but Discord doesn't let anyone time them out, so that is refused up front.
 - **Audit log.** Every action records who asked for it (and the reason, if given) in the server's audit log.
 
 **Raw API (`ARBITRARY_DISCORD_TOOLS=true`).** `discord_api` makes any Discord REST call (`GET /guilds/123/emojis`, ...) for things no
 curated tool covers, with her own permissions, for anyone but other bots. Calls other than `GET` need `confirm=true` unless
 `ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION=false` (that flag is the safety: switch it off once her permissions are what you
 want), and count against
-`DISCORD_MAX_ACTIONS`. A body that can carry a message gets `allowed_mentions: {"parse": []}` forced in, so it still can't
+`DISCORD_MAX_ACTIONS`. Paths take numeric IDs, which `lookup_member` (user IDs), `discord_info` (the server's and her own) and
+`list_channels` show; a name where an ID belongs (`/bans/jackpapel`) is refused with that hint. A body that can carry a message gets `allowed_mentions: {"parse": []}` forced in, so it still can't
 mass-ping, and its `content` goes through the reply checks. A few paths are always refused: OAuth2 and the bot's application,
 the gateway, interaction and webhook-token URLs, deleting a server, pruning and bulk bans (`API_DENYLIST` in
 `discord_tools.py`). Leaving a server is allowed; someone can always invite her back. The response is trimmed to `PAGE_MAX_CHARS`. Calls that keep showing up in the logs are good candidates for a
