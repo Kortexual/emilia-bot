@@ -548,6 +548,29 @@ class MultiTurnTests(ClientTestCase):
         self.assertNotIn("tool_choice", server.requests[0])  # a plain chat reply stays possible at first
         self.assertEqual(server.requests[1]["tool_choice"], "required")
 
+    async def test_images_a_model_cannot_see_are_dropped_and_the_request_retried(self):
+        server = self.serve([(400, {"error": "Model does not support images"}), text_reply("I can't see it, sorry!")])
+        client = await self.client(server)
+        parts = [{"type": "text", "text": "what is this?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        messages = [USER[0], {"role": "user", "content": parts}]
+
+        result = await client.chat(messages)
+
+        self.assertEqual(result.text, "I can't see it, sorry!")
+        self.assertEqual(server.requests[0]["messages"][1]["content"], parts)
+        retried = server.requests[1]["messages"][1]["content"]
+        self.assertIsInstance(retried, str)
+        self.assertTrue(retried.startswith("what is this?"))
+        self.assertIn("can't see images", retried)
+        self.assertEqual(messages[1]["content"], parts)  # the caller's list is left alone
+
+    async def test_a_rejected_request_without_images_still_fails(self):
+        server = self.serve([(400, {"error": "bad request"})])
+        client = await self.client(server)
+        with self.assertRaises(LLMHTTPError):
+            await client.chat(USER, tools=False)
+        self.assertEqual(len(server.requests), 1)
+
     async def test_a_server_that_rejects_tool_choice_is_asked_again_without_it(self):
         server = self.serve(
             [

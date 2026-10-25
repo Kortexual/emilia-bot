@@ -46,6 +46,7 @@ import browser
 import presence
 import prompts
 import styleguard
+from attachments import AttachmentReader
 from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
@@ -92,9 +93,10 @@ class ChatBackend(Protocol):
 class Forwarded:
     """A forwarded message as shown to the model: its text, its author if we could find out, and where/when it was written."""
 
-    body: str
+    body: str  # may be empty when it only forwards attachments
     author: discord.abc.User | None
     origin: str  # e.g. " in #kitchen on 2026-10-23 at 10:29 UTC"; empty if unknown
+    attachments: list[Any] = field(default_factory=list)
 
 
 def source_links(urls: list[str], max_links: int = 3) -> str:
@@ -444,7 +446,7 @@ class EmiliaBot(discord.Client):
             await asyncio.sleep(FORWARD_COMMENT_WAIT)
             if self._forwards.get((message.channel.id, message.author.id)) is not message:
                 return
-        elif not text:  # a bare @mention
+        elif not text and not getattr(message, "attachments", None):  # a bare @mention
             await self._send(message, prompts.GREETING)
             return
 
@@ -454,9 +456,16 @@ class EmiliaBot(discord.Client):
             return
         self._busy.add(user_id)
         try:
-            quoted_body, quoted_author = await self._quoted_context(message)
+            quoted_body, quoted_author, quoted_files = await self._quoted_context(message)
             forwarded = await self._forwarded_context(forward)
-            await self._respond(message, key, text, quoted_body, quoted_author, forwarded)
+            attached = AttachmentReader(
+                vision=self.settings.vision, read_files=self.settings.read_files, max_chars=self.settings.file_max_chars
+            )
+            await attached.add(getattr(message, "attachments", None) or [])
+            await attached.add(quoted_files, " in the message replied to")
+            if forwarded is not None:
+                await attached.add(forwarded.attachments, " in the forwarded message")
+            await self._respond(message, key, text, quoted_body, quoted_author, forwarded, attached)
         finally:
             self._busy.discard(user_id)
 
@@ -468,8 +477,10 @@ class EmiliaBot(discord.Client):
         quoted_body: str,
         quoted_author: discord.abc.User | None,
         forwarded: Forwarded | None = None,
+        attached: AttachmentReader | None = None,
     ) -> None:
-        """Generate and post messages; a tool-assisted reply can continue in further turns."""
+        """Generate and post messages; a tool-assisted reply can continue in further turns. The model sees
+        the attachments' contents (`attached`), memory only their notes."""
         from_bot = message.author.bot  # only possible with RESPOND_TO_BOTS: no computer tools, no pings by name
         people = self._people(message, quoted_author)
         author_name = prompts.safe_name(message.author.display_name)  # what is stored; labels are worked out per request
@@ -482,14 +493,20 @@ class EmiliaBot(discord.Client):
                 author = labels[str(message.author.id)]
                 others = [labels[str(user.id)] for user in people[1:]]
                 quote = ""
-                if quoted_body and quoted_author is not None:
-                    quote = f'(replying to {labels[str(quoted_author.id)]}: "{quoted_body}") '
+                if quoted_author is not None:  # the quote may be only attachments, named in their notes below
+                    said = f': "{quoted_body}"' if quoted_body else ""
+                    quote = f"(replying to {labels[str(quoted_author.id)]}{said}) "
                 if forwarded is not None:  # its author is only named: they may not even be in this server
                     by = "someone"
                     if forwarded.author is not None:
                         by = labels.get(str(forwarded.author.id)) or prompts.safe_name(forwarded.author.display_name)
-                    quote += f'(forwarded a message from {by}{forwarded.origin}: "{forwarded.body}") '
+                    said = f': "{forwarded.body}"' if forwarded.body else ""
+                    quote += f"(forwarded a message from {by}{forwarded.origin}{said}) "
                 user_text = (quote + text).strip()
+                prompt_text = user_text
+                if attached:
+                    prompt_text = f"{user_text}\n{attached.prompt_text()}".strip()
+                    user_text = f"{user_text}\n{attached.stored_text()}".strip()
 
                 shown = history
                 if self.settings.forget_standing_instructions:
@@ -507,11 +524,12 @@ class EmiliaBot(discord.Client):
                     system_prompt,
                     shown,
                     author,
-                    user_text,
+                    prompt_text,
                     others,
                     profiles,
                     yandere=self.settings.yandere_mode,
                     scene_note=prompts.time_note(scene) if scene else "",
+                    images=attached.images if attached else (),
                 )
 
                 # A reply can be several Discord messages, posted as they happen: whatever the model writes
@@ -575,7 +593,7 @@ class EmiliaBot(discord.Client):
                         # Someone talked the model into writing in braille (or similar). Try once more
                         # with a nudge; nothing has run or been posted yet, so the retry is harmless.
                         log.warning("Reply was written in braille/cipher script; retrying once in plain text")
-                        nudged = {**messages[-1], "content": messages[-1]["content"] + prompts.PLAIN_TEXT_HINT}
+                        nudged = prompts.add_text(messages[-1], prompts.PLAIN_TEXT_HINT)
                         result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
                         reply = clean_reply(result.text, self._speaker_names())
                 except LLMError as exc:
@@ -613,6 +631,7 @@ class EmiliaBot(discord.Client):
             fetch_pages=self.settings.fetch_pages,
             browser_tools=self.settings.browser_tools,
             time_awareness=self.settings.time_awareness,
+            vision=self.settings.vision,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -1011,7 +1030,8 @@ class EmiliaBot(discord.Client):
             return None
         snapshot = forward.message_snapshots[0]
         body = sanitize_user_text(self._render_snapshot(snapshot), FORWARD_CHARS).replace('"', "'")
-        if not body:
+        files = list(getattr(snapshot, "attachments", None) or [])
+        if not body and not files:
             return None
         ref = forward.reference
         channel = self.get_channel(ref.channel_id) if ref is not None else None
@@ -1027,31 +1047,34 @@ class EmiliaBot(discord.Client):
             origin += f" in #{prompts.safe_name(name, default='channel')}"
         if snapshot.created_at:
             origin += f" on {snapshot.created_at:%Y-%m-%d} at {snapshot.created_at:%H:%M} UTC"
-        return Forwarded(body, original.author if original is not None else None, origin)
+        return Forwarded(body, original.author if original is not None else None, origin, files)
 
-    async def _quoted_context(self, message: discord.Message) -> tuple[str, discord.abc.User | None]:
-        """If this is a reply to someone else's message, what it said and who said it, so that
-        '@Emilia is this true?' makes sense. Our own earlier messages are already in memory. If the
-        message replied to is a forward, what it forwarded is shown."""
+    async def _quoted_context(self, message: discord.Message) -> tuple[str, discord.abc.User | None, list[Any]]:
+        """If this is a reply to someone else's message, what it said, who said it and what it had attached,
+        so that '@Emilia is this true?' or '@Emilia what is in this picture?' makes sense. Our own earlier
+        messages are already in memory. If the message replied to is a forward, what it forwarded is shown."""
+        nothing: tuple[str, discord.abc.User | None, list[Any]] = ("", None, [])
         ref = message.reference
         if ref is None or ref.message_id is None or getattr(ref, "type", None) == discord.MessageReferenceType.forward:
-            return "", None  # forwards are handled by _forwarded_context
+            return nothing  # forwards are handled by _forwarded_context
         quoted = ref.resolved
         if quoted is None:
             try:
                 quoted = await message.channel.fetch_message(ref.message_id)
             except discord.HTTPException:
-                return "", None
+                return nothing
         if not hasattr(quoted, "author"):  # the original was deleted
-            return "", None
+            return nothing
         if self.user is not None and quoted.author.id == self.user.id:
-            return "", None
+            return nothing
         snapshots = getattr(quoted, "message_snapshots", None)
-        rendered = self._render_snapshot(snapshots[0]) if not quoted.content and snapshots else self._render(quoted)
+        source = snapshots[0] if not quoted.content and snapshots else quoted
+        rendered = self._render_snapshot(source) if source is not quoted else self._render(quoted)
         body = sanitize_user_text(rendered, QUOTE_CHARS).replace('"', "'")
-        if not body:
-            return "", None
-        return body, quoted.author
+        files = list(getattr(source, "attachments", None) or [])
+        if not body and not files:
+            return nothing
+        return body, quoted.author, files
 
     async def _send(self, message: discord.Message, text: str, pinged: list[int] | None = None) -> None:
         """Reply to the message, spilling over into follow-up messages if it is long.
