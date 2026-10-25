@@ -24,7 +24,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
    1. In the [Developer Portal](https://discord.com/developers/applications) create an application, open its
       **Bot** tab and click **Reset Token** to copy the token.
    2. On the same tab, under *Privileged Gateway Intents*, switch on **Message Content Intent**. (Also switch on
-      **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below.)
+      **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below, and **Presence Intent** only if you
+      set `PRESENCE_INTENT=true`.)
    3. Open **OAuth2 → URL Generator**, tick the scope `bot`, then tick the permissions *View Channels*,
       *Send Messages*, *Send Messages in Threads* and *Read Message History*. Open the generated URL to add the bot to your server.
 
@@ -200,14 +201,15 @@ is missing the bot starts without these tools and logs a warning. The browser is
 With `DISCORD_TOOLS=true` the model can look around Discord in the middle of a reply, through the same tool loop as web search:
 `discord_info` (how many servers she is in, uptime, this server's member count and roles), `list_channels`, `read_messages` (the
 last messages of a channel, up to 50, or those around a message), `lookup_member` (names, join date, roles), `list_pins` and
-`list_threads`. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`, `edit_message` and `delete_message` (her
+`list_threads`, plus `member_statuses` (who is online, idle or busy, and what they are doing) when `PRESENCE_INTENT=true`; without
+it the bot logs at startup that the tool is not offered. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`, `edit_message` and `delete_message` (her
 own messages only), `start_thread`, `send_message` (another channel), `pin`/`unpin` and `create_poll`. The code is in `discord_tools.py`.
 
 - **She acts as herself.** Every action uses the bot's own permissions, so what you allow the bot in a server is what anyone who
   can mention her can get done through her. Grant permissions with that in mind.
-- **Only what the sender can see.** Channels (and their messages, pins and threads) are only listed, read or posted to if both she
-  and the sender can see them. Pinning also needs the sender to be allowed to pin there. Channels in other servers are out of
-  reach unless `DISCORD_CROSS_SERVER=true`, and then only in servers the sender is in too.
+- **Her own permissions.** She is treated like any other member: she can see the channels her roles let her see, whoever asks,
+  and Discord refuses what her roles don't allow. A private thread is only seen once she is in it. Channels in other servers are out
+  of reach unless `DISCORD_CROSS_SERVER=true`.
 - **Handles, not IDs.** The model never sees message IDs. `read_messages` and `list_pins` label each message `[m1]`, `[m2]`, ...
   and the action tools take those, `this` (the message she is answering), `replied` (the one it replies to), `mine` / `mine-2`
   (her latest messages in this reply), or a message link the sender wrote. Anything else, like an ID the model made up, is refused.
@@ -335,6 +337,7 @@ All settings are environment variables (or lines in `.env`).
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
+| `PRESENCE_INTENT` | `false` | See members' statuses, for the `member_statuses` Discord tool (needs *Presence Intent*; best with `MEMBERS_INTENT`) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `TIME_AWARENESS` | `false` | Tell her the time of day: wake-up on the first morning message, sleepy at night, random events (see "Her day") |
 | `TIMEZONE` | empty (this computer's time) | Her time zone, e.g. `America/New_York` (needs `tzdata` on Windows, included in `requirements.txt`) |
@@ -395,7 +398,7 @@ tests/        run with:  python -m unittest
 ## Troubleshooting
 
 - **"Turn on Message Content Intent" at startup**: Developer Portal → Bot → Privileged Gateway Intents. If you set `MEMBERS_INTENT=true`,
-  switch on **Server Members Intent** there too.
+  switch on **Server Members Intent** there too, and **Presence Intent** for `PRESENCE_INTENT=true`.
 - **"ping Jack" stays plain text**: the name must be typed in your message and match exactly one human member (see "Pinging"). A last
   name or a middle word is only found with `MEMBERS_INTENT=true`.
 - **Online but silent**: mention the bot *user* (not a role), check it can see and send in that channel,

@@ -145,6 +145,7 @@ class Settings:
     multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
+    presence_intent: bool = False  # see members' statuses (the member_statuses tool); needs the Presence Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
     # Her day (see presence.py)
@@ -244,6 +245,7 @@ class Settings:
             multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
+            presence_intent=_flag("PRESENCE_INTENT", cls.presence_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             time_awareness=_flag("TIME_AWARENESS", cls.time_awareness),
             timezone=_timezone("TIMEZONE"),

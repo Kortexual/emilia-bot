@@ -242,6 +242,7 @@ class EmiliaBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
         intents.members = settings.members_intent  # privileged: Server Members Intent, only if MEMBERS_INTENT=true
+        intents.presences = settings.presence_intent  # privileged: Presence Intent, only if PRESENCE_INTENT=true
         super().__init__(
             intents=intents,
             # Whatever the model writes can never ping @everyone, roles or arbitrary users. Replies
@@ -331,6 +332,7 @@ class EmiliaBot(discord.Client):
                         cross_server=self.settings.discord_cross_server,
                     ),
                     actions=self.settings.discord_actions,
+                    statuses=self.settings.presence_intent,
                 )
             )
         return tools
@@ -346,6 +348,10 @@ class EmiliaBot(discord.Client):
         if self.settings.respond_to_bots:
             scope += ", including from other bots"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
+        if self.settings.discord_tools and not self.settings.presence_intent:
+            log.info("Discord tools are on without PRESENCE_INTENT: the member_statuses tool is not offered")
+        elif self.settings.discord_tools and not self.settings.members_intent:
+            log.info("PRESENCE_INTENT is on without MEMBERS_INTENT: member_statuses only sees members Discord has sent")
         if self._restart_ready_fd is not None:
             try:
                 os.write(self._restart_ready_fd, b"1")
@@ -1171,7 +1177,8 @@ def main() -> None:
         raise SystemExit("Discord rejected DISCORD_TOKEN. Reset the token in the Developer Portal and update .env.") from None
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true): "
+            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true, "
+            "'Presence Intent' if PRESENCE_INTENT=true): "
             "Developer Portal > your app > Bot > Privileged Gateway Intents."
         ) from None
 

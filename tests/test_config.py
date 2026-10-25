@@ -65,6 +65,12 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load(DISCORD_TOKEN="a", MEMBERS_INTENT="maybe")
 
+    def test_presence_intent_flag(self):
+        self.assertFalse(load(DISCORD_TOKEN="a").presence_intent)
+        self.assertTrue(load(DISCORD_TOKEN="a", PRESENCE_INTENT="on").presence_intent)
+        with self.assertRaises(ConfigError):
+            load(DISCORD_TOKEN="a", PRESENCE_INTENT="maybe")
+
     def test_yandere_mode_flag(self):
         self.assertTrue(load(DISCORD_TOKEN="a", YANDERE_MODE="true").yandere_mode)
         self.assertFalse(load(DISCORD_TOKEN="a", YANDERE_MODE="off").yandere_mode)

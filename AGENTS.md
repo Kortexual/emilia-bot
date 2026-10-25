@@ -27,7 +27,7 @@ Emilia is a Discord bot (discord.py) that answers @mentions using a local model 
 | `config.py` | `Settings.from_env()`: every setting comes from environment variables / `.env` |
 | `tests/` | `unittest` suite, one file per module plus `test_end_to_end.py` |
 
-Tools are assembled in `EmiliaBot._build_tools`. Discord tools act only on channels both she and the sender can see and on messages named by a handle; text they post goes through the same `prepare`/`finish` checks as `post()` in `_respond`, and a tool with `quiet = True` gets no tool line. `stop_talking` is not a tool there: `LMStudioClient` offers it itself, only in multi-turn mode and only once the model has started working.
+Tools are assembled in `EmiliaBot._build_tools`. Discord tools act as her, a member like any other (her permissions, not the sender's), only on channels she can see and on messages named by a handle; text they post goes through the same `prepare`/`finish` checks as `post()` in `_respond`, and a tool with `quiet = True` gets no tool line. `stop_talking` is not a tool there: `LMStudioClient` offers it itself, only in multi-turn mode and only once the model has started working.
 
 ### How a reply flows
 
