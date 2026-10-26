@@ -19,7 +19,8 @@
 """Discord bot that chats through a local LM Studio model.
 
 It answers only when @mentioned (and, if you opt in with RESPOND_TO_DMS=true, in DMs), remembers
-recent conversation per channel, and can search the web when the model is unsure of something. If you
+recent conversation per channel, and can search the web when the model is unsure of something. Its
+commands (/forget, /about, /forgetme) are Discord slash commands. If you
 opt in with RANDOM_MESSAGES=true it may also speak up on its own, in the channels you list and only
 during its active hours (see presence.py).
 
@@ -41,6 +42,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Collection, Protocol
 
 import discord
+from discord import app_commands
 
 import browser
 import presence
@@ -62,9 +64,7 @@ log = logging.getLogger("emilia.bot")
 
 RETIRE_TIMEOUT = 600  # seconds a restarted bot waits for its replies in progress before it shuts down anyway
 CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some headroom
-RESET_COMMANDS = {"!forget", "!reset"}  # only recognised inside an @mention, e.g. "@Emilia !forget"
-FORGET_ME_COMMAND = "!forgetme"  # deletes the notes and names saved about the person who sends it
-ABOUT_COMMAND = "!about"  # "@Emilia !about I garden and like tea" saves a note about yourself
+OLD_COMMANDS = {"!forget", "!reset", "!forgetme", "!about"}  # now slash commands; "@Emilia !forget" gets a pointer to them
 QUOTE_CHARS = 300  # how much of a replied-to message is shown to the model
 FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the sender wants to talk about
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
@@ -302,6 +302,38 @@ class EmiliaBot(discord.Client):
         self._rng = rng or random.Random()
         self._started = self._now().timestamp()  # until she has spoken in a channel, her wait is counted from here
         self._presence_task: asyncio.Task[None] | None = None
+        self.tree = app_commands.CommandTree(self)
+        self._build_commands()
+
+    def _build_commands(self) -> None:
+        """The slash commands. Only people can use them (Discord never lets a bot run another bot's commands),
+        and their answers never ping anyone."""
+
+        @self.tree.command(name="forget", description="Forget the conversation in this channel.")
+        @app_commands.default_permissions(manage_messages=True)  # hidden from others by default; checked again in _reset
+        async def forget(interaction: discord.Interaction) -> None:
+            await self._reset(interaction)
+
+        @self.tree.command(name="forgetme", description="Delete the note and the names Emilia has saved about you.")
+        async def forget_me(interaction: discord.Interaction) -> None:
+            await self._forget_me(interaction)
+
+        about = app_commands.Group(name="about", description="A short note about yourself that Emilia sees when you talk.")
+
+        @about.command(name="set", description="Save a short note about yourself, e.g. \"I garden and like tea\".")
+        @app_commands.describe(note=f"Up to {prompts.ABOUT_MAX_CHARS} characters about yourself")
+        async def about_set(interaction: discord.Interaction, note: app_commands.Range[str, 1, prompts.ABOUT_MAX_CHARS]) -> None:
+            await self._about(interaction, note)
+
+        @about.command(name="show", description="Show the note Emilia has saved about you.")
+        async def about_show(interaction: discord.Interaction) -> None:
+            await self._about(interaction, None)
+
+        @about.command(name="clear", description="Remove the note Emilia has saved about you.")
+        async def about_clear(interaction: discord.Interaction) -> None:
+            await self._about(interaction, "")
+
+        self.tree.add_command(about)
 
     def _build_tools(self) -> list[Tool]:
         tools: list[Tool] = []
@@ -350,8 +382,18 @@ class EmiliaBot(discord.Client):
     # --- lifecycle -------------------------------------------------------------
     async def setup_hook(self) -> None:
         await self.llm.start()
+        await self._sync_commands()
         if self.settings.random_messages:
             self._presence_task = asyncio.create_task(self._presence_loop())  # keep a reference so it isn't garbage-collected
+
+    async def _sync_commands(self) -> None:
+        """Tells Discord about the slash commands so they show up in the / menu (globally; changes can take a moment)."""
+        try:
+            synced = await self.tree.sync()
+        except (discord.HTTPException, discord.ClientException) as exc:
+            log.warning("Could not register the slash commands (%s); /forget, /about and /forgetme may be missing", exc)
+            return
+        log.info("Registered slash commands: %s", ", ".join(f"/{command.name}" for command in synced))
 
     async def on_ready(self) -> None:
         scope = "@mentions and DMs" if self.settings.respond_to_dms else "@mentions only"
@@ -457,18 +499,8 @@ class EmiliaBot(discord.Client):
         text = sanitize_user_text(self._render(message), self.settings.max_input_chars)
         key = str(message.channel.id)
 
-        command, _, argument = text.partition(" ")
-        if message.author.bot and (text.lower() in RESET_COMMANDS | {FORGET_ME_COMMAND} or command.lower() == ABOUT_COMMAND):
-            log.info("Ignored a command from bot %s", message.author.id)  # commands are for people only
-            return
-        if text.lower() in RESET_COMMANDS:
-            await self._reset(message, key)
-            return
-        if text.lower() == FORGET_ME_COMMAND:
-            await self._forget_me(message)
-            return
-        if command.lower() == ABOUT_COMMAND:
-            await self._about(message, argument)
+        if not message.author.bot and text.partition(" ")[0].lower() in OLD_COMMANDS:
+            await self._send(message, prompts.SLASH_COMMANDS_HINT)  # so the model never pretends to have forgotten
             return
         if forward is message:  # a forward on its own: if a comment on it follows, that one is answered instead
             await asyncio.sleep(FORWARD_COMMENT_WAIT)
@@ -781,38 +813,73 @@ class EmiliaBot(discord.Client):
                     log.exception("Could not save a message of her own to memory")
                 await self._record_spoke(key, True)
 
-    async def _reset(self, message: discord.Message, key: str) -> None:
-        if message.guild is not None and not message.channel.permissions_for(message.author).manage_messages:
-            await self._send(message, prompts.RESET_DENIED)
+    # --- slash commands --------------------------------------------------------
+    async def _reset(self, interaction: discord.Interaction) -> None:
+        """/forget: clears the memory of the channel. Needs Manage Messages there; in a DM anyone can."""
+        if self._retiring:  # the replacement answers this one
             return
-        async with self._channel_lock(key):
-            removed = await asyncio.to_thread(self.memory.clear, key)
-        log.info("Cleared %d remembered messages in channel %s", removed, key)
-        await self._send(message, prompts.RESET_DONE)
-
-    async def _about(self, message: discord.Message, argument: str) -> None:
-        """`!about <text>` saves a short note about yourself, `!about` shows it, `!about clear` removes it."""
-        user_id = str(message.author.id)
-        argument = argument.strip()
+        if interaction.guild is not None and not interaction.permissions.manage_messages:
+            await self._answer(interaction, prompts.RESET_DENIED, ephemeral=True)
+            return
+        key = str(interaction.channel_id)
+        lock = self._channel_lock(key)
+        if lock.locked():  # a reply is being written here, and Discord wants an answer within 3 seconds
+            await interaction.response.defer()
         try:
-            if not argument:
-                note = (await asyncio.to_thread(self.memory.abouts, [user_id])).get(user_id, "")
-                await self._send(message, prompts.ABOUT_SHOW.format(text=note) if note else prompts.ABOUT_NONE)
-            elif argument.lower() in {"clear", "reset", "delete", "remove"}:
+            async with lock:
+                removed = await asyncio.to_thread(self.memory.clear, key)
+        except sqlite3.Error:
+            log.exception("Could not clear the memory of channel %s", key)
+            await self._answer(interaction, prompts.ERROR_REPLY, ephemeral=True)
+            return
+        log.info("Cleared %d remembered messages in channel %s", removed, key)
+        await self._answer(interaction, prompts.RESET_DONE)  # visible to everyone: it changes the channel for all
+
+    async def _about(self, interaction: discord.Interaction, note: str | None) -> None:
+        """/about set saves a note about yourself (`note`), /about show shows it (None), /about clear removes it ("")."""
+        if self._retiring:
+            return
+        user_id = str(interaction.user.id)
+        try:
+            if note is None:
+                saved = (await asyncio.to_thread(self.memory.abouts, [user_id])).get(user_id, "")
+                reply = prompts.ABOUT_SHOW.format(text=saved) if saved else prompts.ABOUT_NONE
+            elif not note.strip():
                 await asyncio.to_thread(self.memory.set_about, user_id, "")
-                await self._send(message, prompts.ABOUT_CLEARED)
+                reply = prompts.ABOUT_CLEARED
             else:
-                note = prompts.clean_about(argument)
-                await asyncio.to_thread(self.memory.set_about, user_id, note)
-                await self._send(message, prompts.ABOUT_SAVED if note else prompts.ABOUT_NONE)
+                cleaned = prompts.clean_about(note)
+                await asyncio.to_thread(self.memory.set_about, user_id, cleaned)
+                reply = prompts.ABOUT_SAVED if cleaned else prompts.ABOUT_NONE
         except sqlite3.Error:
             log.exception("Could not read or save a note for user %s", user_id)
-            await self._send(message, prompts.ERROR_REPLY)
+            reply = prompts.ERROR_REPLY
+        await self._answer(interaction, reply, ephemeral=True)  # notes are personal: only the sender sees the answer
 
-    async def _forget_me(self, message: discord.Message) -> None:
-        await asyncio.to_thread(self.memory.forget_user, str(message.author.id))
-        log.info("Forgot the saved profile of user %s", message.author.id)
-        await self._send(message, prompts.FORGOT_YOU)
+    async def _forget_me(self, interaction: discord.Interaction) -> None:
+        """/forgetme: deletes the note and the names saved about the person who uses it."""
+        if self._retiring:
+            return
+        try:
+            await asyncio.to_thread(self.memory.forget_user, str(interaction.user.id))
+        except sqlite3.Error:
+            log.exception("Could not forget the saved profile of user %s", interaction.user.id)
+            await self._answer(interaction, prompts.ERROR_REPLY, ephemeral=True)
+            return
+        log.info("Forgot the saved profile of user %s", interaction.user.id)
+        await self._answer(interaction, prompts.FORGOT_YOU, ephemeral=True)
+
+    @staticmethod
+    async def _answer(interaction: discord.Interaction, text: str, *, ephemeral: bool = False) -> None:
+        """Answers a slash command (or follows up, if it was deferred). The answer never pings anyone."""
+        none = discord.AllowedMentions.none()
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=ephemeral, allowed_mentions=none)
+            else:
+                await interaction.response.send_message(text, ephemeral=ephemeral, allowed_mentions=none)
+        except discord.HTTPException as exc:
+            log.warning("Could not answer a slash command (%s)", exc)
 
     # --- helpers -----------------------------------------------------------------
     def _people(self, message: discord.Message, quoted_author: discord.abc.User | None) -> list[discord.abc.User]:

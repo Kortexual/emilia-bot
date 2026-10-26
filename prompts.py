@@ -539,8 +539,12 @@ FORMAT_REPLY = (
 BUSY_REPLY = "One moment, please! I'm still thinking about your last message."
 RESET_DONE = "Okay, I've forgotten our conversation so far. Let's start fresh!"
 ABOUT_SAVED = "Okay! I'll remember that about you."
-ABOUT_NONE = "I don't have any notes about you yet. You can tell me with `!about` and a few words."
+ABOUT_NONE = "I don't have any notes about you yet. You can tell me with `/about set` and a few words."
 ABOUT_CLEARED = "Okay, I've forgotten what you told me about yourself."
 ABOUT_SHOW = "Here's what I have noted about you: {text}"
 FORGOT_YOU = "Okay, I've forgotten the notes and names I had saved for you."
 RESET_DENIED = "Sorry, only people who can manage messages here are able to make me forget."
+SLASH_COMMANDS_HINT = (
+    "Oh, those are slash commands now! Type `/` and you'll find them: `/forget`, `/about set`, `/about show`, "
+    "`/about clear` and `/forgetme`."
+)

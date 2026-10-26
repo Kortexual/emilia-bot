@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
 
 -- Who people are: one row per Discord user ID, the names they have been seen under, and an optional
--- note they wrote about themselves with "!about".
+-- note they wrote about themselves with "/about set".
 CREATE TABLE IF NOT EXISTS users (
     user_id    TEXT PRIMARY KEY,
     about      TEXT NOT NULL DEFAULT '',
