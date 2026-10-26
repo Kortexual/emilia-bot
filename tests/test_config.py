@@ -175,6 +175,7 @@ class DaySettingsTests(unittest.TestCase):
         self.assertEqual(s.random_message_full_hours, 8.0)
         self.assertFalse(s.random_message_tools)
         self.assertFalse(s.random_message_multi_turn)
+        self.assertFalse(s.random_message_computer_tools)
 
     def test_values_are_read(self):
         s = load(
@@ -190,6 +191,8 @@ class DaySettingsTests(unittest.TestCase):
             RANDOM_MESSAGE_FULL_HOURS="6.5",
             RANDOM_MESSAGE_TOOLS="true",
             RANDOM_MESSAGE_MULTI_TURN="on",
+            RANDOM_MESSAGE_COMPUTER_TOOLS="yes",
+            COMPUTER_TOOLS="true",
         )
         self.assertTrue(s.time_awareness)
         self.assertEqual(s.timezone, "America/New_York")
@@ -201,6 +204,7 @@ class DaySettingsTests(unittest.TestCase):
         self.assertEqual(s.random_message_full_hours, 6.5)
         self.assertTrue(s.random_message_tools)
         self.assertTrue(s.random_message_multi_turn)
+        self.assertTrue(s.random_message_computer_tools)
 
     def test_waits_of_minutes_are_allowed(self):
         s = load(DISCORD_TOKEN="a", RANDOM_MESSAGE_MIN_MINUTES="2.5", RANDOM_MESSAGE_FULL_HOURS="0.15")
@@ -232,6 +236,8 @@ class DaySettingsTests(unittest.TestCase):
             {"RANDOM_MESSAGE_MIN_MINUTES": "10", "RANDOM_MESSAGE_FULL_HOURS": "0.1"},  # 6 minutes, shorter than the minimum
             {"RANDOM_MESSAGE_TOOLS": "sometimes"},
             {"RANDOM_MESSAGE_MULTI_TURN": "true"},  # needs RANDOM_MESSAGE_TOOLS
+            {"RANDOM_MESSAGE_COMPUTER_TOOLS": "true", "COMPUTER_TOOLS": "true"},  # needs RANDOM_MESSAGE_TOOLS
+            {"RANDOM_MESSAGE_COMPUTER_TOOLS": "true", "RANDOM_MESSAGE_TOOLS": "true"},  # needs COMPUTER_TOOLS
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)
