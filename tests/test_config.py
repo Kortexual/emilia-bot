@@ -197,6 +197,8 @@ class DaySettingsTests(unittest.TestCase):
         self.assertEqual(s.random_event_cooldown_minutes, 120)
         self.assertEqual(s.random_message_min_minutes, 60)
         self.assertEqual(s.random_message_full_hours, 8.0)
+        self.assertFalse(s.random_message_tools)
+        self.assertFalse(s.random_message_multi_turn)
 
     def test_values_are_read(self):
         s = load(
@@ -210,6 +212,8 @@ class DaySettingsTests(unittest.TestCase):
             ACTIVE_END="11:15 PM",
             RANDOM_MESSAGE_MIN_MINUTES="30",
             RANDOM_MESSAGE_FULL_HOURS="6.5",
+            RANDOM_MESSAGE_TOOLS="true",
+            RANDOM_MESSAGE_MULTI_TURN="on",
         )
         self.assertTrue(s.time_awareness)
         self.assertEqual(s.timezone, "America/New_York")
@@ -219,6 +223,12 @@ class DaySettingsTests(unittest.TestCase):
         self.assertEqual((s.active_start, s.active_end), (time(9, 30), time(23, 15)))
         self.assertEqual(s.random_message_min_minutes, 30)
         self.assertEqual(s.random_message_full_hours, 6.5)
+        self.assertTrue(s.random_message_tools)
+        self.assertTrue(s.random_message_multi_turn)
+
+    def test_waits_of_minutes_are_allowed(self):
+        s = load(DISCORD_TOKEN="a", RANDOM_MESSAGE_MIN_MINUTES="2.5", RANDOM_MESSAGE_FULL_HOURS="0.15")
+        self.assertEqual((s.random_message_min_minutes, s.random_message_full_hours), (2.5, 0.15))
 
     def test_active_hours_may_run_past_midnight(self):
         s = load(DISCORD_TOKEN="a", ACTIVE_START="20:00", ACTIVE_END="02:00")
@@ -243,6 +253,9 @@ class DaySettingsTests(unittest.TestCase):
             {"RANDOM_MESSAGE_FULL_HOURS": "0"},
             {"RANDOM_MESSAGE_MIN_MINUTES": "120", "RANDOM_MESSAGE_FULL_HOURS": "2"},  # must be longer than the minimum
             {"RANDOM_MESSAGES": "true"},  # no channels listed
+            {"RANDOM_MESSAGE_MIN_MINUTES": "10", "RANDOM_MESSAGE_FULL_HOURS": "0.1"},  # 6 minutes, shorter than the minimum
+            {"RANDOM_MESSAGE_TOOLS": "sometimes"},
+            {"RANDOM_MESSAGE_MULTI_TURN": "true"},  # needs RANDOM_MESSAGE_TOOLS
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

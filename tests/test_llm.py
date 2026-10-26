@@ -480,6 +480,21 @@ class MultiTurnTests(ClientTestCase):
         self.assertEqual(events, [("tool", "web_search", {"query": "a"}), ("tool", "web_search", {"query": "b"})])
         self.assertEqual(len(server.requests), 2)
 
+    async def test_multi_turn_can_be_switched_per_conversation(self):
+        replies = [tool_reply(("web_search", {"query": "one"})), text_reply("Found it."), tool_reply((llm.STOP_TALKING, {}))]
+        server = self.serve(list(replies))
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=False)
+        result = await client.chat(USER, multi_turn=True)
+        self.assertEqual(len(server.requests), 3)  # it kept going until stop_talking
+        self.assertEqual(result.text, "")
+        self.assertEqual(self.offered(server.requests[1]), ["web_search", llm.STOP_TALKING])
+
+        server = self.serve([tool_reply(("web_search", {"query": "one"})), text_reply("Found it.")])
+        client = await self.client(server, tools=[FakeSearch()], multi_turn=True)
+        result = await client.chat(USER, multi_turn=False)
+        self.assertEqual(result.text, "Found it.")  # an ordinary answer ends it
+        self.assertEqual(len(server.requests), 2)
+
     async def test_stop_talking_is_refused_before_any_work(self):
         server = self.serve([tool_reply((llm.STOP_TALKING, {})), text_reply("Oh, hello!")])
         client = await self.client(server, tools=[FakeSearch()], multi_turn=True)
