@@ -27,11 +27,12 @@ without Discord or a model. The wording the model sees lives in prompts.py; this
   whether the sender has stumbled on her in the middle of something (a random event, with a
   cooldown), or neither. The model invents the actual event; we only pick the occasion and a few
   ideas to get it started.
-* is_active / send_chance: the hours she is "up", and how likely she is to say something unprompted
-  right now, which grows the longer it has been since she last spoke.
+* is_active / send_chance / check_seconds: the hours she is "up", how likely she is to say something
+  unprompted right now (which grows the longer it has been since she last spoke), and how often to ask.
 """
 from __future__ import annotations
 
+import math
 import random
 import re
 import time
@@ -40,8 +41,13 @@ from datetime import datetime, time as clock_time, tzinfo
 from typing import Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-CHECK_SECONDS = 300  # how often the bot considers saying something unprompted
-MAX_CHANCE = 0.25  # the most likely a single check can be, reached once the wait is as long as it gets
+CHECK_SECONDS = 300  # how often the bot considers saying something unprompted, at most...
+MIN_CHECK_SECONDS = 10  # ...and at least, for very short waits
+CHECKS_PER_WAIT = 96  # checks over the full wait: every 5 minutes with the default 8 hours
+# How eagerly she speaks up once the wait is as long as it gets, in messages per length of the ramp (the
+# time from the minimum wait to the full one). The rate grows with the square of the way along the ramp,
+# so half of all gaps end within about 44% of it: with the defaults (1 to 8 hours), about 4 hours.
+FULL_RATE = 24.0
 EVENT_CHANCE = 0.3  # chance that an eligible reply (cooldown over) comes with a random event
 IDEAS_PER_EVENT = 3  # how many activities are suggested to the model as a starting point
 SLEEPY_CHANCE = 0.2  # at the sleepy hours, the chance that a message is told to let tiredness show (otherwise it is told not to)
@@ -121,15 +127,27 @@ def is_active(now: clock_time, start: clock_time, end: clock_time) -> bool:
     return now >= start or now < end
 
 
-def send_chance(elapsed: float, min_seconds: float, full_seconds: float) -> float:
-    """The chance, at one check, that she says something unprompted, given the seconds since she last
-    spoke. Zero before `min_seconds`, then growing with the square of how far along she is towards
-    `full_seconds` (so it stays low at first and climbs), and never above MAX_CHANCE."""
+def check_seconds(full_seconds: float) -> float:
+    """How often to consider speaking up: CHECKS_PER_WAIT times over the full wait, so a wait of minutes is
+    looked at as finely as one of hours, but no more often than MIN_CHECK_SECONDS and no less than CHECK_SECONDS."""
+    return min(CHECK_SECONDS, max(MIN_CHECK_SECONDS, full_seconds / CHECKS_PER_WAIT))
+
+
+def send_chance(elapsed: float, min_seconds: float, full_seconds: float, interval: float = CHECK_SECONDS) -> float:
+    """The chance that she says something unprompted at one check, given the seconds since she last spoke
+    and the seconds between checks (`interval`). Zero before `min_seconds`; after that she speaks up at a
+    rate that grows with the square of how far along she is towards `full_seconds` (low at first, then
+    climbing), up to FULL_RATE messages per length of that ramp. Because the rate is measured against the
+    ramp, the gaps have the same shape at any scale and however often she checks: 1 to 8 hours checked
+    every 5 minutes and 5 to 15 minutes checked every 10 seconds are the same curve."""
     if elapsed < min_seconds:
         return 0.0
     span = full_seconds - min_seconds
-    ramp = 1.0 if span <= 0 else min(1.0, (elapsed - min_seconds) / span)
-    return MAX_CHANCE * ramp * ramp
+    if span <= 0:  # a degenerate range: as likely as it gets as soon as the minimum is over
+        span, ramp = max(interval, 1.0), 1.0
+    else:
+        ramp = min(1.0, (elapsed - min_seconds) / span)
+    return 1.0 - math.exp(-FULL_RATE * ramp * ramp * interval / span)
 
 
 # --- Scenes --------------------------------------------------------------------------------------

@@ -256,10 +256,12 @@ class LMStudioClient:
         *,
         exclude: Collection[str] = (),
         tools: bool = True,
+        multi_turn: bool | None = None,
     ) -> ChatResult:
         """Run a conversation to completion, executing any tool calls the model makes on the way.
-        With `tools=False` the model is offered none, however many are configured (used for the messages
-        she starts herself, where nobody has asked for anything to be searched, read or run).
+        With `tools=False` the model is offered none, however many are configured (the messages she starts
+        herself, unless RANDOM_MESSAGE_TOOLS is on). `multi_turn` overrides the client's own setting for
+        this conversation (None keeps it).
 
         As it goes, whatever the model writes before its last message is handed to `on_text`, and every
         tool call to `on_tool` just before the tool runs (and to `on_tool_done` after, with its sources),
@@ -269,7 +271,8 @@ class LMStudioClient:
         only offered while working, so it can't end a reply before it has started. Tools named in
         `exclude` are neither offered nor run for this conversation.
         """
-        available = {name: tool for name, tool in self._tools.items() if name not in exclude} if tools else {}
+        multi_turn = self._multi_turn if multi_turn is None else multi_turn
+        available ={name: tool for name, tool in self._tools.items() if name not in exclude} if tools else {}
         convo = list(messages)
         sources: list[str] = []
         used_ids: set[str] = set()
@@ -279,7 +282,7 @@ class LMStudioClient:
         previous_calls: list[str] = []  # the last round's tool calls, to catch it repeating them
         repeated_rounds = 0
         tools_enabled = bool(available)
-        limit = self._max_turns if self._multi_turn else MAX_TOOL_ROUNDS + 1
+        limit = self._max_turns if multi_turn else MAX_TOOL_ROUNDS + 1
 
         for round_no in range(limit):
             last = round_no + 1 >= limit
@@ -336,9 +339,9 @@ class LMStudioClient:
                 }
             )
             if round_no + 2 >= limit:
-                hint = _LAST_TURN_HINT if self._multi_turn else _FINAL_ANSWER_HINT
+                hint = _LAST_TURN_HINT if multi_turn else _FINAL_ANSWER_HINT
             else:
-                hint = CONTINUE_HINT if self._multi_turn else ""
+                hint = CONTINUE_HINT if multi_turn else ""
             if working and all(call.name == STOP_TALKING for call in calls):
                 log.info("Model called stop_talking: turn over")
                 return ChatResult(text, sources, used_tools)  # what it wrote alongside stop_talking is its last message
@@ -378,7 +381,7 @@ class LMStudioClient:
                 sources.extend(result.sources)
                 note = f"\n\n{hint}" if hint and call is calls[-1] else ""
                 convo.append({"role": "tool", "tool_call_id": call.id, "content": result.text + note})
-            working = working or (self._multi_turn and any(call.name in available for call in calls))
+            working = working or (multi_turn and any(call.name in available for call in calls))
             if finished:
                 log.info("Model called stop_talking: turn over")
                 return ChatResult("", sources, used_tools)

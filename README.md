@@ -292,18 +292,32 @@ written fresh by the model each time. The logic is in `presence.py` (pure, so it
 The system prompt stays the same all day (only the date changes), so the note goes at the end of the newest message, after the
 reminder, and is never stored in memory. A reply that fails does not use up a wake-up or an event.
 
-**Speaking up on her own** (`RANDOM_MESSAGES=true`, with `RANDOM_MESSAGE_CHANNELS`). Every 5 minutes, inside `ACTIVE_START` to
-`ACTIVE_END` (the window may run past midnight), each listed channel gets a chance of a message from her. The chance is zero until
-`RANDOM_MESSAGE_MIN_MINUTES` after her last message there (answers count), then rises with the square of how far along she is towards
-`RANDOM_MESSAGE_FULL_HOURS`, where it levels off at 25% per check. With the defaults (60 minutes, 8 hours) a gap is typically about
-4 hours (80% fall between roughly 3 and 6) and rarely more than 8. The wait keeps counting while she is "asleep", so after a quiet night
-she is likely to speak up soon after her active hours begin, and at that time of day it is the wake-up message. Each message comes
-with something she is doing, so she has something to say.
+**Speaking up on her own** (`RANDOM_MESSAGES=true`, with `RANDOM_MESSAGE_CHANNELS`). Inside `ACTIVE_START` to `ACTIVE_END` (the
+window may run past midnight), each listed channel regularly gets a chance of a message from her. The chance is zero until
+`RANDOM_MESSAGE_MIN_MINUTES` after her last message there (answers count); after that she speaks up at a rate that rises with the
+square of how far along she is towards `RANDOM_MESSAGE_FULL_HOURS`, where it levels off. With the defaults (60 minutes, 8 hours) a gap
+is typically about 4 hours (80% fall between roughly 3 and 6) and rarely more than 8. The wait keeps counting while she is "asleep",
+so after a quiet night she is likely to speak up soon after her active hours begin, and at that time of day it is the wake-up message.
+Each message comes with something she is doing, so she has something to say.
+
+Both waits take decimals, and short ones work the same way: she checks 96 times over `RANDOM_MESSAGE_FULL_HOURS` (every 5 minutes
+with the default 8 hours, never more often than every 10 seconds), and the rate is measured against the length of the ramp rather
+than per check, so the gaps keep the same shape at any scale. Half of them end about 44% of the way from the minimum to the full wait:
+`RANDOM_MESSAGE_MIN_MINUTES=5` with `RANDOM_MESSAGE_FULL_HOURS=0.25` (15 minutes) gives a message roughly every 7 to 12 minutes.
 
 Messages she starts herself are held to stricter rules than answers: they never ping anyone (not even someone named in the conversation),
-the model gets no tools (no search, page reading, files, commands or restart), she skips a channel while she is busy answering in it,
-and the usual checks (cleanup, system-prompt leak, braille, emoji cooldown) apply. They are stored in memory as an exchange with a
-placeholder where the question would be, so the conversation still alternates and a reply to her has context. The time she last
+she skips a channel while she is busy answering in it, and the usual checks (cleanup, system-prompt leak, braille, emoji cooldown) apply.
+By default the model gets no tools for them. With `RANDOM_MESSAGE_TOOLS=true` it is offered the tools you have turned on for replies
+(search, page reading, the browser), so she can look up whatever she is in the middle of, and her tool lines are posted as in a reply.
+The computer tools and `restart_bot` are left out, since nobody asked for a command, unless you also set
+`RANDOM_MESSAGE_COMPUTER_TOOLS=true` (which needs `COMPUTER_TOOLS`). Even then she is told that nobody asked, so she should not set
+`confirm=true` on her own: with `COMPUTER_REQUIRE_CONFIRMATION=true` (the default) that keeps her to looking around, and if you want her
+to write files or run commands unprompted, turn confirmation off. That is a request to the model, not a guarantee; the workspace and
+the sandbox are what actually contain her. `RANDOM_MESSAGE_MULTI_TURN=true`
+(which needs `RANDOM_MESSAGE_TOOLS`) lets her keep taking turns after a tool call until she calls `stop_talking`, like
+`MULTI_TURN_TOOLS` does for replies and limited by the same `MAX_TOOL_TURNS`; the two settings are independent. A message with only
+tool lines and no text still counts as speaking up. What she posts is stored in memory as an exchange with a placeholder where the
+question would be, so the conversation still alternates and a reply to her has context. The time she last
 spoke is kept in `memory.db` (timing only), so a restart does not reset her wait. Until she has spoken in a channel, the wait counts
 from when the bot started.
 
@@ -348,8 +362,11 @@ All settings are environment variables (or lines in `.env`).
 | `RANDOM_MESSAGES` | `false` | Let her speak up on her own in `RANDOM_MESSAGE_CHANNELS` during her active hours |
 | `RANDOM_MESSAGE_CHANNELS` | empty | Channel IDs, separated by commas; required with `RANDOM_MESSAGES` |
 | `ACTIVE_START`, `ACTIVE_END` | `08:00`, `22:00` | When she may speak up (`22:00` or `10:00PM`; may run past midnight; must differ) |
-| `RANDOM_MESSAGE_MIN_MINUTES` | `60` | Never speaks up sooner than this after her last message in that channel |
-| `RANDOM_MESSAGE_FULL_HOURS` | `8` | The wait after which speaking up is as likely as it gets (must be longer than the minimum) |
+| `RANDOM_MESSAGE_MIN_MINUTES` | `60` | Never speaks up sooner than this after her last message in that channel (decimals allowed) |
+| `RANDOM_MESSAGE_FULL_HOURS` | `8` | The wait after which speaking up is as likely as it gets (decimals allowed, e.g. `0.25`; must be longer than the minimum) |
+| `RANDOM_MESSAGE_TOOLS` | `false` | Offer her tools when she speaks up on her own (not the computer tools or `restart_bot`, see below) |
+| `RANDOM_MESSAGE_COMPUTER_TOOLS` | `false` | With `RANDOM_MESSAGE_TOOLS` and `COMPUTER_TOOLS`, also offer the computer tools and `restart_bot` then |
+| `RANDOM_MESSAGE_MULTI_TURN` | `false` | With `RANDOM_MESSAGE_TOOLS`, let her keep taking turns after a tool call, like `MULTI_TURN_TOOLS` |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |
 | `MEMORY_MAX_CHARS` | `6000` | Cap on remembered text sent per request |
