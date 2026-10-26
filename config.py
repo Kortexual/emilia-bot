@@ -164,6 +164,7 @@ class Settings:
     random_message_full_hours: float = 8.0  # the wait after which speaking up is as likely as it gets
     random_message_tools: bool = False  # opt-in: messages she starts herself may use tools (never computer tools or restart)
     random_message_multi_turn: bool = False  # ...and keep taking turns after a tool call, like MULTI_TURN_TOOLS
+    random_message_computer_tools: bool = False  # ...including the computer tools and restart_bot (needs COMPUTER_TOOLS)
 
     # Memory
     memory_db: str = str(BASE_DIR / "memory.db")
@@ -214,6 +215,10 @@ class Settings:
         random_multi_turn = _flag("RANDOM_MESSAGE_MULTI_TURN", cls.random_message_multi_turn)
         if random_multi_turn and not random_tools:
             raise ConfigError("RANDOM_MESSAGE_MULTI_TURN needs RANDOM_MESSAGE_TOOLS: she only keeps going after using a tool")
+        computer_tools = _flag("COMPUTER_TOOLS", cls.computer_tools)
+        random_computer_tools = _flag("RANDOM_MESSAGE_COMPUTER_TOOLS", cls.random_message_computer_tools)
+        if random_computer_tools and not (random_tools and computer_tools):
+            raise ConfigError("RANDOM_MESSAGE_COMPUTER_TOOLS needs both RANDOM_MESSAGE_TOOLS and COMPUTER_TOOLS")
         random_messages = _flag("RANDOM_MESSAGES", cls.random_messages)
         channels = _channel_ids("RANDOM_MESSAGE_CHANNELS")
         if random_messages and not channels:
@@ -247,7 +252,7 @@ class Settings:
             fetch_pages=_flag("FETCH_PAGES", cls.fetch_pages),
             page_max_chars=_number("PAGE_MAX_CHARS", cls.page_max_chars, int, minimum=500),
             show_sources=_flag("SHOW_SOURCES", cls.show_sources),
-            computer_tools=_flag("COMPUTER_TOOLS", cls.computer_tools),
+            computer_tools=computer_tools,
             computer_workspace=_text("COMPUTER_WORKSPACE") or cls.computer_workspace,
             command_timeout=_number("COMMAND_TIMEOUT", cls.command_timeout, float, minimum=1),
             computer_allow_host_access=_flag("COMPUTER_ALLOW_HOST_ACCESS", cls.computer_allow_host_access),
@@ -282,6 +287,7 @@ class Settings:
             random_message_full_hours=full_hours,
             random_message_tools=random_tools,
             random_message_multi_turn=random_multi_turn,
+            random_message_computer_tools=random_computer_tools,
             memory_db=_text("MEMORY_DB") or cls.memory_db,
             memory_turns=_number("MEMORY_TURNS", cls.memory_turns, int, minimum=1),
             memory_max_chars=_number("MEMORY_MAX_CHARS", cls.memory_max_chars, int, minimum=200),

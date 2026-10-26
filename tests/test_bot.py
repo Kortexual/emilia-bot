@@ -1877,6 +1877,7 @@ class RandomMessageTests(DayTestCase):
         self.assertEqual(self.llm.excludes, [set(OPERATOR_TOOLS)])
         self.assertEqual(self.llm.multi_turns, [False])
         self.assertIn("tools offered to you now", self.llm.calls[0][-1]["content"])
+        self.assertNotIn("computer tools", self.llm.calls[0][-1]["content"])
         self.assertNotIn("stop_talking", self.llm.calls[0][-1]["content"])
         self.assertEqual(self.channel.sent[0], "Let me look that up @Alice")
         self.assertTrue(self.channel.sent[1].startswith("-# 🔎 Searching `tea`"))
@@ -1887,6 +1888,18 @@ class RandomMessageTests(DayTestCase):
         history = self.memory.recent(str(self.CHANNEL_ID))
         self.assertEqual(history[-1].content, "Let me look that up @Alice\n\nOh, oolong is lovely \U0001F338")
         self.assertEqual(self.memory.presence(str(self.CHANNEL_ID)).sent_here, self.clock.timestamp())
+
+    async def test_random_message_computer_tools_also_offers_the_operator_tools(self):
+        bot = self.random_bot(random_message_tools=True, random_message_computer_tools=True, computer_tools=True)
+        await bot._check_presence()
+        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([True], [set()]))
+        self.assertIn("computer tools", self.llm.calls[0][-1]["content"])
+
+    async def test_random_message_computer_tools_does_nothing_without_random_message_tools(self):
+        bot = self.random_bot(random_message_computer_tools=True, computer_tools=True)
+        await bot._check_presence()
+        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([False], [set(OPERATOR_TOOLS)]))
+        self.assertNotIn("computer tools", self.llm.calls[0][-1]["content"])
 
     async def test_random_message_multi_turn_keeps_her_going_after_a_tool(self):
         bot = self.random_bot(random_message_tools=True, random_message_multi_turn=True)

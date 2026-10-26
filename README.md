@@ -362,8 +362,12 @@ than per check, so the gaps keep the same shape at any scale. Half of them end a
 Messages she starts herself are held to stricter rules than answers: they never ping anyone (not even someone named in the conversation),
 she skips a channel while she is busy answering in it, and the usual checks (cleanup, system-prompt leak, braille, emoji cooldown) apply.
 By default the model gets no tools for them. With `RANDOM_MESSAGE_TOOLS=true` it is offered the tools you have turned on for replies
-(search, page reading, the browser), so she can look up whatever she is in the middle of, and her tool lines are posted as in a reply,
-but never the computer tools or `restart_bot`: nobody asked for a command or confirmed anything. `RANDOM_MESSAGE_MULTI_TURN=true`
+(search, page reading, the browser), so she can look up whatever she is in the middle of, and her tool lines are posted as in a reply.
+The computer tools and `restart_bot` are left out, since nobody asked for a command, unless you also set
+`RANDOM_MESSAGE_COMPUTER_TOOLS=true` (which needs `COMPUTER_TOOLS`). Even then she is told that nobody asked, so she should not set
+`confirm=true` on her own: with `COMPUTER_REQUIRE_CONFIRMATION=true` (the default) that keeps her to looking around, and if you want her
+to write files or run commands unprompted, turn confirmation off. That is a request to the model, not a guarantee; the workspace and
+the sandbox are what actually contain her. `RANDOM_MESSAGE_MULTI_TURN=true`
 (which needs `RANDOM_MESSAGE_TOOLS`) lets her keep taking turns after a tool call until she calls `stop_talking`, like
 `MULTI_TURN_TOOLS` does for replies and limited by the same `MAX_TOOL_TURNS`; the two settings are independent. A message with only
 tool lines and no text still counts as speaking up. What she posts is stored in memory as an exchange with a placeholder where the
@@ -422,7 +426,8 @@ All settings are environment variables (or lines in `.env`).
 | `ACTIVE_START`, `ACTIVE_END` | `08:00`, `22:00` | When she may speak up (`22:00` or `10:00PM`; may run past midnight; must differ) |
 | `RANDOM_MESSAGE_MIN_MINUTES` | `60` | Never speaks up sooner than this after her last message in that channel (decimals allowed) |
 | `RANDOM_MESSAGE_FULL_HOURS` | `8` | The wait after which speaking up is as likely as it gets (decimals allowed, e.g. `0.25`; must be longer than the minimum) |
-| `RANDOM_MESSAGE_TOOLS` | `false` | Offer her tools when she speaks up on her own (never computer tools or `restart_bot`) |
+| `RANDOM_MESSAGE_TOOLS` | `false` | Offer her tools when she speaks up on her own (not the computer tools or `restart_bot`, see below) |
+| `RANDOM_MESSAGE_COMPUTER_TOOLS` | `false` | With `RANDOM_MESSAGE_TOOLS` and `COMPUTER_TOOLS`, also offer the computer tools and `restart_bot` then |
 | `RANDOM_MESSAGE_MULTI_TURN` | `false` | With `RANDOM_MESSAGE_TOOLS`, let her keep taking turns after a tool call, like `MULTI_TURN_TOOLS` |
 | `MEMORY_DB` | `memory.db` next to `bot.py` | Where memory is stored |
 | `MEMORY_TURNS` | `10` | Exchanges remembered per channel |

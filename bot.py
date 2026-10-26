@@ -805,8 +805,8 @@ class EmiliaBot(discord.Client):
 
     async def _speak_up(self, channel: Any, key: str) -> None:
         """Say something nobody asked for. It never pings anyone. The model gets no tools unless
-        RANDOM_MESSAGE_TOOLS is on, and never the operator tools (computer tools, restart): there is nobody
-        to ask for a command, and nobody who has confirmed anything."""
+        RANDOM_MESSAGE_TOOLS is on, and the operator tools (computer tools, restart) only with
+        RANDOM_MESSAGE_COMPUTER_TOOLS as well: there is nobody to ask for a command, or to confirm one."""
         async with channel.typing():
             async with self._channel_lock(key):
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
@@ -818,7 +818,8 @@ class EmiliaBot(discord.Client):
                 scene = await self._scene(key, spontaneous=True)
                 use_tools = self.settings.random_message_tools
                 multi_turn = use_tools and self.settings.random_message_multi_turn
-                note = prompts.unprompted_note(scene, tools=use_tools, multi_turn=multi_turn)
+                computer = use_tools and self.settings.random_message_computer_tools
+                note = prompts.unprompted_note(scene, tools=use_tools, multi_turn=multi_turn, computer=computer)
                 messages = prompts.build_unprompted_messages(self._system_prompt(), shown, note)
                 browser.SESSION_KEY.set(key)  # if she browses, it is in this channel's browser context
 
@@ -856,7 +857,7 @@ class EmiliaBot(discord.Client):
                         post,
                         on_tool,
                         on_tool_done,
-                        exclude=OPERATOR_TOOLS,
+                        exclude=() if computer else OPERATOR_TOOLS,
                         tools=use_tools,
                         multi_turn=multi_turn,
                     )
