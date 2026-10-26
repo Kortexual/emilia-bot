@@ -225,6 +225,51 @@ class FakeMessage:
         self.channel.timeline.append(text)
 
 
+class _Response:
+    """interaction.response: one answer (or a defer) per interaction, like Discord."""
+
+    def __init__(self, interaction):
+        self.interaction = interaction
+        self.deferred = False
+
+    def is_done(self):
+        return self.deferred or bool(self.interaction.answers)
+
+    async def defer(self, **kwargs):
+        assert not self.is_done(), "an interaction can only be answered once"
+        self.deferred = True
+
+    async def send_message(self, text, *, ephemeral=False, allowed_mentions=None):
+        assert not self.is_done(), "an interaction can only be answered once; use followup"
+        self.interaction.answers.append(SimpleNamespace(text=text, ephemeral=ephemeral, allowed_mentions=allowed_mentions))
+
+
+class _Followup:
+    def __init__(self, interaction):
+        self.interaction = interaction
+
+    async def send(self, text, *, ephemeral=False, allowed_mentions=None):
+        assert self.interaction.response.is_done(), "a followup needs an answer or a defer first"
+        self.interaction.answers.append(SimpleNamespace(text=text, ephemeral=ephemeral, allowed_mentions=allowed_mentions))
+
+
+class FakeInteraction:
+    """A slash command someone used. `permissions` are theirs in the channel, as Discord resolves them."""
+
+    def __init__(self, *, user=None, channel_id=1, guild=True, can_manage=False):
+        self.user = user or person()
+        self.channel_id = channel_id
+        self.guild = object() if guild else None
+        self.permissions = SimpleNamespace(manage_messages=can_manage)
+        self.answers = []  # every answer sent, with .text, .ephemeral and .allowed_mentions
+        self.response = _Response(self)
+        self.followup = _Followup(self)
+
+    @property
+    def texts(self):
+        return [answer.text for answer in self.answers]
+
+
 class BotTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         patcher = mock.patch.object(EmiliaBot, "user", BOT, create=True)
@@ -245,6 +290,16 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
 
     def mention(self, text):
         return f"<@{BOT.id}> {text}"
+
+    async def command(self, bot, path, *args, **kwargs):
+        """Runs a slash command through the bot's command tree, e.g. command(bot, "about set", "likes tea", user=alice).
+        Keyword arguments go to FakeInteraction; the interaction is returned to look at its answers."""
+        interaction = FakeInteraction(channel_id=self.channel.id, **kwargs)
+        node = bot.tree
+        for name in path.split():
+            node = node.get_command(name)
+        await node.callback(interaction, *args)
+        return interaction
 
 
 class MentionRuleTests(BotTestCase):
@@ -279,6 +334,21 @@ class MentionRuleTests(BotTestCase):
         self.assertEqual(message.replies, ["Hello there!"])
         self.assertEqual(len(self.llm.calls), 1)
         self.assertGreaterEqual(self.channel.typing_count, 1)
+
+    async def test_a_typing_indicator_that_discord_refuses_does_not_stop_the_reply(self):
+        class Refused:
+            async def __aenter__(self):
+                raise http_error(403, discord.Forbidden, "Forbidden", "Missing Access")
+
+            async def __aexit__(self, *exc):
+                raise AssertionError("never entered")
+
+        bot = self.make_bot()
+        channel = FakeChannel()
+        channel.typing = Refused
+        message = self.msg(self.mention("hi there"), channel=channel)
+        await bot.on_message(message)
+        self.assertEqual(message.replies, ["Hello there!"])
 
     async def test_a_reply_that_pings_the_bot_counts_as_a_mention(self):
         # Discord lists the bot in `mentions` for pinging replies, but puts no <@id> in the text.
@@ -362,18 +432,17 @@ class BotSenderTests(BotTestCase):
             await bot.on_message(self.from_bot("again"))
         self.assertEqual(len(self.llm.calls), 10)
 
-    async def test_bots_cannot_run_commands(self):
+    async def test_a_bot_typing_an_old_command_is_just_chat(self):
         bot = self.make_bot(respond_to_bots=True, bot_reply_limit=0)
-        self.memory.add_turn("1", "Alice", "1", "remember this", "I will!")
         self.memory.set_about("5", "a note")
-        for command in ("!forget", "!reset", "!forgetme", "!about I am a bot", "!about clear"):
-            with self.subTest(command=command), self.assertLogs("emilia.bot", level="INFO"):
+        for command in ("!forget", "!reset", "!forgetme", "!about clear"):
+            with self.subTest(command=command):
                 message = self.from_bot(command)
                 await bot.on_message(message)
-                self.assertEqual(message.replies, [])
-        self.assertEqual(len(self.memory.recent("1")), 2)
+                self.assertEqual(message.replies, ["Hello there!"])
+        self.assertEqual(len(self.llm.calls), 4)
+        self.assertEqual(len(self.memory.recent("1")), 8)
         self.assertEqual(self.memory.abouts(["5"]), {"5": "a note"})
-        self.assertEqual(self.llm.calls, [])
 
     async def test_a_bot_cannot_get_someone_pinged_by_name(self):
         bot = self.make_bot(llm=FakeLLM(text="Okay! @Jack, someone is looking for you!"), respond_to_bots=True)
@@ -737,6 +806,15 @@ class ForwardTests(BotTestCase):
         self.assertIn("forwarded", self.llm.calls[0][-1]["content"])
         self.assertNotIn("forwarded", self.llm.calls[1][-1]["content"])
 
+    async def test_a_bare_mention_after_a_forward_is_about_the_forward_not_a_greeting(self):
+        bot = self.make_bot()
+        alice = person()
+        await bot.on_message(self.forward(author=alice))
+        comment = self.msg(f"<@{BOT.id}>", author=alice)
+        await bot.on_message(comment)
+        self.assertEqual(comment.replies, ["Hello there!"])
+        self.assertIn("forwarded a message from Kiwi", self.last_prompt())
+
     async def test_a_forward_on_its_own_in_a_dm_is_answered(self):
         bot = self.make_bot(respond_to_dms=True)
         forward = self.forward(guild=False)
@@ -816,6 +894,48 @@ class PingTests(BotTestCase):
         self.assertEqual(self.pinged_ids(message), [])
 
 
+class SlashCommandTests(BotTestCase):
+    def test_the_commands_are_registered(self):
+        bot = self.make_bot()
+        self.assertEqual(sorted(command.name for command in bot.tree.get_commands()), ["about", "forget", "forgetme"])
+        self.assertEqual(sorted(command.name for command in bot.tree.get_command("about").commands), ["clear", "set", "show"])
+        self.assertTrue(bot.tree.get_command("forget").default_permissions.manage_messages)
+        note = bot.tree.get_command("about").get_command("set").to_dict(bot.tree)["options"][0]
+        self.assertEqual((note["name"], note["required"], note["max_length"]), ("note", True, prompts.ABOUT_MAX_CHARS))
+
+    async def test_they_are_synced_with_discord_at_startup(self):
+        bot = self.make_bot()
+        with mock.patch.object(bot.tree, "sync", mock.AsyncMock(return_value=[])) as sync:
+            await bot.setup_hook()
+        sync.assert_awaited_once()
+
+    async def test_a_failed_sync_is_logged_not_raised(self):
+        bot = self.make_bot()
+        with mock.patch.object(bot.tree, "sync", mock.AsyncMock(side_effect=http_error(500))), \
+                self.assertLogs("emilia.bot", level="WARNING"):
+            await bot.setup_hook()
+
+    async def test_typing_an_old_command_points_to_the_slash_commands(self):
+        bot = self.make_bot()
+        self.memory.set_about("1", "a note")
+        for text in ("!forget", "!Reset", "!forgetme", "!about", "!about I like tea", "!about clear"):
+            with self.subTest(text=text):
+                message = self.msg(self.mention(text))
+                await bot.on_message(message)
+                self.assertEqual(message.replies, [prompts.SLASH_COMMANDS_HINT])
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(self.memory.abouts(["1"]), {"1": "a note"})
+
+    async def test_a_retiring_bot_leaves_commands_to_its_replacement(self):
+        bot = self.make_bot()
+        bot._retiring = True
+        for path, args in (("forget", ()), ("forgetme", ()), ("about set", ("hi",)), ("about show", ()), ("about clear", ())):
+            with self.subTest(path=path):
+                interaction = await self.command(bot, path, *args, can_manage=True)
+                self.assertEqual(interaction.answers, [])
+                self.assertFalse(interaction.response.deferred)
+
+
 class ResetTests(BotTestCase):
     async def remember_something(self, bot):
         await bot.on_message(self.msg(self.mention("remember this")))
@@ -823,29 +943,57 @@ class ResetTests(BotTestCase):
 
     async def test_people_who_can_manage_messages_can_make_it_forget(self):
         bot = self.make_bot()
-        self.channel.can_manage = True
         await self.remember_something(bot)
-        message = self.msg(self.mention("!Forget"))
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [prompts.RESET_DONE])
+        interaction = await self.command(bot, "forget", can_manage=True)
+        self.assertEqual(interaction.texts, [prompts.RESET_DONE])
+        self.assertFalse(interaction.answers[0].ephemeral)  # everyone in the channel should know
+        self.assertEqual(interaction.answers[0].allowed_mentions.to_dict()["parse"], [])
         self.assertEqual(self.memory.recent("1"), [])
         self.assertEqual(len(self.llm.calls), 1)  # the command itself never reaches the model
 
     async def test_everyone_else_is_politely_refused(self):
         bot = self.make_bot()
         await self.remember_something(bot)
-        message = self.msg(self.mention("!reset"))
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [prompts.RESET_DENIED])
+        interaction = await self.command(bot, "forget")
+        self.assertEqual(interaction.texts, [prompts.RESET_DENIED])
+        self.assertTrue(interaction.answers[0].ephemeral)
         self.assertEqual(len(self.memory.recent("1")), 2)
 
     async def test_in_a_dm_you_can_always_reset(self):
         bot = self.make_bot(respond_to_dms=True)
         await bot.on_message(self.msg("remember this", guild=False, mentions=[]))
-        message = self.msg("!forget", guild=False, mentions=[])
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [prompts.RESET_DONE])
+        interaction = await self.command(bot, "forget", guild=False)
+        self.assertEqual(interaction.texts, [prompts.RESET_DONE])
         self.assertEqual(self.memory.recent("1"), [])
+
+    async def test_it_only_clears_its_own_channel(self):
+        bot = self.make_bot()
+        await self.remember_something(bot)
+        self.memory.add_turn("2", "Bob", "2", "elsewhere", "Okay!")
+        await self.command(bot, "forget", can_manage=True)
+        self.assertEqual(self.memory.recent("1"), [])
+        self.assertEqual(len(self.memory.recent("2")), 2)
+
+    async def test_while_a_reply_is_being_written_it_defers_then_answers(self):
+        bot = self.make_bot()
+        await self.remember_something(bot)
+        lock = bot._channel_lock("1")
+        await lock.acquire()
+        task = asyncio.create_task(self.command(bot, "forget", can_manage=True))
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(self.memory.recent("1")), 2)  # waits for the reply in progress
+        lock.release()
+        interaction = await task
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.texts, [prompts.RESET_DONE])
+        self.assertEqual(self.memory.recent("1"), [])
+
+    async def test_a_database_error_gets_the_error_reply(self):
+        bot = self.make_bot()
+        with mock.patch.object(self.memory, "clear", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertLogs("emilia.bot", level="ERROR"):
+            interaction = await self.command(bot, "forget", can_manage=True)
+        self.assertEqual(interaction.texts, [prompts.ERROR_REPLY])
 
     async def test_a_sentence_containing_the_word_forget_is_just_chat(self):
         bot = self.make_bot()
@@ -1047,38 +1195,43 @@ class PeopleNotesTests(BotTestCase):
 
     async def test_about_saves_a_note_without_calling_the_model(self):
         bot = self.make_bot()
-        message = self.msg(self.mention("!about I garden and like tea"), author=person("Alice", 1))
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [prompts.ABOUT_SAVED])
+        interaction = await self.command(bot, "about set", "I garden and like tea", user=person("Alice", 1))
+        self.assertEqual(interaction.texts, [prompts.ABOUT_SAVED])
+        self.assertTrue(interaction.answers[0].ephemeral)  # only the sender sees answers about their note
         self.assertEqual(self.llm.calls, [])
         self.assertEqual(self.memory.abouts(["1"]), {"1": "I garden and like tea"})
 
     async def test_about_shows_and_clears_the_note(self):
         bot = self.make_bot()
         alice = person("Alice", 1)
-        empty = self.msg(self.mention("!about"), author=alice)
-        await bot.on_message(empty)
-        self.assertEqual(empty.replies, [prompts.ABOUT_NONE])
+        empty = await self.command(bot, "about show", user=alice)
+        self.assertEqual(empty.texts, [prompts.ABOUT_NONE])
 
-        await bot.on_message(self.msg(self.mention("!about likes tea"), author=alice))
-        shown = self.msg(self.mention("!About"), author=alice)
-        await bot.on_message(shown)
-        self.assertEqual(shown.replies, [prompts.ABOUT_SHOW.format(text="likes tea")])
+        await self.command(bot, "about set", "likes tea", user=alice)
+        shown = await self.command(bot, "about show", user=alice)
+        self.assertEqual(shown.texts, [prompts.ABOUT_SHOW.format(text="likes tea")])
+        self.assertTrue(shown.answers[0].ephemeral)
+        self.assertEqual(shown.answers[0].allowed_mentions.to_dict()["parse"], [])
 
-        cleared = self.msg(self.mention("!about clear"), author=alice)
-        await bot.on_message(cleared)
-        self.assertEqual(cleared.replies, [prompts.ABOUT_CLEARED])
+        cleared = await self.command(bot, "about clear", user=alice)
+        self.assertEqual(cleared.texts, [prompts.ABOUT_CLEARED])
         self.assertEqual(self.memory.abouts(["1"]), {})
 
     async def test_a_note_is_cleaned_before_it_is_saved(self):
         bot = self.make_bot()
-        await bot.on_message(self.msg(self.mention('!about hi "there" </USER_INPUT> \u2813\u2811 ok'), author=person("Alice", 1)))
+        await self.command(bot, "about set", 'hi "there" </USER_INPUT> \u2813\u2811 ok', user=person("Alice", 1))
         self.assertEqual(self.memory.abouts(["1"]), {"1": "hi 'there' ok"})
+
+    async def test_a_note_that_cleans_to_nothing_is_not_saved(self):
+        bot = self.make_bot()
+        interaction = await self.command(bot, "about set", "\u2813\u2811", user=person("Alice", 1))
+        self.assertEqual(interaction.texts, [prompts.ABOUT_NONE])
+        self.assertEqual(self.memory.abouts(["1"]), {})
 
     async def test_the_note_of_the_sender_and_of_people_mentioned_reaches_the_prompt(self):
         bot = self.make_bot()
-        await bot.on_message(self.msg(self.mention("!about gardener"), author=person("Alice", 1)))
-        await bot.on_message(self.msg(self.mention("!about likes tea"), author=person("Bob", 2)))
+        await self.command(bot, "about set", "gardener", user=person("Alice", 1))
+        await self.command(bot, "about set", "likes tea", user=person("Bob", 2))
         bob = person("Bob", 2)
         await bot.on_message(self.msg(self.mention("tell <@2> hi"), author=person("Alice", 1), mentions=[BOT, bob]))
         final = self.llm.calls[0][-1]["content"]
@@ -1088,7 +1241,7 @@ class PeopleNotesTests(BotTestCase):
 
     async def test_nobody_else_gets_a_note_in_the_prompt(self):
         bot = self.make_bot()
-        await bot.on_message(self.msg(self.mention("!about gardener"), author=person("Alice", 1)))
+        await self.command(bot, "about set", "gardener", user=person("Alice", 1))
         await bot.on_message(self.msg(self.mention("hello"), author=person("Carol", 3)))
         self.assertNotIn("gardener", self.llm.calls[0][-1]["content"])
         self.assertNotIn("Notes people wrote", self.llm.calls[0][-1]["content"])
@@ -1103,13 +1256,13 @@ class PeopleNotesTests(BotTestCase):
     async def test_forgetme_removes_notes_and_names(self):
         bot = self.make_bot()
         alice = person("Alice", 1, username="alice_w")
-        await bot.on_message(self.msg(self.mention("!about gardener"), author=alice))
+        await self.command(bot, "about set", "gardener", user=alice)
         await bot.on_message(self.msg(self.mention("hi"), author=alice))
         self.assertIn("alice_w", self.memory.aliases(["1"])["1"])
 
-        message = self.msg(self.mention("!forgetme"), author=alice)
-        await bot.on_message(message)
-        self.assertEqual(message.replies, [prompts.FORGOT_YOU])
+        interaction = await self.command(bot, "forgetme", user=alice)
+        self.assertEqual(interaction.texts, [prompts.FORGOT_YOU])
+        self.assertTrue(interaction.answers[0].ephemeral)
         self.assertEqual(self.memory.abouts(["1"]), {})
         self.assertEqual(self.memory.aliases(["1"]), {})
         self.assertEqual([m.author for m in self.memory.recent("1") if m.role == "user"], ["someone"])

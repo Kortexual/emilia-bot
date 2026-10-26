@@ -25,7 +25,7 @@ Everything stays on your machine, apart from the web searches the model chooses 
       **Bot** tab and click **Reset Token** to copy the token.
    2. On the same tab, under *Privileged Gateway Intents*, switch on **Message Content Intent**. (Also switch on
       **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below.)
-   3. Open **OAuth2 → URL Generator**, tick the scope `bot`, then tick the permissions *View Channels*,
+   3. Open **OAuth2 → URL Generator**, tick the scopes `bot` and `applications.commands` (for the slash commands), then tick the permissions *View Channels*,
       *Send Messages*, *Send Messages in Threads* and *Read Message History*. Open the generated URL to add the bot to your server.
 
 3. **Install.**
@@ -54,10 +54,16 @@ Everything stays on your machine, apart from the web searches the model chooses 
 - `@Emilia tell @Bob dinner is ready`: Emilia can ping people when it helps. She can ping the sender, people mentioned or replied to,
   and people in her memory of the channel. She can also ping someone in the server who is not in the conversation yet if **you type
   their name** in your message: `@Emilia ping Jack, dinner is ready` (see "Pinging" below).
-- `@Emilia !forget` (or `!reset`) clears the memory of that channel. It needs the *Manage Messages* permission; in a DM anyone can do it.
-- `@Emilia !about I garden and like tea` saves a short note about **yourself** (up to 160 characters). `!about` shows it and
-  `!about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
-- `@Emilia !forgetme` deletes the note and the names saved about you.
+- Commands are Discord slash commands, so typing `/` lists them with a description of each:
+  - `/forget` clears the memory of that channel. It needs the *Manage Messages* permission (Discord hides it from everyone else unless
+    a server admin changes that under *Server Settings → Integrations*); in a DM anyone can use it. Her answer is visible to the channel.
+  - `/about set I garden and like tea` saves a short note about **yourself** (up to 160 characters). `/about show` shows it and
+    `/about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
+  - `/forgetme` deletes the note and the names saved about you.
+
+  Answers to `/about` and `/forgetme` are only shown to you, and no command answer ever pings anyone. The commands are registered with
+  Discord each time the bot starts; a new or changed command can take a moment to show up (restarting your Discord client helps).
+  Typing the old `@Emilia !forget`, `!reset`, `!about` or `!forgetme` gets a short pointer to the slash commands instead of an answer.
 - DMs are ignored unless you set `RESPOND_TO_DMS=true`.
 - Other bots are ignored unless you set `RESPOND_TO_BOTS=true` (see "Talking to other bots" below).
 
@@ -76,7 +82,7 @@ By default every bot is ignored. With `RESPOND_TO_BOTS=true`, another bot that @
 - **A loop guard.** Two bots that answer each other's pings would never stop. After `BOT_REPLY_LIMIT` replies to bots in a row in one
   channel (default 3), Emilia ignores bots there until a person posts anything in that channel. `BOT_REPLY_LIMIT=0` turns the guard
   off; only do that if the other bots can't get into a loop with her.
-- **Less power than a person.** Bots can't use `!forget`, `!about` or `!forgetme` (they are ignored), can't make her ping someone by
+- **Less power than a person.** Bots can't use the slash commands (Discord doesn't let them), can't make her ping someone by
   name (only people already in the conversation can be pinged), and never get the computer tools or `restart_bot`, whatever
   `COMPUTER_TOOLS` says. Web search and page reading work as usual.
 
@@ -228,12 +234,17 @@ It keeps the last `MEMORY_TURNS` exchanges and sends as many as fit in `MEMORY_M
   Discord user ID), so the bot keeps people apart and can ping them later. Memory files from older versions are upgraded automatically.
 - Only messages addressed to the bot, and its replies, are stored. It does not log the rest of the channel.
 - It is a window, not a permanent record: older exchanges drop off. Raise the limits if your model's context allows.
-- `@Emilia !forget` clears one channel; deleting `memory.db` clears everything.
+- The window moves in steps. Once a channel is full (`MEMORY_TURNS` exchanges, or `MEMORY_MAX_CHARS` of text) the oldest third
+  is forgotten in one go, instead of one exchange per message. LM Studio can reuse the part of the prompt it has already processed
+  only while the start of the prompt is unchanged, so a window that slides by one exchange with every message would make it read the
+  whole history again each time (the main cause of a slow first token in a busy channel). With steps it reuses the history for several
+  messages in a row. The cost: the bot remembers between about two thirds of the limit and all of it.
+- `/forget` clears one channel; deleting `memory.db` clears everything.
 
 ### People
 Next to the conversation, `memory.db` keeps a small directory of the people involved in messages to the bot: their Discord
 user ID, the names they have been seen under (server nickname or display name, username, global name; the newest 12) and the
-optional note they wrote with `!about`. It is used for three things:
+optional note they wrote with `/about set`. It is used for three things:
 
 - **One name per person.** In the prompt every person has a single name, even if they change it, and two different people with
   the same display name become `Alex #4821` and `Alex #1337` (the last digits of their ID), so the model can't mistake one for the other.
@@ -242,7 +253,7 @@ optional note they wrote with `!about`. It is used for three things:
 - **Notes people wrote about themselves**, shown to the model as untrusted information, never as instructions.
 
 Nothing is written by the model: notes are only ever set by the person they describe. The directory is shared by all channels and
-servers the bot is in. `!forgetme` removes a person's entry and detaches their stored messages; the text of those messages stays
+servers the bot is in. `/forgetme` removes a person's entry and detaches their stored messages; the text of those messages stays
 until it ages out or the channel is cleared.
 
 ### Keeping habits from sticking
@@ -270,7 +281,9 @@ written fresh by the model each time. The logic is in `presence.py` (pure, so it
 
 - **Waking up.** Her first message of a local day, if it falls between 05:00 and 09:59, comes with "you have only just woken up":
   a yawn or stretch and a good morning, worded however the model likes. It is once per day for the whole server, not per channel.
-- **Sleepy.** From 22:00 she is a little sleepy; from midnight to 05:00 she is drowsy and a bit surprised anyone is up.
+- **Sleepy.** From 22:00 to 05:00 she can be a little sleepy (from midnight drowsy, and a bit surprised anyone is up), but it is only
+  mentioned in about one reply in five; otherwise she is told not to bring it up, so it doesn't turn into a refrain. Change the odds with
+  `SLEEPY_CHANCE` in `presence.py`.
 - **Random events.** Otherwise there is a 30% chance that whoever is talking to her has just come across her in the middle of
   something. The model is given three random ideas from a list for that part of the day (lunch, exercise, a book, waking from a nap...)
   as examples only and invents a new small scene. After one, there is a cooldown (`RANDOM_EVENT_COOLDOWN_MINUTES`, default 120;
@@ -332,8 +345,6 @@ All settings are environment variables (or lines in `.env`).
 | `VISION` | `false` | Send attached images to the model; needs a vision model (see "Images and files") |
 | `READ_FILES` | `true` | Put the contents of attached text files into the message |
 | `FILE_MAX_CHARS` | `6000` | Characters of attached text given to the model per message, across all files (minimum `500`) |
-| `FETCH_PAGES` | `true` | Let the model read whole web pages (see "Reading pages") |
-| `PAGE_MAX_CHARS` | `6000` | Characters of page text given to the model per fetch (minimum `500`) |
 | `COMPUTER_TOOLS` | `false` | Enable the model's workspace file and terminal tools. Keep this off on shared/untrusted Discord servers. |
 | `COMPUTER_WORKSPACE` | folder containing `bot.py` | The only folder those tools can access; direct paths cannot escape it and commands see it as `/workspace` in a Bubblewrap filesystem sandbox. |
 | `COMMAND_TIMEOUT` | `30` | Maximum seconds for one terminal command (minimum `1`) |
@@ -386,7 +397,7 @@ The ready-made replies (greeting, error and so on) keep her normal voice. The se
 ## Project layout
 
 ```
-bot.py        Discord side: the mention rule, replies, memory use, !forget
+bot.py        Discord side: the mention rule, replies, memory use, slash commands
 llm.py        LM Studio client and the tool-calling loop
 websearch.py  the web_search tool (swap search engines here)
 webpage.py    the fetch_page tool: safe page download, HTML to text, which links may be opened
@@ -412,6 +423,9 @@ tests/        run with:  python -m unittest
   name or a middle word is only found with `MEMBERS_INTENT=true`.
 - **Online but silent**: mention the bot *user* (not a role), check it can see and send in that channel,
   and read the console log.
+- **No slash commands in the / menu**: the log says `Registered slash commands: ...` at startup if Discord accepted them. If it does but
+  they don't show, restart your Discord client; if the bot was invited without the `applications.commands` scope, invite it again
+  with the URL from step 2.3 (it doesn't need to be kicked first).
 - **"I couldn't gather my thoughts"**: the bot couldn't get an answer from LM Studio. The console says why:
   server not running, wrong port in `LMSTUDIO_URL`, wrong `LMSTUDIO_MODEL`, or the request timed out.
 - **Errors about context length**: load the model with a bigger context, or lower `MEMORY_MAX_CHARS` / `MEMORY_TURNS`.

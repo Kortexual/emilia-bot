@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
 
 -- Who people are: one row per Discord user ID, the names they have been seen under, and an optional
--- note they wrote about themselves with "!about".
+-- note they wrote about themselves with "/about set".
 CREATE TABLE IF NOT EXISTS users (
     user_id    TEXT PRIMARY KEY,
     about      TEXT NOT NULL DEFAULT '',
@@ -93,15 +93,25 @@ class Presence:
 
 
 class MemoryStore:
-    """Thread-safe: methods are blocking but fast, so the bot calls them via asyncio.to_thread."""
+    """Thread-safe: methods are blocking but fast, so the bot calls them via asyncio.to_thread.
 
-    def __init__(self, path: str = "memory.db", max_turns: int = 10) -> None:
+    A channel keeps at most `max_turns` exchanges (and, if `max_chars` is given, that much text). By default
+    the oldest exchange is forgotten as each new one arrives, so the start of the remembered conversation
+    moves with every message. With `trim_chunk` the store forgets `trim_chunk` exchanges more than it has to
+    each time it is full, so the start stays put for several messages in a row. That matters for speed: the
+    model server can only reuse its processed prompt while the start of the prompt is unchanged.
+    """
+
+    def __init__(self, path: str = "memory.db", max_turns: int = 10, *, max_chars: int | None = None, trim_chunk: int = 0) -> None:
         self._max_messages = max(1, max_turns) * 2  # a turn is a user message plus the reply
+        self._max_chars = max_chars
+        self._trim_chunk = max(0, trim_chunk)
         self._lock = threading.Lock()
         if path != ":memory:":
             Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")  # in WAL mode: no disk flush on every commit, and still safe if the bot crashes
         with self._db:
             self._db.executescript(_SCHEMA)
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
@@ -141,7 +151,7 @@ class MemoryStore:
         return messages
 
     def add_turn(self, channel_id: str, author: str, author_id: str, user_text: str, reply_text: str) -> None:
-        """Store one exchange atomically and trim the channel to the newest `max_turns`."""
+        """Store one exchange atomically, then forget the channel's oldest exchanges if it holds too many."""
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO messages (channel_id, role, author, author_id, content) VALUES (?, 'user', ?, ?, ?)",
@@ -151,11 +161,27 @@ class MemoryStore:
                 "INSERT INTO messages (channel_id, role, author, content) VALUES (?, 'assistant', NULL, ?)",
                 (channel_id, reply_text),
             )
-            self._db.execute(
-                "DELETE FROM messages WHERE channel_id = ? AND id NOT IN ("
-                "  SELECT id FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?)",
-                (channel_id, channel_id, self._max_messages),
-            )
+            self._trim(channel_id)
+
+    def _trim(self, channel_id: str) -> None:
+        """Forget the oldest exchanges of a channel once it holds more than `max_turns` (or `max_chars`).
+        It is then cut back by `trim_chunk` exchanges more than needed. Call it inside the write transaction."""
+        rows = self._db.execute(
+            "SELECT id, LENGTH(content) FROM messages WHERE channel_id = ? ORDER BY id DESC", (channel_id,)
+        ).fetchall()  # newest first
+        if len(rows) <= self._max_messages and (self._max_chars is None or sum(size for _, size in rows) <= self._max_chars):
+            return
+        target = max(2, self._max_messages - 2 * self._trim_chunk)
+        allowed = None if self._max_chars is None else self._max_chars * target // self._max_messages
+        keep = chars = 0
+        for _, size in rows:
+            if keep >= target or (allowed is not None and keep >= 2 and chars + size > allowed):
+                break
+            keep += 1
+            chars += size
+        keep = max(2, keep - keep % 2)  # whole exchanges: the oldest message kept is a user message
+        if keep < len(rows):
+            self._db.execute("DELETE FROM messages WHERE channel_id = ? AND id < ?", (channel_id, rows[keep - 1][0]))
 
     def last_replies(self, channel_id: str, count: int) -> list[str]:
         """The bot's own last `count` replies in a channel, oldest first."""

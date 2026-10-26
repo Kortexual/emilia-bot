@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -47,6 +48,19 @@ class WorkspaceToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Exit code: 0", result.text)
         self.assertIn("/workspace", result.text)
         self.assertIn("hello", result.text)
+
+    async def test_a_timeout_stops_what_the_command_started_too(self):
+        started = time.monotonic()
+        result = await self.tools.run_command({"command": "sleep 30 & sleep 30"})  # the first sleep keeps the output open
+        self.assertIn("timed out", result.text)
+        self.assertLess(time.monotonic() - started, 10)
+
+    async def test_editing_a_file_that_is_not_utf8_leaves_it_untouched(self):
+        original = "caf\xe9 au lait".encode("latin-1")
+        (self.root / "latin.txt").write_bytes(original)
+        result = await self.tools.edit_file({"path": "latin.txt", "old": "au", "new": "with"})
+        self.assertIn("Error", result.text)
+        self.assertEqual((self.root / "latin.txt").read_bytes(), original)
 
     async def test_default_requires_explicit_confirmation_for_mutations(self):
         tools = WorkspaceTools(self.root)

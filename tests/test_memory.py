@@ -207,6 +207,27 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.recent("c1"), [])
         self.assertEqual(len(self.store.recent("c2")), 2)
 
+    def test_trimming_in_chunks_keeps_the_start_of_the_history_steady(self):
+        store = MemoryStore(":memory:", max_turns=6, trim_chunk=2)
+        self.addCleanup(store.close)
+        starts = []
+        for i in range(14):
+            store.add_turn("c1", "A", "1", f"q{i}", f"a{i}")
+            history = store.recent("c1")
+            self.assertEqual(history[0].role, "user")
+            self.assertLessEqual(len(history), 12)  # never more than max_turns exchanges
+            starts.append(history[0].content)
+        self.assertEqual(list(dict.fromkeys(starts)), ["q0", "q3", "q6", "q9"])  # it moves every few messages, not every message
+
+    def test_a_character_limit_forgets_whole_old_exchanges(self):
+        store = MemoryStore(":memory:", max_turns=10, max_chars=100)
+        self.addCleanup(store.close)
+        for i in range(3):
+            store.add_turn("c1", "A", "1", f"u{i}" * 10, f"a{i}" * 10)  # 40 characters per exchange
+        self.assertEqual([m.content[:2] for m in store.recent("c1")], ["u1", "a1", "u2", "a2"])
+        store.add_turn("c2", "A", "1", "u" * 500, "a" * 500)  # one exchange is never forgotten just for being long
+        self.assertEqual(len(store._db.execute("SELECT id FROM messages WHERE channel_id = 'c2'").fetchall()), 2)
+
     def test_memory_survives_a_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "nested", "memory.db")  # missing folder is created
