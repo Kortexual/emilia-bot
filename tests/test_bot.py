@@ -53,6 +53,7 @@ class FakeLLM:
         self.calls = []  # the message list of every chat() call
         self.excludes = []  # the tools left out of every chat() call
         self.tools_offered = []  # the `tools` argument of every chat() call
+        self.multi_turns = []  # the `multi_turn` argument of every chat() call
 
     async def start(self):
         pass
@@ -60,10 +61,11 @@ class FakeLLM:
     async def close(self):
         pass
 
-    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True, multi_turn=None):
         self.calls.append(messages)
         self.excludes.append(set(exclude))
         self.tools_offered.append(tools)
+        self.multi_turns.append(multi_turn)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error:
@@ -79,9 +81,11 @@ class WorkingLLM(FakeLLM):
         super().__init__(text=final, sources=sources)
         self.events = list(events)
 
-    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=()):
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True, multi_turn=None):
         self.calls.append(messages)
         self.excludes.append(set(exclude))
+        self.tools_offered.append(tools)
+        self.multi_turns.append(multi_turn)
         for event in self.events:
             if isinstance(event, ToolUse):
                 await on_tool(event)
@@ -1802,10 +1806,62 @@ class RandomMessageTests(DayTestCase):
         mentions = self.channel.allowed_mentions[0]
         self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
         self.assertEqual(self.llm.tools_offered, [False])  # no search, page reading, commands or restarts on her own
+        self.assertEqual(self.llm.multi_turns, [False])
         note = self.llm.calls[0][-1]["content"]
         self.assertTrue(note.startswith("(Note from the system"))
         self.assertIn("nobody has spoken to you", note)
         self.assertNotIn("USER_INPUT", note)
+        self.assertNotIn("tools", note)
+
+    async def test_with_random_message_tools_she_may_use_tools_but_never_operator_ones(self):
+        llm = WorkingLLM(
+            ["Let me look that up @Alice", use("🔎 Searching `tea`", ["https://example.com/tea"])],
+            final="Oh, oolong is lovely \U0001F338",
+        )
+        bot = self.random_bot(llm=llm, random_message_tools=True, show_sources=True, computer_tools=True)
+        await bot._check_presence()
+        self.assertEqual(self.llm.tools_offered, [True])
+        self.assertEqual(self.llm.excludes, [set(OPERATOR_TOOLS)])
+        self.assertEqual(self.llm.multi_turns, [False])
+        self.assertIn("tools offered to you now", self.llm.calls[0][-1]["content"])
+        self.assertNotIn("stop_talking", self.llm.calls[0][-1]["content"])
+        self.assertEqual(self.channel.sent[0], "Let me look that up @Alice")
+        self.assertTrue(self.channel.sent[1].startswith("-# 🔎 Searching `tea`"))
+        self.assertIn("example.com", self.channel.timeline[1])  # its links were edited in
+        self.assertEqual(self.channel.sent[2], "Oh, oolong is lovely \U0001F338")
+        for mentions in self.channel.allowed_mentions:  # still no pings of any kind
+            self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
+        history = self.memory.recent(str(self.CHANNEL_ID))
+        self.assertEqual(history[-1].content, "Let me look that up @Alice\n\nOh, oolong is lovely \U0001F338")
+        self.assertEqual(self.memory.presence(str(self.CHANNEL_ID)).sent_here, self.clock.timestamp())
+
+    async def test_random_message_multi_turn_keeps_her_going_after_a_tool(self):
+        bot = self.random_bot(random_message_tools=True, random_message_multi_turn=True)
+        await bot._check_presence()
+        self.assertEqual((self.llm.tools_offered, self.llm.multi_turns), ([True], [True]))
+        self.assertIn("stop_talking", self.llm.calls[0][-1]["content"])
+
+    async def test_the_emoji_cooldown_covers_every_message_of_one_go(self):
+        llm = WorkingLLM(["First \U0001F338"], final="Second \U0001F338")
+        bot = self.random_bot(llm=llm, random_message_tools=True)
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, ["First \U0001F338", "Second"])
+
+    async def test_only_tool_lines_still_count_as_speaking_up(self):
+        bot = self.random_bot(llm=WorkingLLM([use("🔎 Searching `tea`")], final=""), random_message_tools=True)
+        await bot._check_presence()
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.memory.recent(str(self.CHANNEL_ID)), [])  # nothing she said to remember
+        self.assertEqual(self.memory.presence(str(self.CHANNEL_ID)).sent_here, self.clock.timestamp())
+
+    async def test_short_waits_work(self):
+        settings = dict(random_message_min_minutes=5, random_message_full_hours=0.25)
+        bot = self.random_bot(silence_hours=4 / 60, **settings)
+        await bot._check_presence()
+        self.assertEqual(self.channel.sent, [])  # 4 minutes: too soon
+        bot = self.random_bot(silence_hours=6 / 60, **settings)
+        await bot._check_presence()
+        self.assertEqual(len(self.channel.sent), 1)
 
     async def test_she_stays_quiet_outside_her_active_hours(self):
         bot = self.random_bot(hour=23)

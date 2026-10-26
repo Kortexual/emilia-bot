@@ -24,8 +24,8 @@ from datetime import datetime, time, timedelta, timezone
 import prompts
 import presence
 from presence import (
-    MAX_CHANCE,
     Scene,
+    check_seconds,
     clock_text,
     is_active,
     local_now,
@@ -135,6 +135,21 @@ class ClockTextTests(unittest.TestCase):
 class SendChanceTests(unittest.TestCase):
     MIN, FULL = 3600, 8 * 3600
 
+    @staticmethod
+    def gaps(min_seconds, full_seconds, runs=300, seed=3):
+        """How long she stays quiet, in seconds, over many simulated silences checked as the bot checks them."""
+        rng = random.Random(seed)
+        interval = check_seconds(full_seconds)
+        gaps = []
+        for _ in range(runs):
+            elapsed = 0.0
+            while True:
+                elapsed += interval
+                if rng.random() < send_chance(elapsed, min_seconds, full_seconds, interval):
+                    break
+            gaps.append(elapsed)
+        return sorted(gaps)
+
     def test_she_never_speaks_up_before_the_minimum_wait(self):
         self.assertEqual(send_chance(0, self.MIN, self.FULL), 0.0)
         self.assertEqual(send_chance(self.MIN - 1, self.MIN, self.FULL), 0.0)
@@ -146,23 +161,34 @@ class SendChanceTests(unittest.TestCase):
         self.assertEqual(chances[0], 0.0)
         self.assertLess(chances[1], chances[-1] / 4)  # low at first, then it climbs
 
-    def test_it_is_capped(self):
-        self.assertEqual(send_chance(self.FULL, self.MIN, self.FULL), MAX_CHANCE)
-        self.assertEqual(send_chance(100 * 3600, self.MIN, self.FULL), MAX_CHANCE)
-        self.assertEqual(send_chance(10, 0, 0), MAX_CHANCE)  # a degenerate range does not divide by zero
+    def test_it_levels_off_at_the_full_wait(self):
+        self.assertEqual(send_chance(self.FULL, self.MIN, self.FULL), send_chance(100 * 3600, self.MIN, self.FULL))
+        self.assertTrue(0.2 < send_chance(self.FULL, self.MIN, self.FULL) < 0.3)  # about one check in four at the defaults
+        self.assertTrue(0 < send_chance(10, 0, 0) <= 1)  # a degenerate range does not divide by zero
+
+    def test_the_chance_per_check_follows_how_often_she_checks(self):
+        elapsed = 5 * 3600
+        often, rarely = send_chance(elapsed, self.MIN, self.FULL, 60), send_chance(elapsed, self.MIN, self.FULL, 300)
+        self.assertLess(often, rarely)
+        self.assertAlmostEqual(1 - (1 - often) ** 5, rarely)  # five short checks add up to one long one
+
+    def test_checks_scale_with_the_wait(self):
+        self.assertEqual(check_seconds(8 * 3600), presence.CHECK_SECONDS)  # the defaults: every 5 minutes
+        self.assertEqual(check_seconds(48 * 3600), presence.CHECK_SECONDS)  # never rarer
+        self.assertEqual(check_seconds(30 * 60), 30 * 60 / presence.CHECKS_PER_WAIT)
+        self.assertEqual(check_seconds(60), presence.MIN_CHECK_SECONDS)  # never more often
 
     def test_over_a_long_silence_she_does_speak_eventually(self):
-        rng = random.Random(3)
-        gaps = []
-        for _ in range(300):
-            elapsed = 0
-            while rng.random() >= send_chance(elapsed, self.MIN, self.FULL):
-                elapsed += presence.CHECK_SECONDS
-            gaps.append(elapsed / 3600)
-        gaps.sort()
+        gaps = [gap / 3600 for gap in self.gaps(self.MIN, self.FULL)]
         self.assertGreaterEqual(gaps[0], 1)  # never before the minimum
         self.assertLess(gaps[-1], 12)  # and never a very long silence either
-        self.assertTrue(2 < gaps[len(gaps) // 2] < 6, gaps[len(gaps) // 2])
+        self.assertTrue(3 < gaps[len(gaps) // 2] < 5, gaps[len(gaps) // 2])
+
+    def test_short_waits_have_the_same_shape(self):
+        gaps = [gap / 60 for gap in self.gaps(5 * 60, 15 * 60)]  # every 5 to 15 minutes
+        self.assertGreaterEqual(gaps[0], 5)
+        self.assertLess(gaps[-1], 20)
+        self.assertTrue(8 < gaps[len(gaps) // 2] < 11, gaps[len(gaps) // 2])  # like 4 hours out of 1 to 8
 
 
 class SceneTests(unittest.TestCase):

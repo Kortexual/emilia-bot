@@ -86,6 +86,7 @@ class ChatBackend(Protocol):
         *,
         exclude: Collection[str] = (),
         tools: bool = True,
+        multi_turn: bool | None = None,
     ) -> ChatResult: ...
 
 
@@ -568,22 +569,12 @@ class EmiliaBot(discord.Client):
                     elif reply:
                         await post(reply)
 
-                tool_messages: dict[int, discord.Message] = {}  # by id() of the ToolUse
+                show_tool, on_tool_done = self._tool_lines(message.channel)
 
                 async def on_tool(use: ToolUse) -> None:
                     nonlocal posted
                     posted = True
-                    sent = await message.channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
-                    tool_messages[id(use)] = sent
-
-                async def on_tool_done(use: ToolUse) -> None:
-                    sent = tool_messages.pop(id(use), None)
-                    if sent is None or not (self.settings.show_sources and source_links(use.sources)):
-                        return
-                    try:
-                        await sent.edit(content=tool_line(use, show_sources=True), allowed_mentions=discord.AllowedMentions.none())
-                    except discord.HTTPException as exc:
-                        log.info("Could not add links to a tool message (%s)", exc)
+                    await show_tool(use)
 
                 exclude = OPERATOR_TOOLS if from_bot else ()
                 try:
@@ -617,6 +608,25 @@ class EmiliaBot(discord.Client):
                     except sqlite3.Error:
                         log.exception("Could not save this exchange to memory")
                     await self._record_spoke(key, bool(scene and scene.kind))
+
+    def _tool_lines(self, channel: Any) -> tuple[ToolHandler, ToolHandler]:
+        """Handlers that post a line in `channel` for each tool the model uses (never pinging anyone), then
+        edit its links in once it has run (with SHOW_SOURCES)."""
+        tool_messages: dict[int, discord.Message] = {}  # by id() of the ToolUse
+
+        async def on_tool(use: ToolUse) -> None:
+            tool_messages[id(use)] = await channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
+
+        async def on_tool_done(use: ToolUse) -> None:
+            sent = tool_messages.pop(id(use), None)
+            if sent is None or not (self.settings.show_sources and source_links(use.sources)):
+                return
+            try:
+                await sent.edit(content=tool_line(use, show_sources=True), allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as exc:
+                log.info("Could not add links to a tool message (%s)", exc)
+
+        return on_tool, on_tool_done
 
     # --- her day: time awareness and speaking up unprompted ---------------------------
     def _system_prompt(self, *, from_bot: bool = False) -> str:
@@ -661,14 +671,17 @@ class EmiliaBot(discord.Client):
 
     async def _presence_loop(self) -> None:
         await self.wait_until_ready()
+        interval = presence.check_seconds(self.settings.random_message_full_hours * 3600)
         log.info(
-            "She may speak up on her own in %d channel(s), between %s and %s",
+            "She may speak up on her own in %d channel(s), between %s and %s (checking every %g seconds%s)",
             len(self.settings.random_message_channels),
             self.settings.active_start.strftime("%H:%M"),
             self.settings.active_end.strftime("%H:%M"),
+            interval,
+            ", with tools" if self.settings.random_message_tools else "",
         )
         while not self._retiring:
-            await asyncio.sleep(presence.CHECK_SECONDS)
+            await asyncio.sleep(interval)
             try:
                 await self._check_presence()
             except Exception:  # one bad check must not end the loop
@@ -702,13 +715,15 @@ class EmiliaBot(discord.Client):
             now.timestamp() - waited_since,
             self.settings.random_message_min_minutes * 60,
             self.settings.random_message_full_hours * 3600,
+            presence.check_seconds(self.settings.random_message_full_hours * 3600),
         )
         if chance > 0 and self._rng.random() < chance:
             await self._speak_up(channel, key)
 
     async def _speak_up(self, channel: Any, key: str) -> None:
-        """Say something nobody asked for. It never pings anyone and the model gets no tools: there is nobody
-        to ask for a search or a command, and nobody who has confirmed anything."""
+        """Say something nobody asked for. It never pings anyone. The model gets no tools unless
+        RANDOM_MESSAGE_TOOLS is on, and never the operator tools (computer tools, restart): there is nobody
+        to ask for a command, and nobody who has confirmed anything."""
         async with channel.typing():
             async with self._channel_lock(key):
                 history = await asyncio.to_thread(self.memory.recent, key, self.settings.memory_max_chars)
@@ -718,39 +733,66 @@ class EmiliaBot(discord.Client):
                     shown = styleguard.drop_stale_directives(shown)
                 shown = [replace(m, author=labels.get(m.author_id, m.author)) if m.role == "user" else m for m in shown]
                 scene = await self._scene(key, spontaneous=True)
-                messages = prompts.build_unprompted_messages(self._system_prompt(), shown, prompts.unprompted_note(scene))
-                try:
-                    result = await self.llm.chat(messages, tools=False)
-                except LLMError as exc:
-                    log.error("LM Studio request failed (message of her own): %s", exc)
-                    return
+                use_tools = self.settings.random_message_tools
+                multi_turn = use_tools and self.settings.random_message_multi_turn
+                note = prompts.unprompted_note(scene, tools=use_tools, multi_turn=multi_turn)
+                messages = prompts.build_unprompted_messages(self._system_prompt(), shown, note)
+                browser.SESSION_KEY.set(key)  # if she browses, it is in this channel's browser context
 
-                text = clean_reply(result.text, self._speaker_names())
-                if not text:
-                    log.info("The model had nothing to say on its own")
-                    return
-                if prompts.LEAK_DETECTOR.leaks(text):
-                    log.warning("Blocked a message of her own that repeated the system prompt")
-                    return
-                if contains_cipher_script(text):
-                    log.warning("Dropped a message of her own written in braille/cipher script")
-                    return
+                recent: list[str] = []
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
-                    text = styleguard.cool_down(text, recent)
-                try:
+                kept: list[str] = []  # what was posted: remembered as one message
+                show_tool, on_tool_done = self._tool_lines(channel)
+                tools_shown = False
+
+                async def post(draft: str) -> None:
+                    text = clean_reply(draft, self._speaker_names())
+                    if not text:
+                        return
+                    if prompts.LEAK_DETECTOR.leaks(text):
+                        log.warning("Blocked a message of her own that repeated the system prompt")
+                        return
+                    if contains_cipher_script(text):
+                        log.warning("Dropped a message of her own written in braille/cipher script")
+                        return
+                    if self.settings.style_cooldown:
+                        text = styleguard.cool_down(text, [*recent, *kept])
                     for chunk in split_message(text, CHUNK_SIZE):
                         await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+                    kept.append(text)
+
+                async def on_tool(use: ToolUse) -> None:
+                    nonlocal tools_shown
+                    tools_shown = True
+                    await show_tool(use)
+
+                try:
+                    result = await self.llm.chat(
+                        messages,
+                        post,
+                        on_tool,
+                        on_tool_done,
+                        exclude=OPERATOR_TOOLS,
+                        tools=use_tools,
+                        multi_turn=multi_turn,
+                    )
+                    await post(result.text)
+                except LLMError as exc:
+                    log.error("LM Studio request failed (message of her own): %s", exc)
                 except discord.Forbidden:
                     log.warning("Missing permission to speak in channel %s", key)
-                    return
                 except discord.HTTPException as exc:
                     log.warning("Could not post in channel %s (%s)", key, exc)
+
+                if kept:
+                    try:  # remembered as an exchange with a placeholder where the question would be
+                        await asyncio.to_thread(self.memory.add_turn, key, "", "", prompts.UNPROMPTED_MARKER, "\n\n".join(kept))
+                    except sqlite3.Error:
+                        log.exception("Could not save a message of her own to memory")
+                elif not tools_shown:
+                    log.info("The model had nothing to say on its own")
                     return
-                try:  # remembered as an exchange with a placeholder where the question would be
-                    await asyncio.to_thread(self.memory.add_turn, key, "", "", prompts.UNPROMPTED_MARKER, text)
-                except sqlite3.Error:
-                    log.exception("Could not save a message of her own to memory")
                 await self._record_spoke(key, True)
 
     async def _reset(self, message: discord.Message, key: str) -> None:

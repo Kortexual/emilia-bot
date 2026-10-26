@@ -371,14 +371,26 @@ def time_note(scene: Scene) -> str:
     return f"(Scene note from the system: {_scene_clause(scene, unprompted=False)})"
 
 
-def unprompted_note(scene: Scene) -> str:
-    """The last message of the prompt when she speaks up on her own: there is nobody to answer."""
+def unprompted_note(scene: Scene, *, tools: bool = False, multi_turn: bool = False) -> str:
+    """The last message of the prompt when she speaks up on her own: there is nobody to answer. `tools`
+    and `multi_turn` say whether she has tools this time (RANDOM_MESSAGE_TOOLS / RANDOM_MESSAGE_MULTI_TURN)."""
+    tool_clause = ""
+    if tools:
+        tool_clause = (
+            " If what you are up to calls for it, you may use the tools offered to you now (looking something "
+            "up, for example), but only for yourself: nobody asked, so never confirm an action on anyone's behalf."
+        )
+        if multi_turn:
+            tool_clause += (
+                " After a tool you get another turn, so you can follow it up; each message you write is posted "
+                "straight away. Call stop_talking once you have said what you wanted to."
+            )
     return (
         "(Note from the system, not from anyone in the chat: nobody has spoken to you. You feel like saying "
         f"something in the channel on your own. {_scene_clause(scene, unprompted=True)} Write one short message "
         "in your own voice, a sentence or two, as if it just crossed your mind. It doesn't have to be a "
-        "question. Don't address a particular person unless the recent conversation makes that natural, "
-        "don't ping anyone, and never mention this note.)"
+        f"question.{tool_clause} Don't address a particular person unless the recent conversation makes that "
+        "natural, don't ping anyone, and never mention this note.)"
     )
 
 

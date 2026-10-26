@@ -154,8 +154,10 @@ class Settings:
     random_message_channels: tuple[int, ...] = ()
     active_start: clock_time = clock_time(8, 0)  # she only speaks up unprompted between these two times
     active_end: clock_time = clock_time(22, 0)
-    random_message_min_minutes: int = 60  # never speaks up sooner than this after her last message
+    random_message_min_minutes: float = 60.0  # never speaks up sooner than this after her last message
     random_message_full_hours: float = 8.0  # the wait after which speaking up is as likely as it gets
+    random_message_tools: bool = False  # opt-in: messages she starts herself may use tools (never computer tools or restart)
+    random_message_multi_turn: bool = False  # ...and keep taking turns after a tool call, like MULTI_TURN_TOOLS
 
     # Memory
     memory_db: str = str(BASE_DIR / "memory.db")
@@ -196,12 +198,16 @@ class Settings:
         active_end = _clock("ACTIVE_END", cls.active_end)
         if active_start == active_end:
             raise ConfigError("ACTIVE_START and ACTIVE_END must be different times")
-        min_minutes = _number("RANDOM_MESSAGE_MIN_MINUTES", cls.random_message_min_minutes, int, minimum=0)
-        full_hours = _number("RANDOM_MESSAGE_FULL_HOURS", cls.random_message_full_hours, float, minimum=0.1)
+        min_minutes = _number("RANDOM_MESSAGE_MIN_MINUTES", cls.random_message_min_minutes, float, minimum=0)
+        full_hours = _number("RANDOM_MESSAGE_FULL_HOURS", cls.random_message_full_hours, float, minimum=0.01)
         if full_hours * 60 <= min_minutes:
             raise ConfigError(
-                f"RANDOM_MESSAGE_FULL_HOURS ({full_hours:g} hours) must be longer than RANDOM_MESSAGE_MIN_MINUTES ({min_minutes} minutes)"
+                f"RANDOM_MESSAGE_FULL_HOURS ({full_hours:g} hours) must be longer than RANDOM_MESSAGE_MIN_MINUTES ({min_minutes:g} minutes)"
             )
+        random_tools = _flag("RANDOM_MESSAGE_TOOLS", cls.random_message_tools)
+        random_multi_turn = _flag("RANDOM_MESSAGE_MULTI_TURN", cls.random_message_multi_turn)
+        if random_multi_turn and not random_tools:
+            raise ConfigError("RANDOM_MESSAGE_MULTI_TURN needs RANDOM_MESSAGE_TOOLS: she only keeps going after using a tool")
         random_messages = _flag("RANDOM_MESSAGES", cls.random_messages)
         channels = _channel_ids("RANDOM_MESSAGE_CHANNELS")
         if random_messages and not channels:
@@ -247,6 +253,8 @@ class Settings:
             active_end=active_end,
             random_message_min_minutes=min_minutes,
             random_message_full_hours=full_hours,
+            random_message_tools=random_tools,
+            random_message_multi_turn=random_multi_turn,
             memory_db=_text("MEMORY_DB") or cls.memory_db,
             memory_turns=_number("MEMORY_TURNS", cls.memory_turns, int, minimum=1),
             memory_max_chars=_number("MEMORY_MAX_CHARS", cls.memory_max_chars, int, minimum=200),
