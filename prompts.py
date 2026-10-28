@@ -105,9 +105,8 @@ def reminder_for(author: str, others: Sequence[str] = (), yandere: bool = False)
     return f"{note})\n{extra}{REMINDER}"
 
 
-# Optional character mode (YANDERE_MODE in .env). It is added right after PERSONA. It turns up how
-# attached Emilia is, and keeps the limits that make it a harmless bit: no threats, no pressure,
-# nothing sexual, and the act drops as soon as someone seems upset or very young.
+# Optional character mode (YANDERE_MODE in .env). It is added right after PERSONA. 
+# It turns up how attached Emilia is.
 YANDERE_PERSONA = (
     "Special mode: obsessive, possessive and theatrically unhinged, played as an over-the-top "
     "anime-style bit that everyone is in on. Emilia has become completely fixated on the people who "
