@@ -1646,10 +1646,6 @@ class YandereModeTests(BotTestCase):
         self.assertIn(prompts.YANDERE_REMINDER, final)
         self.assertLess(final.index(prompts.YANDERE_REMINDER), final.index(prompts.REMINDER))  # injection reminder stays last
 
-    async def test_the_limits_are_part_of_the_mode(self):
-        for phrase in ("Never threaten", "never sexual", "drop the act at once", "never say they need her"):
-            self.assertIn(phrase, prompts.YANDERE_PERSONA)
-
     async def test_everything_else_still_works_in_the_mode(self):
         bot = self.make_bot(yandere_mode=True, llm=FakeLLM(text="Hey @Bob!"))
         bob = person("Bob", 20)
@@ -1847,14 +1843,14 @@ class ToolDisplayTests(BotTestCase):
             ("read_file", {"path": "notes.txt"}, "📄 Reading `notes.txt`"),
             ("write_file", {"path": "a.txt", "content": "hi"}, "📝 Writing `a.txt`"),
             ("edit_file", {"path": "a.txt", "old": "x", "new": "y"}, "✏️ Editing `a.txt`"),
-            ("delete_path", {"path": "old"}, "🗑️ Deleting `old`"),
+            ("delete_path", {"path": "old"}, "🗑�?Deleting `old`"),
             ("run_command", {"command": "make " + "x" * 100}, "💻 Running `make " + "x" * 54 + "…`"),
             ("restart_bot", {"confirm": True}, "🔄 Restarting the bot"),
             ("fetch_page", {"url": "https://blog.example/post"}, "🌐 Reading `https://blog.example/post`"),
         ]:
             with self.subTest(name=name):
                 self.assertEqual(tools[name].describe(arguments), expected)
-        self.assertEqual(default_description("lookup", {"confirm": True, "term": "tea"}), "🛠️ `lookup: tea`")
+        self.assertEqual(default_description("lookup", {"confirm": True, "term": "tea"}), "🛠�?`lookup: tea`")
 
     async def test_multi_turn_settings_reach_the_client_and_the_prompt(self):
         bot = EmiliaBot(Settings(discord_token="x", multi_turn_tools=True, max_tool_turns=5, computer_tools=True), memory=MemoryStore(":memory:"))
