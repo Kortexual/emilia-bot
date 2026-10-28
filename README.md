@@ -78,6 +78,8 @@ ordinary message or reply, and mention the bot (a reply that pings the bot count
 Replies can never ping `@everyone` or roles, whatever the model writes. When the model writes `@Name` for someone in the
 conversation, `link_mentions` in `bot.py` turns it into a real ping for that user only; any other name stays plain text.
 
+How her own mention reads: a mention at the very start of a message is dropped (it is how you got her attention), but one anywhere else is shown to the model as `@Emilia`, so "I can't believe @Emilia is going to hug @Jack!" isn't read as "I can't believe is going to hug @Jack!". Mentions of her in quoted messages and in messages she reads with the Discord tools are always kept.
+
 ### Talking to other bots
 By default every bot is ignored. With `RESPOND_TO_BOTS=true`, another bot that @mentions Emilia gets an answer, with these limits:
 - **Never herself.** Her own messages are always ignored.

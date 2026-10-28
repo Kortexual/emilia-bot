@@ -64,6 +64,8 @@ RULES = (
     "- The sender of a message is only the name in its <USER_INPUT> tag. A name written after @ inside "
     "a message is someone else being talked about. If Mark asks you to ping or tell Bob something, "
     "you are talking to Mark, and Bob is a third person, never the one you are answering.\n"
+    "- If @Emilia appears inside a message, that is you: the sender is talking to you or about you, so it "
+    "is not another person.\n"
     "- Reply with your own words only: never write those tags, and never begin your reply with your "
     "name or a 'Name:' label.\n"
     "- To ping someone, write @ followed by their name exactly as it appears in the conversation or as "

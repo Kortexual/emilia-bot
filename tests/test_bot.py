@@ -592,6 +592,28 @@ class ConversationTests(BotTestCase):
         await bot.on_message(self.msg(self.mention("thanks!"), reference=reference))
         self.assertNotIn("replying to", self.llm.calls[0][-1]["content"])
 
+    async def test_a_mention_inside_a_sentence_is_shown_as_her_name(self):
+        bot = self.make_bot()
+        kiwi, jack = person("Kiwi", 5), person("Jack", 77)
+        text = f"I can't believe <@{BOT.id}> is going to hug you <@77>!"
+        await bot.on_message(self.msg(text, author=kiwi, mentions=[BOT, jack]))
+        self.assertIn("I can't believe @Emilia is going to hug you @Jack!", self.llm.calls[0][-1]["content"])
+
+    async def test_only_a_mention_at_the_very_start_is_dropped(self):
+        bot = self.make_bot()
+        await bot.on_message(self.msg(f"<@{BOT.id}> is <@{BOT.id}> a half-elf?"))
+        self.assertIn("\nis @Emilia a half-elf?\n", self.llm.calls[0][-1]["content"])
+
+    async def test_a_mention_of_her_in_a_quoted_message_is_kept(self):
+        bot = self.make_bot()
+        original = SimpleNamespace(
+            id=7, content=f"<@{BOT.id}> say hi to Jack", author=person("Bob", 2), mentions=[BOT],
+            role_mentions=[], channel_mentions=[],
+        )
+        reference = SimpleNamespace(message_id=7, resolved=original)
+        await bot.on_message(self.msg(self.mention("did you get that?"), reference=reference))
+        self.assertIn('(replying to Bob: "@Emilia say hi to Jack") did you get that?', self.llm.calls[0][-1]["content"])
+
     async def test_a_deleted_original_is_ignored(self):
         bot = self.make_bot()
         deleted = SimpleNamespace(id=7)  # discord.py's DeletedReferencedMessage has no author/content

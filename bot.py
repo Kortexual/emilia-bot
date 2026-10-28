@@ -536,7 +536,7 @@ class EmiliaBot(discord.Client):
         return None
 
     async def _handle(self, message: discord.Message, forward: discord.Message | None = None) -> None:
-        text = sanitize_user_text(self._render(message), self.settings.max_input_chars)
+        text = sanitize_user_text(self._render(message, address=True), self.settings.max_input_chars)
         key = str(message.channel.id)
 
         if not message.author.bot and text.partition(" ")[0].lower() in OLD_COMMANDS:
@@ -1297,12 +1297,17 @@ class EmiliaBot(discord.Client):
     def _speaker_names(self) -> tuple[str, ...]:
         return (prompts.PERSONA_NAME, self.user.display_name if self.user else "")
 
-    def _render(self, message: discord.Message) -> str:
-        """Message text with Discord's <@id> markup turned into readable names (our own mention removed)."""
+    def _render(self, message: discord.Message, *, address: bool = False) -> str:
+        """Message text with Discord's <@id> markup turned into readable names. Our own mention is shown as
+        "@Emilia", so "I can't believe @Emilia is going to hug @Jack" still reads that way. With `address`
+        (the message being answered), a mention at the very start is only how the sender got her attention
+        and is dropped."""
         text = message.content
         bot_id = self.user.id if self.user else None
+        if address and bot_id is not None:
+            text = re.sub(rf"^\s*<@!?{bot_id}>\s*", "", text, count=1)
         for user in message.mentions:
-            label = "" if user.id == bot_id else f"@{user.display_name}"
+            label = f"@{prompts.PERSONA_NAME}" if user.id == bot_id else f"@{user.display_name}"
             text = text.replace(f"<@{user.id}>", label).replace(f"<@!{user.id}>", label)
         for role in message.role_mentions:
             text = text.replace(f"<@&{role.id}>", f"@{role.name}")
