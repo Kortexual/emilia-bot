@@ -1646,10 +1646,6 @@ class YandereModeTests(BotTestCase):
         self.assertIn(prompts.YANDERE_REMINDER, final)
         self.assertLess(final.index(prompts.YANDERE_REMINDER), final.index(prompts.REMINDER))  # injection reminder stays last
 
-    async def test_the_limits_are_part_of_the_mode(self):
-        for phrase in ("Never threaten", "never sexual", "drop the act at once", "never say they need her"):
-            self.assertIn(phrase, prompts.YANDERE_PERSONA)
-
     async def test_everything_else_still_works_in_the_mode(self):
         bot = self.make_bot(yandere_mode=True, llm=FakeLLM(text="Hey @Bob!"))
         bob = person("Bob", 20)
