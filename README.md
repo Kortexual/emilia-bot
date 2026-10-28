@@ -488,9 +488,6 @@ restart the service with systemd instead.
 `YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes
 obsessive and possessive in an over-the-top, anime-style way: fixated on small details, mood swings from giddy to pouty to heartbroken, and
 dramatic sulking when people mention other friends or bots.
-The text also sets fixed limits that apply however she is asked: no threats or violence (not even toward someone she's "jealous" of), no claiming
-to watch or track anyone, no guilt-tripping or pressuring people or telling them they need her, nothing sexual, and she drops the act and answers
-normally when someone seems upset or very young or asks her to stop. A prompt can't guarantee behaviour with every model, so test it with yours.
 The ready-made replies (greeting, error and so on) keep her normal voice. The setting is read at startup, so restart the bot after changing it.
 
 ## Project layout
