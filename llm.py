@@ -114,6 +114,7 @@ class ToolUse:
     arguments: dict[str, Any]
     description: str = ""  # the line shown in the chat, from the tool's describe()
     sources: list[str] = field(default_factory=list)  # filled in once the tool has run
+    quiet: bool = False  # the tool's effect shows by itself (a reaction): no line is posted for it
 
 
 TextHandler = Callable[[str], Awaitable[None]]
@@ -370,7 +371,7 @@ class LMStudioClient:
                 elif call.name not in offered:  # unknown or excluded: refused, and not shown in the chat as if it ran
                     result = await self._run_tool(call, offered)
                 else:
-                    use = ToolUse(call.name, call.arguments, self._describe(call))
+                    use = ToolUse(call.name, call.arguments, self._describe(call), quiet=bool(getattr(self._tools[call.name], "quiet", False)))
                     if on_tool is not None:
                         await on_tool(use)
                     result = await self._run_tool(call, offered)

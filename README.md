@@ -24,7 +24,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
    1. In the [Developer Portal](https://discord.com/developers/applications) create an application, open its
       **Bot** tab and click **Reset Token** to copy the token.
    2. On the same tab, under *Privileged Gateway Intents*, switch on **Message Content Intent**. (Also switch on
-      **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below.)
+      **Server Members Intent** only if you set `MEMBERS_INTENT=true`; see "Pinging" below, and **Presence Intent** only if you
+      set `PRESENCE_INTENT=true`.)
    3. Open **OAuth2 → URL Generator**, tick the scopes `bot` and `applications.commands` (for the slash commands), then tick the permissions *View Channels*,
       *Send Messages*, *Send Messages in Threads* and *Read Message History*. Open the generated URL to add the bot to your server.
 
@@ -60,6 +61,8 @@ Everything stays on your machine, apart from the web searches the model chooses 
   - `/about set I garden and like tea` saves a short note about **yourself** (up to 160 characters). `/about show` shows it and
     `/about clear` removes it. Emilia sees the note when you talk to her, or when someone else mentions you.
   - `/forgetme` deletes the note and the names saved about you.
+  - `/giveup` makes her drop what she is doing in that channel, right away, and not pick it back up unless someone asks again (see
+    "Giving up" below). You can stop the replies to your own messages; stopping someone else's needs *Manage Messages*, like `/forget`.
 
   Answers to `/about` and `/forgetme` are only shown to you, and no command answer ever pings anyone. The commands are registered with
   Discord each time the bot starts; a new or changed command can take a moment to show up (restarting your Discord client helps).
@@ -154,6 +157,19 @@ Memory keeps everything the model said for one request as one reply; the tool li
   offered once it has started working, so it can't use it to skip answering. A plain chat reply with no tools is still a single generation. Each step is a full generation, so long tasks on big
   models take a while.
 
+### Giving up
+`/giveup` makes her stop what she is doing in that channel right away, and leave it be. The reply (or replies) in progress is cancelled
+wherever it is: a model that is still thinking, a tool that is running (a shell command is killed together with everything it started,
+and a `restart_bot` that is still waiting for its replacement stops it), or a long message being posted. Whatever she had already
+said stays in the chat and in memory, and so does the `/giveup` itself, with a note that tells the next reply to drop the matter:
+otherwise she would simply start the same thing again at the next message.
+
+- **Who can use it.** You can stop the replies to your own messages. Stopping someone else's needs *Manage Messages* in that channel,
+  like `/forget` (in a DM, anyone can). If nothing is going on she says so, and only you see that.
+- **Only that channel.** Replies in other channels are not touched.
+- **Not queued.** Replies in a channel are handled one at a time, but `/giveup` is not one of them: it doesn't wait behind the lock,
+  it cancels the task the reply runs in, so it works even while she is stuck on a slow generation.
+
 ### Reading pages
 Search snippets are short. With `FETCH_PAGES=true` (the default) the model also has a `fetch_page` tool that opens a web page and returns
 its text, for when a snippet isn't enough or someone shares a link to read. A question that needs a search and then a page uses both
@@ -203,6 +219,80 @@ is missing the bot starts without these tools and logs a warning. The browser is
 - **Untrusted text.** Page text and element labels are cleaned like `fetch_page`'s and marked as untrusted. A page can still try to
   talk the model into typing something from the conversation into a form, which no filter can rule out; the confirmation rule and
   the prompt are the defence, so only turn this on where you trust the people who can prompt the bot.
+
+### Discord tools
+With `DISCORD_TOOLS=true` the model can look around Discord in the middle of a reply, through the same tool loop as web search:
+`discord_info` (how many servers she is in, uptime, this server's member count and roles), `list_channels`, `read_messages` (the
+last messages of a channel, up to 50, or those around a message), `lookup_member` (names, user ID, join date, roles), `list_pins` and
+`list_threads`, plus `member_statuses` (who is online, idle or busy, and what they are doing) when `PRESENCE_INTENT=true`; without
+it the bot logs at startup that the tool is not offered. With `DISCORD_ACTIONS=true` as well she can act there: `react`/`unreact`,
+`edit_message` and `delete_message` (her own messages only), `start_thread`, `send_message` (another channel of this server),
+`pin`/`unpin` and `create_poll`. The code is in `discord_tools.py`.
+
+- **She acts as herself.** Every action uses the bot's own permissions, so what you allow the bot in a server is what anyone who
+  can mention her can get done through her. Grant permissions with that in mind.
+- **Her own permissions.** She is treated like any other member: she can see the channels her roles let her see, whoever asks,
+  and Discord refuses what her roles don't allow. A private thread is only seen once she is in it. Channels in other servers are out
+  of reach unless `DISCORD_CROSS_SERVER=true`.
+- **Other servers.** With `DISCORD_CROSS_SERVER=true` she also gets `list_servers`, and `send_to_server` with `DISCORD_ACTIONS`.
+  Posting elsewhere is split in two on purpose: `send_message` is for this server and `send_to_server` (which requires a `server`)
+  for another one, because with one tool the model kept looking for the other server's channel in this one. `list_channels`,
+  `read_messages`, `list_pins`, `list_threads` and `lookup_member` take an optional `server` too. If `send_message` gets a channel
+  name that only exists in another server, the error names that server and points to `send_to_server`.
+- **Names or IDs.** A server is its name or ID; a channel is `#name`, an ID, a `<#id>` mention or a channel link. Names ignore case,
+  and if nothing matches exactly, spaces, dashes and emoji too (`Tea Time` finds `#🍵-tea-time`). A name that fits several is
+  refused with their IDs, never guessed.
+- **Finding people.** `lookup_member` takes a name, a user ID, a mention or a message handle (`m3` means its author), and shows
+  user IDs. A user ID or handle works for someone who isn't in this server. With `DISCORD_CROSS_SERVER=true`, a name not found here
+  is looked for among the members of her other servers that Discord has sent, then in the people directory (anyone she has talked
+  with), and the result says where they were found. Discord has no way for a bot to search everyone by name, so beyond that the
+  tool tells the model to ask for a user ID (Copy User ID with Developer Mode), a mention or a link to one of their messages.
+- **Handles, not IDs.** The model never sees message IDs. `read_messages` and `list_pins` label each message `[m1]`, `[m2]`, ...
+  and the action tools take those, `this` (the message she is answering), `replied` (the one it replies to), `mine` / `mine-2`
+  (her latest messages in this reply), or a message link the sender wrote. Anything else, like an ID the model made up, is refused.
+  Handles last for one reply.
+- **Text goes through the reply checks.** Messages, edits, thread names and poll text are cleaned and checked for prompt leaks,
+  braille and the emoji cooldown like a reply. A message posted elsewhere can ping people in this conversation only; an edit pings
+  nobody new. A message posted in another channel is remembered there (marked as posted on someone's request); edits and deletes
+  don't rewrite memory, which keeps the conversation as it happened.
+- **Threads.** After `start_thread`, the rest of the reply (text and tool lines) goes into the new thread, whose memory starts with a
+  note about where it came from.
+- **Limits.** `DISCORD_MAX_ACTIONS` (default 5) caps the actions in one reply, so a model stuck in a loop can't spam. Reactions post
+  no tool line (tools can set `quiet = True`), since they show by themselves. Read results are marked as untrusted, like search results.
+- **Bots and unprompted messages.** A bot sender (`RESPOND_TO_BOTS`) gets the read tools and reactions, but no other actions,
+  moderation tools or `discord_api`. Messages she starts on her own never get the Discord tools, even with `RANDOM_MESSAGE_TOOLS`:
+  they act for the person who asked.
+
+**Moderation (`DISCORD_ADMIN_TOOLS=true`).** `remove_message` (someone else's), `timeout_member`, `kick_member`, `ban_member`,
+`unban_member`, `add_role`/`remove_role`, `edit_channel` (name, topic, slowmode) and `edit_server` (its name).
+
+- **Her permissions, not the sender's.** As with every Discord tool, she acts as herself: if her roles let her kick, she can kick
+  when someone asks, whoever they are. Give her only the permissions you want anyone who can mention her to use. A member or role is
+  only touched if it ranks below her highest role (Discord's own rule, checked first for a clearer answer). She never moderates
+  herself or the server owner.
+- **Confirmation.** With `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION=true` (the default) every call needs `confirm=true`, and the model
+  is told to set it only when the sender asked for exactly that action. Turn it off once her permissions are what you want.
+- **Who is meant.** A member is named the way the model tends to write it: a display name, username, global name or nickname (with
+  or without `@`), a mention, a user ID, or a message handle (`m3` means its author). Names are looked up among the people in the
+  conversation, authors of messages she read, members Discord has sent and Discord's member search (which only matches the start of
+  usernames and nicknames, so a first word is tried too). An exact name wins, then a first name; if that still fits several people the
+  call is refused with their user IDs, rather than guessed.
+- **Clear refusals.** Her own permission is checked first, so the model hears "you don't have Kick Members" instead of a bare
+  failure, and when Discord refuses, its reason is passed on. Administrators can be kicked and banned (only role order and server
+  ownership protect anyone), but Discord doesn't let anyone time them out, so that is refused up front.
+- **Audit log.** Every action records who asked for it (and the reason, if given) in the server's audit log.
+
+**Raw API (`ARBITRARY_DISCORD_TOOLS=true`).** `discord_api` makes any Discord REST call (`GET /guilds/123/emojis`, ...) for things no
+curated tool covers, with her own permissions, for anyone but other bots. Calls other than `GET` need `confirm=true` unless
+`ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION=false` (that flag is the safety: switch it off once her permissions are what you
+want), and count against `DISCORD_MAX_ACTIONS`. Its description and the prompt point posting at `send_message`/`send_to_server`
+instead. Paths take numeric IDs, which `lookup_member` (user IDs), `discord_info` (the server's and her own), `list_servers`
+(other servers') and `list_channels` show; a name where an ID belongs (`/bans/jackpapel`) is refused with that hint. A body that
+can carry a message gets `allowed_mentions: {"parse": []}` forced in, so it still can't mass-ping, and its `content` goes through the
+reply checks. A few paths are always refused: OAuth2 and the bot's application, the gateway, interaction and webhook-token URLs,
+deleting a server, pruning and bulk bans (`API_DENYLIST` in `discord_tools.py`). Leaving a server is allowed; someone can always
+invite her back. The response is trimmed to `PAGE_MAX_CHARS`. Calls that keep showing up in the logs are good candidates for a
+curated tool.
 
 ### Images and files
 Every attachment on the message being answered, on the message it replies to, or in a forward it comments on is named in the
@@ -352,9 +442,18 @@ All settings are environment variables (or lines in `.env`).
 | `COMPUTER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each write, edit, delete or command tool call. Set `false` for fully non-interactive operation. |
 | `BROWSER_TOOLS` | `false` | Give the model a headless browser it can open, read and click around in (needs Playwright; see "Browsing") |
 | `BROWSER_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each browser click, typing or dropdown choice. Set `false` to let the model use pages freely. |
+| `DISCORD_TOOLS` | `false` | Let the model read Discord: server info, channels, recent messages, members, pins, threads (see "Discord tools") |
+| `DISCORD_ACTIONS` | `false` | Also let it react, edit or delete its own messages, start threads, post in other channels, pin and start polls (needs `DISCORD_TOOLS`) |
+| `DISCORD_MAX_ACTIONS` | `5` | Most Discord actions in one reply (minimum `1`) |
+| `DISCORD_CROSS_SERVER` | `false` | Let the Discord tools reach other servers she is in: `list_servers`, `send_to_server`, and a `server` argument on the channel tools |
+| `DISCORD_ADMIN_TOOLS` | `false` | Moderation: remove messages, time out, kick, ban, roles, channel and server edits, with her own permissions (needs `DISCORD_TOOLS`) |
+| `DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each moderation tool call |
+| `ARBITRARY_DISCORD_TOOLS` | `false` | Offer `discord_api`, raw Discord REST calls with her own permissions (needs `DISCORD_TOOLS`) |
+| `ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION` | `true` | Require `confirm=true` in each `discord_api` call other than `GET` |
 | `MULTI_TURN_TOOLS` | `false` | After a tool call, let the model keep working over more turns until it calls `stop_talking` (see "Tool use" below) |
 | `MAX_TOOL_TURNS` | `8` | With `MULTI_TURN_TOOLS`, the most generations one message can take (minimum `2`); the last one must answer |
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
+| `PRESENCE_INTENT` | `false` | See members' statuses, for the `member_statuses` Discord tool (needs *Presence Intent*; best with `MEMBERS_INTENT`) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
 | `TIME_AWARENESS` | `false` | Tell her the time of day: wake-up on the first morning message, sleepy at night, random events (see "Her day") |
 | `TIMEZONE` | empty (this computer's time) | Her time zone, e.g. `America/New_York` (needs `tzdata` on Windows, included in `requirements.txt`) |
@@ -404,6 +503,7 @@ webpage.py    the fetch_page tool: safe page download, HTML to text, which links
 attachments.py images and files attached to messages: notes, file text, image parts for vision models
 browser.py    the opt-in browser tools (Playwright) and the proxy that keeps them on the public internet
 computer.py   the opt-in workspace file and terminal tools
+discord_tools.py  the opt-in Discord tools: reading channels and members, reacting, threads, posting, moderation
 restart.py    the restart_bot tool and its handoff
 memory.py     SQLite conversation memory and the people directory
 styleguard.py cooldown for emoji tics, expiry of standing instructions
@@ -418,7 +518,7 @@ tests/        run with:  python -m unittest
 ## Troubleshooting
 
 - **"Turn on Message Content Intent" at startup**: Developer Portal → Bot → Privileged Gateway Intents. If you set `MEMBERS_INTENT=true`,
-  switch on **Server Members Intent** there too.
+  switch on **Server Members Intent** there too, and **Presence Intent** for `PRESENCE_INTENT=true`.
 - **"ping Jack" stays plain text**: the name must be typed in your message and match exactly one human member (see "Pinging"). A last
   name or a middle word is only found with `MEMBERS_INTENT=true`.
 - **Online but silent**: mention the bot *user* (not a role), check it can see and send in that channel,

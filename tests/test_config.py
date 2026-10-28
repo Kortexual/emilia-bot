@@ -48,6 +48,14 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(s.computer_require_confirmation)
         self.assertFalse(s.browser_tools)
         self.assertTrue(s.browser_require_confirmation)
+        self.assertFalse(s.discord_tools)
+        self.assertFalse(s.discord_actions)
+        self.assertEqual(s.discord_max_actions, 5)
+        self.assertFalse(s.discord_cross_server)
+        self.assertFalse(s.discord_admin_tools)
+        self.assertTrue(s.discord_admin_tools_require_confirmation)
+        self.assertFalse(s.arbitrary_discord_tools)
+        self.assertTrue(s.arbitrary_discord_tools_require_confirmation)
         self.assertFalse(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 8)
         self.assertEqual(s.memory_turns, 10)
@@ -72,6 +80,12 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(load(DISCORD_TOKEN="a", MEMBERS_INTENT="yes").members_intent)
         with self.assertRaises(ConfigError):
             load(DISCORD_TOKEN="a", MEMBERS_INTENT="maybe")
+
+    def test_presence_intent_flag(self):
+        self.assertFalse(load(DISCORD_TOKEN="a").presence_intent)
+        self.assertTrue(load(DISCORD_TOKEN="a", PRESENCE_INTENT="on").presence_intent)
+        with self.assertRaises(ConfigError):
+            load(DISCORD_TOKEN="a", PRESENCE_INTENT="maybe")
 
     def test_yandere_mode_flag(self):
         self.assertTrue(load(DISCORD_TOKEN="a", YANDERE_MODE="true").yandere_mode)
@@ -123,6 +137,14 @@ class SettingsTests(unittest.TestCase):
             COMPUTER_REQUIRE_CONFIRMATION="false",
             BROWSER_TOOLS="on",
             BROWSER_REQUIRE_CONFIRMATION="no",
+            DISCORD_TOOLS="true",
+            DISCORD_ACTIONS="true",
+            DISCORD_MAX_ACTIONS="2",
+            DISCORD_CROSS_SERVER="yes",
+            DISCORD_ADMIN_TOOLS="true",
+            DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION="false",
+            ARBITRARY_DISCORD_TOOLS="true",
+            ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION="false",
             MULTI_TURN_TOOLS="true",
             MAX_TOOL_TURNS="4",
         )
@@ -140,6 +162,14 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(s.computer_require_confirmation)
         self.assertTrue(s.browser_tools)
         self.assertFalse(s.browser_require_confirmation)
+        self.assertTrue(s.discord_tools)
+        self.assertTrue(s.discord_actions)
+        self.assertEqual(s.discord_max_actions, 2)
+        self.assertTrue(s.discord_cross_server)
+        self.assertTrue(s.discord_admin_tools)
+        self.assertFalse(s.discord_admin_tools_require_confirmation)
+        self.assertTrue(s.arbitrary_discord_tools)
+        self.assertFalse(s.arbitrary_discord_tools_require_confirmation)
         self.assertTrue(s.multi_turn_tools)
         self.assertEqual(s.max_tool_turns, 4)
 
@@ -157,6 +187,12 @@ class SettingsTests(unittest.TestCase):
             {"RESPOND_TO_BOTS": "sometimes"},
             {"BROWSER_TOOLS": "sometimes"},
             {"BROWSER_REQUIRE_CONFIRMATION": "2"},
+            {"DISCORD_TOOLS": "sometimes"},
+            {"DISCORD_TOOLS": "true", "DISCORD_MAX_ACTIONS": "0"},
+            {"DISCORD_ACTIONS": "true"},  # needs DISCORD_TOOLS
+            {"DISCORD_ADMIN_TOOLS": "true"},  # needs DISCORD_TOOLS
+            {"ARBITRARY_DISCORD_TOOLS": "true"},  # needs DISCORD_TOOLS
+            {"DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION": "perhaps"},
         ):
             with self.subTest(bad=bad), self.assertRaises(ConfigError):
                 load(DISCORD_TOKEN="a", **bad)

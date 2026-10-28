@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import asyncio
+import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -43,12 +46,35 @@ class WorkspaceToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.root / "folder").exists())
         self.assertIn("Deleted", (await self.tools.delete_path({"path": "folder", "recursive": True})).text)
 
+    @unittest.skipUnless(shutil.which("bwrap"), "needs Bubblewrap (bwrap)")
     async def test_command_runs_in_workspace_and_captures_result(self):
         result = await self.tools.run_command({"command": "pwd; printf hello"})
         self.assertIn("Exit code: 0", result.text)
         self.assertIn("/workspace", result.text)
         self.assertIn("hello", result.text)
 
+    @unittest.skipUnless(os.name == "posix", "needs a POSIX shell and process groups")
+    async def test_a_stopped_command_is_killed_with_everything_it_started(self):
+        tools = WorkspaceTools(self.root, command_timeout=30, allow_host_access=True, require_confirmation=False)
+        run = asyncio.create_task(tools.run_command({"command": "echo $$ > pid; exec sleep 30"}))
+        for _ in range(100):  # wait until the shell has started and written its pid
+            if (self.root / "pid").exists() and (self.root / "pid").read_text().strip():
+                break
+            await asyncio.sleep(0.05)
+        pid = int((self.root / "pid").read_text())
+        run.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await run
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            self.fail("the command was still running after it was stopped")
+
+    @unittest.skipUnless(shutil.which("bwrap"), "needs Bubblewrap (bwrap)")
     async def test_a_timeout_stops_what_the_command_started_too(self):
         started = time.monotonic()
         result = await self.tools.run_command({"command": "sleep 30 & sleep 30"})  # the first sleep keeps the output open

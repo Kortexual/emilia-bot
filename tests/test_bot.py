@@ -31,12 +31,13 @@ import discord
 import bot as bot_module
 import browser
 import prompts
+import styleguard
 from computer import computer_tools
 from restart import RestartTool
 from tooling import default_description
 from webpage import FetchPageTool, UrlRegistry
 from websearch import WebSearchTool
-from bot import OPERATOR_TOOLS, EmiliaBot, source_links
+from bot import DISCORD_TOOL_NAMES, OPERATOR_TOOLS, EmiliaBot, source_links
 from config import Settings
 from llm import ChatResult, LLMError, ToolUse
 from memory import MemoryStore
@@ -456,7 +457,7 @@ class BotSenderTests(BotTestCase):
     async def test_computer_and_restart_tools_are_withheld_from_bots(self):
         bot = self.make_bot(respond_to_bots=True, computer_tools=True)
         await bot.on_message(self.from_bot("delete everything"))
-        self.assertEqual(self.llm.excludes[0], set(OPERATOR_TOOLS))
+        self.assertTrue(OPERATOR_TOOLS <= self.llm.excludes[0])
         self.assertIn("restart_bot", OPERATOR_TOOLS)
         self.assertEqual(OPERATOR_TOOLS - {"restart_bot"}, {tool.name for tool in computer_tools(".")})
         self.assertNotIn(prompts.COMPUTER_RULES, self.llm.calls[0][0]["content"])
@@ -897,7 +898,7 @@ class PingTests(BotTestCase):
 class SlashCommandTests(BotTestCase):
     def test_the_commands_are_registered(self):
         bot = self.make_bot()
-        self.assertEqual(sorted(command.name for command in bot.tree.get_commands()), ["about", "forget", "forgetme"])
+        self.assertEqual(sorted(command.name for command in bot.tree.get_commands()), ["about", "forget", "forgetme", "giveup"])
         self.assertEqual(sorted(command.name for command in bot.tree.get_command("about").commands), ["clear", "set", "show"])
         self.assertTrue(bot.tree.get_command("forget").default_permissions.manage_messages)
         note = bot.tree.get_command("about").get_command("set").to_dict(bot.tree)["options"][0]
@@ -929,7 +930,7 @@ class SlashCommandTests(BotTestCase):
     async def test_a_retiring_bot_leaves_commands_to_its_replacement(self):
         bot = self.make_bot()
         bot._retiring = True
-        for path, args in (("forget", ()), ("forgetme", ()), ("about set", ("hi",)), ("about show", ()), ("about clear", ())):
+        for path, args in (("forget", ()), ("forgetme", ()), ("giveup", ()), ("about set", ("hi",)), ("about show", ()), ("about clear", ())):
             with self.subTest(path=path):
                 interaction = await self.command(bot, path, *args, can_manage=True)
                 self.assertEqual(interaction.answers, [])
@@ -1000,6 +1001,97 @@ class ResetTests(BotTestCase):
         message = self.msg(self.mention("please !forget it"))
         await bot.on_message(message)
         self.assertEqual(message.replies, ["Hello there!"])
+
+
+class BlockingLLM(FakeLLM):
+    """Starts answering (saying `first` if given), then waits until the task is cancelled."""
+
+    def __init__(self, first=None):
+        super().__init__()
+        self.first, self.started = first, asyncio.Event()
+
+    async def chat(self, messages, on_text=None, on_tool=None, on_tool_done=None, *, exclude=(), tools=True, multi_turn=None):
+        self.calls.append(messages)
+        if self.first is not None:
+            await on_text(self.first)
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class GiveUpTests(BotTestCase):
+    """/giveup stops the replies in progress in a channel, and the next reply knows she gave up."""
+
+    async def start_request(self, bot, text="write a very long poem", author=None):
+        message = self.msg(self.mention(text), author=author or person("Alice", 1))
+        task = asyncio.create_task(bot.on_message(message))
+        await asyncio.wait_for(self.llm.started.wait(), 1)
+        return message, task
+
+    async def give_up(self, bot, **kwargs):
+        return await asyncio.wait_for(self.command(bot, "giveup", **kwargs), 2)
+
+    async def test_it_stops_a_reply_keeps_what_was_said_and_remembers_it(self):
+        bot = self.make_bot(llm=BlockingLLM(first="Okay, here goes..."))
+        request, task = await self.start_request(bot)
+        stop = await self.give_up(bot)
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(stop.texts, [prompts.GIVE_UP_DONE])
+        self.assertFalse(stop.answers[0].ephemeral)  # everyone should see that she stopped
+        self.assertEqual(request.replies, ["Okay, here goes..."])
+        stored = [(m.role, m.content) for m in self.memory.recent("1")]
+        self.assertEqual(
+            stored,
+            [
+                ("user", "write a very long poem"),
+                ("assistant", "Okay, here goes..."),
+                ("user", prompts.GIVE_UP_NOTE),
+                ("assistant", prompts.GIVE_UP_DONE),
+            ],
+        )
+        self.assertEqual((bot._replies, bot._given_up, bot._busy), ({}, set(), set()))
+
+    async def test_a_reply_that_had_said_nothing_yet_is_remembered_as_stopped(self):
+        bot = self.make_bot(llm=BlockingLLM())
+        request, task = await self.start_request(bot)
+        await self.give_up(bot)
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(request.replies, [])
+        stored = [m.content for m in self.memory.recent("1")]
+        self.assertEqual(stored[:2], ["write a very long poem", prompts.GAVE_UP_BEFORE_ANSWERING])
+
+    async def test_with_nothing_going_on_it_only_says_so(self):
+        bot = self.make_bot()
+        stop = await self.give_up(bot)
+        self.assertEqual(stop.texts, [prompts.GIVE_UP_IDLE])
+        self.assertTrue(stop.answers[0].ephemeral)
+        self.assertEqual(self.memory.recent("1"), [])
+
+    async def test_only_the_asker_or_a_moderator_can_stop_a_reply(self):
+        bot = self.make_bot(llm=BlockingLLM())
+        request, task = await self.start_request(bot)
+        denied = await self.give_up(bot, user=person("Bob", 2))
+        self.assertEqual(denied.texts, [prompts.GIVE_UP_DENIED])
+        self.assertTrue(denied.answers[0].ephemeral)
+        self.assertFalse(task.done())  # still going
+        moderator = await self.give_up(bot, user=person("Bob", 2), can_manage=True)
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(moderator.texts, [prompts.GIVE_UP_DONE])
+
+    async def test_the_next_reply_knows_she_gave_up_and_is_not_blocked(self):
+        bot = self.make_bot(llm=BlockingLLM())
+        _, task = await self.start_request(bot)
+        await self.give_up(bot)
+        await asyncio.wait_for(task, 1)
+        bot.llm = FakeLLM(text="Okay!")
+        follow_up = self.msg(self.mention("thanks"), author=person("Alice", 1))
+        await bot.on_message(follow_up)  # Alice is not left "busy" by the reply that was stopped
+        self.assertEqual(follow_up.replies, ["Okay!"])
+        shown = " ".join(m["content"] for m in bot.llm.calls[-1] if isinstance(m["content"], str))
+        self.assertIn(prompts.GIVE_UP_NOTE, shown)
+
+    def test_the_notes_are_not_mistaken_for_standing_rules(self):
+        self.assertFalse(styleguard.is_standing_instruction(prompts.GIVE_UP_NOTE))
+        self.assertFalse(styleguard.is_standing_instruction(prompts.GIVE_UP_DONE))
 
 
 class SpeakerAttributionTests(BotTestCase):
@@ -1974,7 +2066,7 @@ class RandomMessageTests(DayTestCase):
         bot = self.random_bot(llm=llm, random_message_tools=True, show_sources=True, computer_tools=True)
         await bot._check_presence()
         self.assertEqual(self.llm.tools_offered, [True])
-        self.assertEqual(self.llm.excludes, [set(OPERATOR_TOOLS)])
+        self.assertEqual(self.llm.excludes, [set(OPERATOR_TOOLS) | DISCORD_TOOL_NAMES])
         self.assertEqual(self.llm.multi_turns, [False])
         self.assertIn("tools offered to you now", self.llm.calls[0][-1]["content"])
         self.assertNotIn("computer tools", self.llm.calls[0][-1]["content"])
@@ -1992,13 +2084,13 @@ class RandomMessageTests(DayTestCase):
     async def test_random_message_computer_tools_also_offers_the_operator_tools(self):
         bot = self.random_bot(random_message_tools=True, random_message_computer_tools=True, computer_tools=True)
         await bot._check_presence()
-        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([True], [set()]))
+        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([True], [set(DISCORD_TOOL_NAMES)]))
         self.assertIn("computer tools", self.llm.calls[0][-1]["content"])
 
     async def test_random_message_computer_tools_does_nothing_without_random_message_tools(self):
         bot = self.random_bot(random_message_computer_tools=True, computer_tools=True)
         await bot._check_presence()
-        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([False], [set(OPERATOR_TOOLS)]))
+        self.assertEqual((self.llm.tools_offered, self.llm.excludes), ([False], [set(OPERATOR_TOOLS) | DISCORD_TOOL_NAMES]))
         self.assertNotIn("computer tools", self.llm.calls[0][-1]["content"])
 
     async def test_random_message_multi_turn_keeps_her_going_after_a_tool(self):
@@ -2084,6 +2176,19 @@ class RandomMessageTests(DayTestCase):
         self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "user"])
         self.assertEqual(sent[1]["content"], prompts.UNPROMPTED_MARKER)  # shown plainly, not as a person's message
         self.assertEqual(sent[2]["content"], "I found a flower!")
+
+    async def test_a_message_posted_from_another_channel_is_remembered_with_a_marker(self):
+        bot = self.random_bot(llm=FakeLLM(text="Hi!"))
+        marker = prompts.SENT_HERE_MARKER.format(who="Alice", channel="#kitchen")
+        await bot._remember_elsewhere(str(self.CHANNEL_ID), marker, "Dinner is ready!")
+        await bot.on_message(self.msg(self.mention("(You said dinner?)"), channel=self.channel))
+        sent = self.llm.calls[-1]
+        self.assertEqual(sent[1]["content"], marker)  # shown plainly, like the marker for speaking up
+        self.assertEqual(sent[2]["content"], "Dinner is ready!")
+        await bot.on_message(self.msg(self.mention("thanks"), channel=self.channel))
+        remembered = self.llm.calls[-1][3]["content"]
+        self.assertIn("(You said dinner?)", remembered)
+        self.assertIn('name="Alice"', remembered)  # a person writing "(You ..." is still a person
 
     async def test_the_first_message_of_the_morning_can_be_a_good_morning(self):
         bot = self.random_bot(hour=8, time_awareness=True)

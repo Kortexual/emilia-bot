@@ -203,6 +203,9 @@ class WorkspaceTools:
                 except asyncio.TimeoutError:
                     pass
                 return ToolResult(f"Error: command timed out after {self.command_timeout:g} seconds.")
+            except asyncio.CancelledError:  # the reply was stopped (/giveup): don't leave the command running
+                self._kill(process)
+                raise
             text = output.decode("utf-8", errors="replace")
             if len(text) > MAX_OUTPUT_CHARS:
                 text = text[:MAX_OUTPUT_CHARS] + "\n(Output truncated.)"

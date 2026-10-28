@@ -141,9 +141,18 @@ class Settings:
     computer_require_confirmation: bool = True  # each mutating call must contain confirm=true
     browser_tools: bool = False  # opt-in: a headless browser the model can open, read and click around in
     browser_require_confirmation: bool = True  # each click, typing and dropdown choice must contain confirm=true
+    discord_tools: bool = False  # opt-in: the model can read Discord (server info, channels, messages, members)
+    discord_actions: bool = False  # opt-in, needs discord_tools: react, edit/delete her messages, threads, posts, pins, polls
+    discord_max_actions: int = 5  # action tool calls per reply
+    discord_cross_server: bool = False  # let the Discord tools reach channels in other servers she is in
+    discord_admin_tools: bool = False  # opt-in, needs discord_tools: moderation (timeouts, kicks, bans, roles, channel edits)
+    discord_admin_tools_require_confirmation: bool = True  # each moderation call must contain confirm=true
+    arbitrary_discord_tools: bool = False  # opt-in, needs discord_tools: discord_api, raw REST calls with her permissions
+    arbitrary_discord_tools_require_confirmation: bool = True  # each discord_api call other than GET must contain confirm=true
     multi_turn_tools: bool = False  # after a tool call the model keeps taking turns until it calls stop_talking
     max_tool_turns: int = 8  # cap on generations for one message when multi_turn_tools is on
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
+    presence_intent: bool = False  # see members' statuses (the member_statuses tool); needs the Presence Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
 
     # Her day (see presence.py)
@@ -218,6 +227,17 @@ class Settings:
         if random_messages and not channels:
             raise ConfigError("RANDOM_MESSAGES is on, but RANDOM_MESSAGE_CHANNELS lists no channel IDs")
 
+        discord_tools = _flag("DISCORD_TOOLS", cls.discord_tools)
+        discord_actions = _flag("DISCORD_ACTIONS", cls.discord_actions)
+        if discord_actions and not discord_tools:
+            raise ConfigError("DISCORD_ACTIONS needs DISCORD_TOOLS=true as well")
+        discord_admin_tools = _flag("DISCORD_ADMIN_TOOLS", cls.discord_admin_tools)
+        if discord_admin_tools and not discord_tools:
+            raise ConfigError("DISCORD_ADMIN_TOOLS needs DISCORD_TOOLS=true as well")
+        arbitrary_discord_tools = _flag("ARBITRARY_DISCORD_TOOLS", cls.arbitrary_discord_tools)
+        if arbitrary_discord_tools and not discord_tools:
+            raise ConfigError("ARBITRARY_DISCORD_TOOLS needs DISCORD_TOOLS=true as well")
+
         return cls(
             discord_token=token,
             lmstudio_url=url,
@@ -245,9 +265,22 @@ class Settings:
             computer_require_confirmation=_flag("COMPUTER_REQUIRE_CONFIRMATION", cls.computer_require_confirmation),
             browser_tools=_flag("BROWSER_TOOLS", cls.browser_tools),
             browser_require_confirmation=_flag("BROWSER_REQUIRE_CONFIRMATION", cls.browser_require_confirmation),
+            discord_tools=discord_tools,
+            discord_actions=discord_actions,
+            discord_max_actions=_number("DISCORD_MAX_ACTIONS", cls.discord_max_actions, int, minimum=1),
+            discord_cross_server=_flag("DISCORD_CROSS_SERVER", cls.discord_cross_server),
+            discord_admin_tools=discord_admin_tools,
+            discord_admin_tools_require_confirmation=_flag(
+                "DISCORD_ADMIN_TOOLS_REQUIRE_CONFIRMATION", cls.discord_admin_tools_require_confirmation
+            ),
+            arbitrary_discord_tools=arbitrary_discord_tools,
+            arbitrary_discord_tools_require_confirmation=_flag(
+                "ARBITRARY_DISCORD_TOOLS_REQUIRE_CONFIRMATION", cls.arbitrary_discord_tools_require_confirmation
+            ),
             multi_turn_tools=_flag("MULTI_TURN_TOOLS", cls.multi_turn_tools),
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
+            presence_intent=_flag("PRESENCE_INTENT", cls.presence_intent),
             yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
             time_awareness=_flag("TIME_AWARENESS", cls.time_awareness),
             timezone=_timezone("TIMEZONE"),

@@ -35,7 +35,8 @@ class Tool(Protocol):
     """Anything the model may ask for. `schema` is the OpenAI "function" object.
 
     A tool may also define `describe(arguments) -> str`: the short line posted in the chat when the
-    model uses it, e.g. "💻 Running `ls -la`". Tools without one get default_description()."""
+    model uses it, e.g. "💻 Running `ls -la`". Tools without one get default_description().
+    A tool whose effect is visible by itself (a reaction) may set `quiet = True`: no line is posted for it."""
 
     name: str
     schema: dict[str, Any]  # {"name": ..., "description": ..., "parameters": {JSON schema}}

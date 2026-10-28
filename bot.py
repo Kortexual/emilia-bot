@@ -45,6 +45,7 @@ import discord
 from discord import app_commands
 
 import browser
+import discord_tools
 import presence
 import prompts
 import styleguard
@@ -52,6 +53,7 @@ from attachments import AttachmentReader
 from browser import BrowserSessions, browser_tools, playwright_installed
 from config import ConfigError, Settings, environment_without_dotenv
 from computer import TOOL_NAMES as COMPUTER_TOOL_NAMES, computer_tools
+from discord_tools import ACTION_TOOL_NAMES, ADMIN_TOOL_NAMES, API_TOOL, BOT_SAFE_TOOLS, READ_TOOL_NAMES, DiscordContext, DiscordTools, Outgoing
 from restart import RestartTool
 from llm import ChatResult, LLMError, LMStudioClient, TextHandler, ToolHandler, ToolUse
 from memory import MemoryStore, Presence, StoredMessage
@@ -64,12 +66,18 @@ log = logging.getLogger("emilia.bot")
 
 RETIRE_TIMEOUT = 600  # seconds a restarted bot waits for its replies in progress before it shuts down anyway
 CHUNK_SIZE = 1900  # Discord rejects messages over 2000 characters; leave some headroom
-OLD_COMMANDS = {"!forget", "!reset", "!forgetme", "!about"}  # now slash commands; "@Emilia !forget" gets a pointer to them
+OLD_COMMANDS = {"!forget", "!reset", "!forgetme", "!about", "!giveup"}  # now slash commands; "@Emilia !forget" gets a pointer to them
+GIVE_UP_WAIT = 5.0  # seconds /giveup waits for the replies it stopped to save what they had said
 QUOTE_CHARS = 300  # how much of a replied-to message is shown to the model
 FORWARD_CHARS = 1000  # how much of a forwarded message; it is usually what the sender wants to talk about
 FORWARD_WINDOW = timedelta(seconds=60)  # a message this soon after the sender's forward is taken as a comment on it
 FORWARD_COMMENT_WAIT = 2.0  # seconds a forward on its own (in a DM) waits for a comment that would answer it instead
 OPERATOR_TOOLS = COMPUTER_TOOL_NAMES | {RestartTool.name}  # never offered when the sender is a bot (RESPOND_TO_BOTS)
+# Never offered when the sender is a bot: they still get the Discord read tools and reactions.
+BOT_EXCLUDED_TOOLS = OPERATOR_TOOLS | (ACTION_TOOL_NAMES - BOT_SAFE_TOOLS) | ADMIN_TOOL_NAMES | {API_TOOL}
+# They act for someone who asked, so they are never offered when she speaks up on her own.
+DISCORD_TOOL_NAMES = READ_TOOL_NAMES | ACTION_TOOL_NAMES | ADMIN_TOOL_NAMES | {API_TOOL}
+OTHER_CHANNEL_LOCK_TIMEOUT = 10  # seconds to wait for another channel's lock before skipping its memory
 
 
 class ChatBackend(Protocol):
@@ -262,6 +270,7 @@ class EmiliaBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # privileged: also switch it on in the Developer Portal
         intents.members = settings.members_intent  # privileged: Server Members Intent, only if MEMBERS_INTENT=true
+        intents.presences = settings.presence_intent  # privileged: Presence Intent, only if PRESENCE_INTENT=true
         super().__init__(
             intents=intents,
             # Whatever the model writes can never ping @everyone, roles or arbitrary users. Replies
@@ -293,6 +302,8 @@ class EmiliaBot(discord.Client):
         )
         self._locks: dict[str, asyncio.Lock] = {}  # one conversation at a time per channel
         self._busy: set[int] = set()  # users with a request in flight
+        self._replies: dict[str, dict[asyncio.Task[None], int]] = {}  # by channel: the replies being written, and who asked
+        self._given_up: set[asyncio.Task[None]] = set()  # replies stopped by /giveup (not an error)
         self._forwards: dict[tuple[int, int], discord.Message] = {}  # (channel, user) -> their latest forward there
         self._bot_streak: dict[int, int] = {}  # by channel ID: replies to bots since a human last spoke there
         self._restart_ready_fd = restart_ready_fd
@@ -318,6 +329,10 @@ class EmiliaBot(discord.Client):
         @self.tree.command(name="forgetme", description="Delete the note and the names Emilia has saved about you.")
         async def forget_me(interaction: discord.Interaction) -> None:
             await self._forget_me(interaction)
+
+        @self.tree.command(name="giveup", description="Make Emilia stop what she is doing in this channel and leave it be.")
+        async def give_up(interaction: discord.Interaction) -> None:
+            await self._give_up(interaction)
 
         about = app_commands.Group(name="about", description="A short note about yourself that Emilia sees when you talk.")
 
@@ -378,6 +393,26 @@ class EmiliaBot(discord.Client):
                     "BROWSER_TOOLS is on but Playwright is missing (pip install playwright && playwright install chromium): "
                     "browser tools disabled."
                 )
+        if self.settings.discord_tools:
+            tools.extend(
+                discord_tools.discord_tools(
+                    DiscordTools(
+                        self,
+                        render=self._render,
+                        remember=self._remember_elsewhere,
+                        people=self._people_named,
+                        max_chars=self.settings.page_max_chars,
+                        max_actions=self.settings.discord_max_actions,
+                        cross_server=self.settings.discord_cross_server,
+                        admin_confirmation=self.settings.discord_admin_tools_require_confirmation,
+                        api_confirmation=self.settings.arbitrary_discord_tools_require_confirmation,
+                    ),
+                    actions=self.settings.discord_actions,
+                    statuses=self.settings.presence_intent,
+                    admin=self.settings.discord_admin_tools,
+                    api=self.settings.arbitrary_discord_tools,
+                )
+            )
         return tools
 
     # --- lifecycle -------------------------------------------------------------
@@ -401,6 +436,10 @@ class EmiliaBot(discord.Client):
         if self.settings.respond_to_bots:
             scope += ", including from other bots"
         log.info("Logged in as %s (id %s); answering %s", self.user, self.user.id, scope)
+        if self.settings.discord_tools and not self.settings.presence_intent:
+            log.info("Discord tools are on without PRESENCE_INTENT: the member_statuses tool is not offered")
+        elif self.settings.discord_tools and not self.settings.members_intent:
+            log.info("PRESENCE_INTENT is on without MEMBERS_INTENT: member_statuses only sees members Discord has sent")
         if self._restart_ready_fd is not None:
             try:
                 os.write(self._restart_ready_fd, b"1")
@@ -516,7 +555,8 @@ class EmiliaBot(discord.Client):
             await self._send(message, prompts.BUSY_REPLY)
             return
         self._busy.add(user_id)
-        try:
+
+        async def answer() -> None:
             quoted_body, quoted_author, quoted_files = await self._quoted_context(message)
             forwarded = await self._forwarded_context(forward)
             attached = AttachmentReader(
@@ -527,8 +567,21 @@ class EmiliaBot(discord.Client):
             if forwarded is not None:
                 await attached.add(forwarded.attachments, " in the forwarded message")
             await self._respond(message, key, text, quoted_body, quoted_author, forwarded, attached)
+
+        reply = asyncio.create_task(answer())  # a task of its own, so that /giveup can stop it
+        replies = self._replies.setdefault(key, {})
+        replies[reply] = user_id
+        try:
+            await reply
+        except asyncio.CancelledError:
+            if reply not in self._given_up:  # stopped by /giveup: not an error, and nothing to propagate
+                raise
         finally:
             self._busy.discard(user_id)
+            replies.pop(reply, None)
+            if not replies and self._replies.get(key) is replies:
+                del self._replies[key]
+            self._given_up.discard(reply)
 
     async def _respond(
         self,
@@ -600,7 +653,37 @@ class EmiliaBot(discord.Client):
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
                 kept: list[str] = []  # what was posted, as the model wrote it (plain "@Name"s): this is remembered
+                in_thread: list[str] = []  # the part of it posted in a thread she started (start_thread)
                 posted = False
+
+                async def finish(reply: str, *, pings: bool, lookup: bool = False) -> Outgoing:
+                    """The last steps for text the model wrote: the emoji cooldown, then pings for people in the
+                    conversation (and, with `lookup`, people the sender asked for by name)."""
+                    if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
+                        reply = styleguard.cool_down(reply, [*recent, *kept])
+                    if not pings:
+                        return Outgoing(reply, reply)
+                    pingable = self._pingable(labels, known)
+                    if lookup and not from_bot:  # "the sender typed their name" only counts for people
+                        pingable.update(await self._lookup_members(message, reply, text, pingable))
+                    linked, pinged = link_mentions(reply, pingable)
+                    return Outgoing(linked, reply, pinged)
+
+                async def prepare(draft: str, pings: bool) -> Outgoing | None:
+                    """Text a Discord tool is about to post: the same checks as a reply; None if nothing is left of it."""
+                    reply = clean_reply(draft, self._speaker_names())
+                    if contains_cipher_script(reply):
+                        log.warning("Blocked tool text written in braille/cipher script")
+                        return None
+                    if reply and prompts.LEAK_DETECTOR.leaks(reply):
+                        log.warning("Blocked tool text that repeated the system prompt")
+                        return None
+                    out = await finish(reply, pings=pings) if reply else None
+                    return out if out is not None and out.plain.strip() else None
+
+                context = DiscordContext(message, prepare)  # what the Discord tools work from
+                context.handles.allow_links(message.content)
+                discord_tools.CONTEXT.set(context)
 
                 async def post(reply: str, *, from_model: bool = True) -> None:
                     """Post one message. Canned lines (from_model=False) are neither remembered nor allowed to ping anyone."""
@@ -611,16 +694,14 @@ class EmiliaBot(discord.Client):
                             log.warning("Blocked a reply that repeated the system prompt")
                             reply, from_model = prompts.BLOCKED_REPLY, False
                         else:
-                            if self.settings.style_cooldown:  # no emoji/flourish may stick from message to message
-                                reply = styleguard.cool_down(reply, [*recent, *kept])
-                            kept.append(reply)
-                            pingable = self._pingable(labels, known)
-                            if not from_bot:  # "the sender typed their name" only counts for people
-                                pingable.update(await self._lookup_members(message, reply, text, pingable))
-                            reply, pinged = link_mentions(reply, pingable)
+                            out = await finish(reply, pings=True, lookup=True)
+                            kept.append(out.plain)
+                            if context.redirect is not None:
+                                in_thread.append(out.plain)
+                            reply, pinged = out.text, out.pinged
                     if reply:
                         posted = True
-                        await self._send(message, reply, pinged)
+                        context.posted.extend(await self._send(message, reply, pinged, into=context.redirect))
 
                 async def on_text(draft: str) -> None:
                     reply = clean_reply(draft, self._speaker_names())
@@ -629,53 +710,67 @@ class EmiliaBot(discord.Client):
                     elif reply:
                         await post(reply)
 
-                show_tool, on_tool_done = self._tool_lines(message.channel)
+                show_tool, on_tool_done = self._tool_lines(lambda: context.redirect or message.channel)
 
                 async def on_tool(use: ToolUse) -> None:
                     nonlocal posted
                     posted = True
+                    if use.quiet:  # e.g. a reaction: it shows by itself
+                        log.info("Quiet tool: %s", use.description)
+                        return
                     await show_tool(use)
 
-                exclude = OPERATOR_TOOLS if from_bot else ()
-                try:
-                    result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
-                    reply = clean_reply(result.text, self._speaker_names())
-                    if contains_cipher_script(reply) and not result.used_tools and not posted:
-                        # Someone talked the model into writing in braille (or similar). Try once more
-                        # with a nudge; nothing has run or been posted yet, so the retry is harmless.
-                        log.warning("Reply was written in braille/cipher script; retrying once in plain text")
-                        nudged = prompts.add_text(messages[-1], prompts.PLAIN_TEXT_HINT)
-                        result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
-                        reply = clean_reply(result.text, self._speaker_names())
-                except LLMError as exc:
-                    log.error("LM Studio request failed: %s", exc)
-                    await post(prompts.ERROR_REPLY, from_model=False)
-                else:
-                    if contains_cipher_script(reply):
-                        log.warning("Reply was still in braille/cipher script; posting a canned reply")
-                        await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
-                    elif reply:
-                        await post(reply)
-                    elif not posted:
-                        log.warning("The model sent an empty reply")
-                        await post(prompts.EMPTY_REPLY, from_model=False)
+                exclude = BOT_EXCLUDED_TOOLS if from_bot else ()
 
-                if kept:
+                async def remember(reply_text: str) -> None:
                     try:  # stored with plain "@Name"s, the way the model wrote them
                         await asyncio.to_thread(
-                            self.memory.add_turn, key, author_name, str(message.author.id), user_text, "\n\n".join(kept)
+                            self.memory.add_turn, key, author_name, str(message.author.id), user_text, reply_text
                         )
                     except sqlite3.Error:
                         log.exception("Could not save this exchange to memory")
-                    await self._record_spoke(key, bool(scene and scene.kind))
+                    if kept:
+                        await self._record_spoke(key, bool(scene and scene.kind))
+                    if context.redirect is not None and (in_thread or kept):  # the thread starts out knowing where it came from
+                        await self._remember_elsewhere(str(context.redirect.id), context.thread_note, "\n\n".join(in_thread or kept))
 
-    def _tool_lines(self, channel: Any) -> tuple[ToolHandler, ToolHandler]:
-        """Handlers that post a line in `channel` for each tool the model uses (never pinging anyone), then
-        edit its links in once it has run (with SHOW_SOURCES)."""
+                try:
+                    try:
+                        result = await self.llm.chat(messages, on_text, on_tool, on_tool_done, exclude=exclude)
+                        reply = clean_reply(result.text, self._speaker_names())
+                        if contains_cipher_script(reply) and not result.used_tools and not posted:
+                            # Someone talked the model into writing in braille (or similar). Try once more
+                            # with a nudge; nothing has run or been posted yet, so the retry is harmless.
+                            log.warning("Reply was written in braille/cipher script; retrying once in plain text")
+                            nudged = prompts.add_text(messages[-1], prompts.PLAIN_TEXT_HINT)
+                            result = await self.llm.chat([*messages[:-1], nudged], on_text, on_tool, on_tool_done, exclude=exclude)
+                            reply = clean_reply(result.text, self._speaker_names())
+                    except LLMError as exc:
+                        log.error("LM Studio request failed: %s", exc)
+                        await post(prompts.ERROR_REPLY, from_model=False)
+                    else:
+                        if contains_cipher_script(reply):
+                            log.warning("Reply was still in braille/cipher script; posting a canned reply")
+                            await post(prompts.FORMAT_REPLY, from_model=False)  # not stored, so it can't teach the model the pattern
+                        elif reply:
+                            await post(reply)
+                        elif not posted:
+                            log.warning("The model sent an empty reply")
+                            await post(prompts.EMPTY_REPLY, from_model=False)
+                except asyncio.CancelledError:  # stopped by /giveup: keep what she had said, then let it propagate
+                    await remember("\n\n".join(kept) or prompts.GAVE_UP_BEFORE_ANSWERING)
+                    raise
+
+                if kept:
+                    await remember("\n\n".join(kept))
+
+    def _tool_lines(self, channel: Callable[[], Any]) -> tuple[ToolHandler, ToolHandler]:
+        """Handlers that post a line in `channel()` (asked each time: a thread she starts takes over the rest of the
+        reply) for each tool the model uses (never pinging anyone), then edit its links in once it has run (with SHOW_SOURCES)."""
         tool_messages: dict[int, discord.Message] = {}  # by id() of the ToolUse
 
         async def on_tool(use: ToolUse) -> None:
-            tool_messages[id(use)] = await channel.send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
+            tool_messages[id(use)] = await channel().send(tool_line(use), allowed_mentions=discord.AllowedMentions.none())
 
         async def on_tool_done(use: ToolUse) -> None:
             sent = tool_messages.pop(id(use), None)
@@ -702,6 +797,11 @@ class EmiliaBot(discord.Client):
             browser_tools=self.settings.browser_tools,
             time_awareness=self.settings.time_awareness,
             vision=self.settings.vision,
+            discord_tools=self.settings.discord_tools,
+            discord_actions=self.settings.discord_actions and not from_bot,
+            discord_admin=self.settings.discord_admin_tools and not from_bot,
+            discord_api=self.settings.arbitrary_discord_tools and not from_bot,
+            discord_cross_server=self.settings.discord_cross_server,
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -804,7 +904,7 @@ class EmiliaBot(discord.Client):
                 if self.settings.style_cooldown:
                     recent = await asyncio.to_thread(self.memory.last_replies, key, self.settings.style_cooldown)
                 kept: list[str] = []  # what was posted: remembered as one message
-                show_tool, on_tool_done = self._tool_lines(channel)
+                show_tool, on_tool_done = self._tool_lines(lambda: channel)
                 tools_shown = False
 
                 async def post(draft: str) -> None:
@@ -834,7 +934,7 @@ class EmiliaBot(discord.Client):
                         post,
                         on_tool,
                         on_tool_done,
-                        exclude=() if computer else OPERATOR_TOOLS,
+                        exclude=(frozenset() if computer else OPERATOR_TOOLS) | DISCORD_TOOL_NAMES,
                         tools=use_tools,
                         multi_turn=multi_turn,
                     )
@@ -911,6 +1011,40 @@ class EmiliaBot(discord.Client):
             return
         log.info("Forgot the saved profile of user %s", interaction.user.id)
         await self._answer(interaction, prompts.FORGOT_YOU, ephemeral=True)
+
+    async def _give_up(self, interaction: discord.Interaction) -> None:
+        """/giveup: stop what she is doing in this channel and leave it be. Anyone can stop the replies to their own
+        messages; stopping someone else's needs Manage Messages (in a DM it is always allowed)."""
+        if self._retiring:  # the replacement answers this one
+            return
+        key = str(interaction.channel_id)
+        replies = self._replies.get(key, {})
+        everyone = interaction.guild is None or interaction.permissions.manage_messages
+        stopping = [task for task, asker in replies.items() if everyone or asker == interaction.user.id]
+        if replies and not stopping:
+            await self._answer(interaction, prompts.GIVE_UP_DENIED, ephemeral=True)
+            return
+        if not stopping:
+            await self._answer(interaction, prompts.GIVE_UP_IDLE, ephemeral=True)
+            return
+        await interaction.response.defer()  # saving what she had said can take longer than Discord waits for an answer
+        for task in stopping:
+            self._given_up.add(task)
+            task.cancel()
+        await asyncio.wait(stopping, timeout=GIVE_UP_WAIT)
+        try:  # the next reply has to know she gave up, or she would simply start the same thing again
+            await asyncio.to_thread(
+                self.memory.add_turn,
+                key,
+                prompts.safe_name(interaction.user.display_name),
+                str(interaction.user.id),
+                prompts.GIVE_UP_NOTE,
+                prompts.GIVE_UP_DONE,
+            )
+        except sqlite3.Error:
+            log.exception("Could not save that she gave up in channel %s", key)
+        log.info("Gave up %d repl%s in channel %s", len(stopping), "y" if len(stopping) == 1 else "ies", key)
+        await self._answer(interaction, prompts.GIVE_UP_DONE)
 
     @staticmethod
     async def _answer(interaction: discord.Interaction, text: str, *, ephemeral: bool = False) -> None:
@@ -994,6 +1128,35 @@ class EmiliaBot(discord.Client):
         if lock is None:
             lock = self._locks[key] = asyncio.Lock()
         return lock
+
+    async def _people_named(self, name: str) -> list[int]:
+        """User IDs the people directory has saved under exactly `name` (ignoring case and spacing), newest
+        first: how lookup_member finds someone who isn't in this server."""
+        wanted = " ".join(name.casefold().split())
+        try:
+            ids = await asyncio.to_thread(self.memory.find_by_alias, wanted)
+            aliases = await asyncio.to_thread(self.memory.aliases, ids)
+        except sqlite3.Error:
+            log.exception("Could not search the people directory")
+            return []
+        return [int(i) for i in ids if any(" ".join(a.casefold().split()) == wanted for a in aliases.get(i, []))]
+
+    async def _remember_elsewhere(self, key: str, marker: str, text: str) -> None:
+        """Remember a message she posted in another channel than the one she is answering in (send_message,
+        or the start of a thread), under that channel's lock. The current channel's lock is already held, so
+        the other one is only waited for so long: two replies posting into each other's channels can't deadlock."""
+        lock = self._channel_lock(key)
+        try:
+            await asyncio.wait_for(lock.acquire(), OTHER_CHANNEL_LOCK_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("Channel %s stayed busy; not remembering the message posted there", key)
+            return
+        try:
+            await asyncio.to_thread(self.memory.add_turn, key, "", "", marker, text)
+        except sqlite3.Error:
+            log.exception("Could not save a message posted in channel %s to memory", key)
+        finally:
+            lock.release()
 
     async def _lookup_members(
         self, message: discord.Message, reply: str, typed: str, already: dict[str, int]
@@ -1214,20 +1377,25 @@ class EmiliaBot(discord.Client):
             return nothing
         return body, quoted.author, files
 
-    async def _send(self, message: discord.Message, text: str, pinged: list[int] | None = None) -> None:
-        """Reply to the message, spilling over into follow-up messages if it is long.
-        Only the users in `pinged` are actually notified by mentions in the text."""
+    async def _send(
+        self, message: discord.Message, text: str, pinged: list[int] | None = None, *, into: Any = None
+    ) -> list[Any]:
+        """Reply to the message, spilling over into follow-up messages if it is long, and return what was sent.
+        Only the users in `pinged` are actually notified by mentions in the text. With `into` (a thread she
+        started during this reply), everything is posted there instead."""
         allowed = discord.AllowedMentions(users=[discord.Object(user_id) for user_id in pinged or []])
+        sent = []
         for index, chunk in enumerate(split_message(text, CHUNK_SIZE)):
-            if index == 0:
+            if index == 0 and into is None:
                 try:
-                    await message.reply(chunk, allowed_mentions=allowed)
+                    sent.append(await message.reply(chunk, allowed_mentions=allowed))
                     continue
                 except discord.Forbidden:
                     raise
                 except discord.HTTPException as exc:  # e.g. the original message was deleted meanwhile
                     log.info("Could not reply to message %s (%s); posting normally instead", message.id, exc)
-            await message.channel.send(chunk, allowed_mentions=allowed)
+            sent.append(await (into or message.channel).send(chunk, allowed_mentions=allowed))
+        return sent
 
 
 def main() -> None:
@@ -1256,7 +1424,8 @@ def main() -> None:
         raise SystemExit("Discord rejected DISCORD_TOKEN. Reset the token in the Developer Portal and update .env.") from None
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true): "
+            "Turn on 'Message Content Intent' (and 'Server Members Intent' if MEMBERS_INTENT=true, "
+            "'Presence Intent' if PRESENCE_INTENT=true): "
             "Developer Portal > your app > Bot > Privileged Gateway Intents."
         ) from None
 
