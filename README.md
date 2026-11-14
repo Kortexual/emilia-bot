@@ -177,9 +177,11 @@ Search snippets are short. With `FETCH_PAGES=true` (the default) the model also 
 its text, for when a snippet isn't enough or someone shares a link to read. A question that needs a search and then a page uses both
 tool rounds (search first, then the page), and each tool round is an extra generation.
 
-- **Which links can be opened.** Only links from the web search results of the last 15 minutes, and links the sender wrote in their
-  message (or in the message they replied to). The model can't open a link it found inside a page, or one someone planted in the
-  conversation, so text from the web can't send the bot somewhere or smuggle chat contents out in a URL.
+- **Which links can be opened.** Only links from the web search results of the last 15 minutes, and links people wrote in the chat:
+  in the message being answered, the one it replies to or forwards, and the people's messages in the channel's remembered
+  conversation (so "read that link from earlier" works while it is still in memory). The model can't open a link it found inside a
+  page or wrote in one of its own replies, so text from the web can't send the bot somewhere or smuggle chat contents out in a URL.
+  The trade-off: anyone who talks to the bot in a channel can leave a link there that it may later open for someone else.
 - **Only the public internet.** The bot runs on your computer, next to LM Studio and anything else on your network, so the address of
   every site is checked: loopback (`127.0.0.1`, `localhost`), private ranges (`10.x`, `192.168.x`...), link-local and cloud metadata
   addresses are refused, also when a site redirects to them. The connection is made to the address that was checked, and HTTPS
@@ -259,6 +261,9 @@ it the bot logs at startup that the tool is not offered. With `DISCORD_ACTIONS=t
   don't rewrite memory, which keeps the conversation as it happened.
 - **Threads.** After `start_thread`, the rest of the reply (text and tool lines) goes into the new thread, whose memory starts with a
   note about where it came from.
+- **Links.** Links in the messages `read_messages` and `list_pins` return may be opened with `fetch_page` and `browser_open` for the
+  next 15 minutes, as if they were in the chat, so "find the link in #links and read it" works. Anyone who can post where she can
+  read can plant a link this way; the public-address checks still apply and page text stays untrusted.
 - **Limits.** `DISCORD_MAX_ACTIONS` (default 5) caps the actions in one reply, so a model stuck in a loop can't spam. Reactions post
   no tool line (tools can set `quiet = True`), since they show by themselves. Read results are marked as untrusted, like search results.
 - **Bots and unprompted messages.** A bot sender (`RESPOND_TO_BOTS`) gets the read tools and reactions, but no other actions,

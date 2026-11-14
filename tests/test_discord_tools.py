@@ -39,6 +39,7 @@ from discord_tools import (
 )
 from llm import ChatResult, ToolUse
 from tests import test_bot
+from webpage import UrlRegistry
 
 ME = SimpleNamespace(id=999, display_name="Emilia", name="emilia", bot=True)
 ALICE = SimpleNamespace(id=1, display_name="Alice", name="alice", bot=False)
@@ -400,6 +401,21 @@ class ReadToolTests(DiscordToolTestCase):
         self.assertIn("remember this", text)
         self.assertIn("[m1]", text)
 
+    async def test_links_in_messages_she_reads_may_be_opened_by_the_page_tools(self):
+        registry = UrlRegistry()
+        self.random.add("the recipe is at https://food.example/soup, enjoy", author=BOB)
+        self.random.add("filler " * 100 + "https://late.example/page", author=BOB)  # past the 300 characters that are shown
+        pinned = self.general.add("rules: https://rules.example/page", author=BOB)
+        pinned.pinned = True
+        self.context()
+        tools = self.tools(urls=registry)
+        self.assertFalse(registry.is_allowed("https://food.example/soup"))
+        await tools["read_messages"].run({"channel": "#random"})
+        await tools["list_pins"].run({})
+        for url in ("https://food.example/soup", "https://late.example/page", "https://rules.example/page"):
+            self.assertTrue(registry.is_allowed(url), url)
+        self.assertFalse(registry.is_allowed("https://never-read.example/"))
+
 
 class ActionToolTests(DiscordToolTestCase):
     async def test_someone_elses_message_cant_be_edited_or_deleted(self):
@@ -643,6 +659,11 @@ class BotLevelTests(test_bot.BotTestCase):
         bot = self.make_bot()
         await bot.on_message(self.msg(self.mention("hi")))
         self.assertNotIn(prompts.DISCORD_RULES, self.llm.calls[0][0]["content"])
+
+    async def test_the_discord_tools_share_the_bots_list_of_openable_links(self):
+        bot = self.make_bot(discord_tools=True)
+        tool = next(t for t in bot._build_tools() if t.name == "read_messages")
+        self.assertIs(tool._tools.urls, bot.urls)
 
     async def test_a_quiet_tool_posts_no_line(self):
         llm = test_bot.WorkingLLM([ToolUse("react", {"emoji": "👍"}, "Reacting `👍`", quiet=True)], final="Done!")

@@ -53,6 +53,7 @@ import discord
 import prompts
 from textutil import sanitize_user_text, split_message
 from tooling import ToolResult, code_span
+from webpage import UrlRegistry, extract_urls
 
 log = logging.getLogger("emilia.discord_tools")
 
@@ -244,6 +245,7 @@ class DiscordTools:
         render: Callable[[discord.Message], str],
         remember: Remember | None = None,
         people: People | None = None,
+        urls: UrlRegistry | None = None,
         max_chars: int = 6000,
         max_actions: int = 5,
         cross_server: bool = False,
@@ -255,6 +257,7 @@ class DiscordTools:
         self.render = render  # message text with <@id> markup turned into names (EmiliaBot._render)
         self.remember = remember
         self.people = people
+        self.urls = urls  # links in the messages she reads may be opened by fetch_page and browser_open (see _line)
         self.max_chars = max_chars
         self.max_actions = max_actions
         self.cross_server = cross_server
@@ -471,6 +474,8 @@ class DiscordTools:
     def _line(self, ctx: DiscordContext, message: discord.Message) -> str:
         """[m3] Alice (2026-10-25 14:02 UTC): text"""
         handle = ctx.handles.add(message)
+        if self.urls is not None:  # what she reads may be what she is asked to open: take the links whole, not cut like the text shown
+            self.urls.allow(extract_urls(message.content or ""))
         me = self.client.user
         tag = " (you)" if me is not None and message.author.id == me.id else " (bot)" if message.author.bot else ""
         text = sanitize_user_text(self.render(message), MESSAGE_CHARS) if message.content else ""

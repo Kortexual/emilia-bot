@@ -1693,6 +1693,15 @@ class PageReadingTests(BotTestCase):
         await bot.on_message(self.msg(self.mention("summarise this please"), reference=reference))
         self.assertTrue(bot.urls.is_allowed("https://news.example/story"))
 
+    async def test_a_link_people_wrote_earlier_may_be_opened_while_it_is_remembered_but_not_her_own(self):
+        bot = self.make_bot(llm=FakeLLM(text="Sure, see https://model.example/page"))
+        await bot.on_message(self.msg(self.mention("keep https://blog.example/post-1 in mind"), author=person("Bob", 2)))
+        bot.urls._urls.clear()  # as if the permission had expired
+        self.assertFalse(bot.urls.is_allowed("https://blog.example/post-1"))
+        await bot.on_message(self.msg(self.mention("what did that link say?"), author=person("Alice", 1)))
+        self.assertTrue(bot.urls.is_allowed("https://blog.example/post-1"))
+        self.assertFalse(bot.urls.is_allowed("https://model.example/page"))  # links in her own replies don't count
+
     async def test_nothing_is_registered_when_page_reading_is_off(self):
         bot = self.make_bot(fetch_pages=False)
         await bot.on_message(self.msg(self.mention("see https://blog.example/post-1")))

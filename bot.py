@@ -401,6 +401,7 @@ class EmiliaBot(discord.Client):
                         render=self._render,
                         remember=self._remember_elsewhere,
                         people=self._people_named,
+                        urls=self.urls,
                         max_chars=self.settings.page_max_chars,
                         max_actions=self.settings.discord_max_actions,
                         cross_server=self.settings.discord_cross_server,
@@ -630,9 +631,15 @@ class EmiliaBot(discord.Client):
                 scene = await self._scene(key) if self.settings.time_awareness else None
 
                 system_prompt = self._system_prompt(from_bot=from_bot)
-                if self.settings.fetch_pages or self.settings.browser_tools:  # links the sender wrote, quoted or forwarded
+                if self.settings.fetch_pages or self.settings.browser_tools:  # links people wrote: now, quoted, forwarded or earlier
                     forwarded_body = forwarded.body if forwarded is not None else ""
-                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body))
+                    earlier = [  # what people said in this channel's memory; not her own replies or her scene markers
+                        url
+                        for item in history
+                        if item.role == "user" and (item.author or item.author_id)
+                        for url in extract_urls(item.content)
+                    ]
+                    self.urls.allow(extract_urls(text) + extract_urls(quoted_body) + extract_urls(forwarded_body) + earlier)
                 browser.SESSION_KEY.set(key)  # each channel browses in its own browser context
                 messages = prompts.build_messages(
                     system_prompt,
