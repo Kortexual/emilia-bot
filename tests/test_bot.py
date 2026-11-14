@@ -2028,6 +2028,28 @@ class TimeAwarenessTests(DayTestCase):
         await self.ask(bot)
         self.assertIn("in the middle of something", self.last_request())
 
+    async def test_in_yandere_mode_the_random_events_are_yandere_too(self):
+        bot = self.day_bot(13, rng=AlwaysLuckyRNG(), yandere_mode=True)
+        await self.ask(bot)
+        note = self.last_request()
+        self.assertIn("lovesick", note)
+        self.assertTrue(any(idea in note for idea in prompts.YANDERE_EVENT_IDEAS["midday"]))
+        self.assertFalse(any(idea in note for idea in prompts.EVENT_IDEAS["midday"]))
+
+    async def test_without_yandere_mode_the_random_events_are_the_ordinary_ones(self):
+        bot = self.day_bot(13, rng=AlwaysLuckyRNG())
+        await self.ask(bot)
+        note = self.last_request()
+        self.assertNotIn("lovesick", note)
+        self.assertTrue(any(idea in note for idea in prompts.EVENT_IDEAS["midday"]))
+        self.assertFalse(any(idea in note for idea in prompts.YANDERE_EVENT_IDEAS["midday"]))
+
+    async def test_in_yandere_mode_the_wake_up_is_about_missing_everyone(self):
+        bot = self.day_bot(7, 42, random_event_cooldown_minutes=0, yandere_mode=True)
+        await self.ask(bot)
+        self.assertIn("only just woken up", self.last_request())
+        self.assertIn("missed them overnight", self.last_request())
+
     async def test_notes_never_reach_memory(self):
         bot = self.day_bot(13, rng=AlwaysLuckyRNG())
         await self.ask(bot, "hello there")
@@ -2222,6 +2244,15 @@ class RandomMessageTests(DayTestCase):
         await bot._check_presence()
         self.assertIn("only just woken up", self.llm.calls[0][-1]["content"])
         self.assertIn("good morning to everyone", self.llm.calls[0][-1]["content"])
+
+    async def test_in_yandere_mode_her_own_messages_are_yandere_too(self):
+        bot = self.random_bot(yandere_mode=True)
+        await bot._check_presence()
+        note = self.llm.calls[0][-1]["content"]
+        self.assertIn("lonely and clingy", note)
+        self.assertTrue(any(idea in note for idea in prompts.YANDERE_EVENT_IDEAS["afternoon"]))
+        self.assertFalse(any(idea in note for idea in prompts.EVENT_IDEAS["afternoon"]))
+        self.assertFalse(self.channel.allowed_mentions[0].users)  # still nobody is pinged
 
     async def test_it_counts_as_a_scene_for_the_event_cooldown(self):
         bot = self.random_bot(hour=15, random_event_cooldown_minutes=120)

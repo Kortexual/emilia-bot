@@ -337,6 +337,48 @@ class NoteTextTests(unittest.TestCase):
     def test_the_new_rules_are_part_of_the_leak_check(self):
         self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.TIME_RULES))
 
+    def test_yandere_events_have_ideas_for_every_phase(self):
+        self.assertEqual(set(prompts.YANDERE_EVENT_IDEAS), set(prompts.EVENT_IDEAS))
+        for phase, ideas in prompts.YANDERE_EVENT_IDEAS.items():
+            with self.subTest(phase=phase):
+                self.assertGreaterEqual(len(ideas), presence.IDEAS_PER_EVENT)
+                self.assertEqual(len(set(ideas)), len(ideas))
+                self.assertFalse(set(ideas) & set(prompts.EVENT_IDEAS[phase]))  # not the ordinary ones
+
+    def test_every_scene_kind_and_phase_renders_in_yandere_mode_too(self):
+        for phase in prompts.PHASE_LABELS:
+            for kind in ("", "wake_up", "event"):
+                scene = Scene("1:00 PM on Friday", phase, kind, ("reading", "napping", "baking") if kind == "event" else ())
+                for text in (prompts.time_note(scene, yandere=True), prompts.unprompted_note(scene, yandere=True)):
+                    with self.subTest(phase=phase, kind=kind):
+                        self.assertIn("1:00 PM on Friday", text)
+                        self.assertIn(prompts.PHASE_LABELS[phase], text)
+
+    def test_the_yandere_wake_up_event_and_sleepiness_are_obsessive_and_the_ordinary_ones_are_not(self):
+        wake = Scene("7:00 AM on Friday", "early_morning", "wake_up")
+        event = Scene("1:00 PM on Friday", "midday", "event", ("eating lunch", "reading", "napping"))
+        late = Scene("2:00 AM on Friday", "late_night", sleepy=True)
+        self.assertIn("missed them overnight", prompts.time_note(wake, yandere=True))
+        self.assertIn("good morning", prompts.time_note(wake, yandere=True))
+        self.assertIn("lovesick", prompts.time_note(event, yandere=True))
+        self.assertIn("respond to what they said", prompts.time_note(event, yandere=True))
+        self.assertIn("lovesick", prompts.unprompted_note(event, yandere=True))
+        self.assertIn("can't stop thinking about the people here", prompts.time_note(late, yandere=True))
+        for ordinary in (prompts.time_note(wake), prompts.time_note(event), prompts.time_note(late), prompts.unprompted_note(event)):
+            self.assertNotIn("lovesick", ordinary)
+            self.assertNotIn("missed them", ordinary)
+            self.assertNotIn("can't stop thinking", ordinary)
+
+    def test_a_yandere_message_of_her_own_may_pout_about_being_ignored(self):
+        scene = Scene("1:00 PM on Friday", "midday", "event", ("eating lunch", "reading", "napping"))
+        self.assertIn("lonely and clingy", prompts.unprompted_note(scene, yandere=True))
+        self.assertNotIn("lonely and clingy", prompts.unprompted_note(scene))
+        self.assertIn("nobody has spoken to you", prompts.unprompted_note(scene, yandere=True))
+        self.assertIn("don't ping anyone", prompts.unprompted_note(scene, yandere=True))
+
+    def test_the_yandere_persona_is_part_of_the_leak_check(self):
+        self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.YANDERE_PERSONA))
+
 
 if __name__ == "__main__":
     unittest.main()

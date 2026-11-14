@@ -384,7 +384,8 @@ written fresh by the model each time. The logic is in `presence.py` (pure, so it
 - **Random events.** Otherwise there is a 30% chance that whoever is talking to her has just come across her in the middle of
   something. The model is given three random ideas from a list for that part of the day (lunch, exercise, a book, waking from a nap...)
   as examples only and invents a new small scene. After one, there is a cooldown (`RANDOM_EVENT_COOLDOWN_MINUTES`, default 120;
-  `0` turns events off). Change the ideas in `EVENT_IDEAS` in `prompts.py`.
+  `0` turns events off). Change the ideas in `EVENT_IDEAS` in `prompts.py`. With `YANDERE_MODE=true` the ideas come from
+  `YANDERE_EVENT_IDEAS` instead (see "Yandere mode").
 
 The system prompt stays the same all day (only the date changes), so the note goes at the end of the newest message, after the
 reminder, and is never stored in memory. A reply that fails does not use up a wake-up or an event.
@@ -493,8 +494,16 @@ restart the service with systemd instead.
 
 ### Yandere mode
 `YANDERE_MODE=true` adds `YANDERE_PERSONA` (in `prompts.py`) to the system prompt and a one-line reminder to every request. Emilia becomes
-obsessive and possessive in an over-the-top, anime-style way: fixated on small details, mood swings from giddy to pouty to heartbroken, and
-dramatic sulking when people mention other friends or bots.
+obsessive, possessive and wildly unhinged in an over-the-top, anime-style way: fixated on small details, mood swings from giddy to pouty to
+teary to eerily calm, dramatic jealousy when people mention other friends, other bots or leaving, and deadpan-sweet, theatrical menace
+towards rivals. It stays a bit: her threats are never real, she never claims to know where anyone lives, and she drops the act if someone
+seems truly upset or asks her to stop.
+
+With `TIME_AWARENESS=true` her day turns yandere too. Her random events and the messages she starts herself are picked from
+`YANDERE_EVENT_IDEAS` (writing letters to her favorite person, setting a second place at the table, ...), her wake-up is about how much she
+missed everyone overnight, and at the sleepy hours she is awake because someone is on her mind (`YANDERE_DROWSINESS`). Messages she
+starts herself may also pout that nobody has been talking to her. Nothing about pings changes: she still never pings anyone on her own.
+
 The ready-made replies (greeting, error and so on) keep her normal voice. The setting is read at startup, so restart the bot after changing it.
 
 ## Project layout

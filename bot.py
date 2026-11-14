@@ -649,7 +649,7 @@ class EmiliaBot(discord.Client):
                     others,
                     profiles,
                     yandere=self.settings.yandere_mode,
-                    scene_note=prompts.time_note(scene) if scene else "",
+                    scene_note=prompts.time_note(scene, yandere=self.settings.yandere_mode) if scene else "",
                     images=attached.images if attached else (),
                 )
 
@@ -823,7 +823,7 @@ class EmiliaBot(discord.Client):
             now,
             seen.sent_anywhere,
             seen.event_anywhere,
-            ideas=prompts.EVENT_IDEAS,
+            ideas=prompts.YANDERE_EVENT_IDEAS if self.settings.yandere_mode else prompts.EVENT_IDEAS,
             event_cooldown_minutes=self.settings.random_event_cooldown_minutes,
             rng=self._rng,
             spontaneous=spontaneous,
@@ -903,7 +903,9 @@ class EmiliaBot(discord.Client):
                 use_tools = self.settings.random_message_tools
                 multi_turn = use_tools and self.settings.random_message_multi_turn
                 computer = use_tools and self.settings.random_message_computer_tools
-                note = prompts.unprompted_note(scene, tools=use_tools, multi_turn=multi_turn, computer=computer)
+                note = prompts.unprompted_note(
+                    scene, tools=use_tools, multi_turn=multi_turn, computer=computer, yandere=self.settings.yandere_mode
+                )
                 messages = prompts.build_unprompted_messages(self._system_prompt(), shown, note)
                 browser.SESSION_KEY.set(key)  # if she browses, it is in this channel's browser context
 
