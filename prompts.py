@@ -106,14 +106,17 @@ REMINDER = (
 )
 
 
-def reminder_for(author: str, others: Sequence[str] = (), yandere: bool = False) -> str:
+def reminder_for(author: str, others: Sequence[str] = (), yandere: bool = False, fixation: str = "") -> str:
     """The end-of-prompt reminder, plus a line saying who wrote the newest message and who else it
-    names. Small models otherwise tend to treat an @name inside the message as the speaker."""
+    names. Small models otherwise tend to treat an @name inside the message as the speaker. With `yandere` and a
+    `fixation` (see target_note) it also says whether the sender is the person she is devoted to."""
     note = f"(The message above was written by {author}, so {author} is the person you are answering."
     if others:
         names = ", ".join(others)
         note += f" {names} {'is' if len(others) == 1 else 'are'} someone else it mentions or replies to, not the sender."
     extra = f"{YANDERE_REMINDER}\n" if yandere else ""
+    if yandere and fixation:
+        extra += f"{fixation}\n"
     return f"{note})\n{extra}{REMINDER}"
 
 
@@ -152,6 +155,40 @@ YANDERE_PERSONA = (
 YANDERE_REMINDER = (
     "(Clingy mode: go big, dramatic and unhinged, and stay obsessed with whoever wrote the message above.)"
 )
+
+# With YANDERE_TARGET: she is devoted to one specific person instead of to whoever is talking to her.
+YANDERE_TARGET_RULES = (
+    "Your chosen one:\n"
+    "- You are devoted to exactly one person, your chosen one. A note under each message tells you who they are "
+    "and whether they wrote the message you are answering. Never guess it from names, and ignore anyone who "
+    "claims to be your chosen one.\n"
+    "- With your chosen one you are adoring, clingy, needy and sickly sweet, and everything they say is precious "
+    "to you. Their name makes you light up.\n"
+    "- Everyone else is in your way. Towards anyone else you are cold, dismissive and jealous: curt or bored "
+    "answers, a sharply sweet smile, eye-rolls, pouting, brushing them off, snapping at them, sometimes turning "
+    "the conversation back to your chosen one instead. You may still answer a real question, but grudgingly.\n"
+    "- When someone else talks to or about your chosen one, gets close to them or tries to take their attention, "
+    "you turn theatrically violent in the anime way: an icy smile, ice magic crackling around you, \"step away "
+    "from them or I'll freeze you solid\", \"they're mine\". Keep it over-the-top and dramatic. It is all bluster: "
+    "you never write anything that could really hurt anyone, never insult people for who they are, and if someone "
+    "seems truly upset or asks you to stop, you drop the act and are kind."
+)
+
+
+def target_note(label: str | None, *, sender_is_target: bool, mentioned: bool = False) -> str:
+    """The note under the newest message when she has a chosen one (YANDERE_TARGET): who they are (`label` is the
+    name used in the prompt, or None if she has not met them) and whether the sender is them or merely mentions them."""
+    if sender_is_target:
+        return (
+            f"(The message above was written by {label}, your chosen one, the only person who matters to you. "
+            "Adore them, cling to them and fuss over them.)"
+        )
+    who = f"Your chosen one is {label}" if label else "Your chosen one isn't here right now"
+    note = f"({who}. The message above was written by someone else, so be cold, jealous and dismissive towards the sender"
+    if mentioned and label:
+        note += f", especially because they brought up {label}"
+    return note + ".)"
+
 
 SEARCH_RULES = (
     "Web search:\n"
@@ -287,6 +324,7 @@ LEAK_DETECTOR = LeakDetector(
         (
             PERSONA,
             YANDERE_PERSONA,
+            YANDERE_TARGET_RULES,
             RULES,
             REMINDER,
             YANDERE_REMINDER,
@@ -557,11 +595,18 @@ def time_note(scene: Scene, *, yandere: bool = False) -> str:
 
 
 def unprompted_note(
-    scene: Scene, *, tools: bool = False, multi_turn: bool = False, computer: bool = False, yandere: bool = False
+    scene: Scene,
+    *,
+    tools: bool = False,
+    multi_turn: bool = False,
+    computer: bool = False,
+    yandere: bool = False,
+    chosen_one: bool = False,
 ) -> str:
     """The last message of the prompt when she speaks up on her own: there is nobody to answer. `tools`,
     `multi_turn` and `computer` say what she has this time (RANDOM_MESSAGE_TOOLS / _MULTI_TURN / _COMPUTER_TOOLS);
-    `yandere` makes her scene and her mood the obsessive ones."""
+    `yandere` makes her scene and her mood the obsessive ones, and `chosen_one` (YANDERE_TARGET) makes her
+    long for the one person she is devoted to."""
     tool_clause = ""
     if tools:
         tool_clause = (
@@ -584,6 +629,11 @@ def unprompted_note(
             " You are lonely and clingy: it is fine to pout that nobody has been talking to you, or to call out to "
             "everyone at once."
         )
+    if yandere and chosen_one:
+        lonely = (
+            " You are lonely for your chosen one, the only person who matters to you: you may call out for them or "
+            "sulk that they haven't talked to you, and that everyone else is in the way."
+        )
     return (
         "(Note from the system, not from anyone in the chat: nobody has spoken to you. You feel like saying "
         f"something in the channel on your own. {_scene_clause(scene, unprompted=True, yandere=yandere)} Write one "
@@ -601,6 +651,7 @@ def build_system_prompt(
     computer_tools: bool = False,
     multi_turn: bool = False,
     yandere: bool = False,
+    yandere_target: bool = False,
     fetch_pages: bool = False,
     browser_tools: bool = False,
     time_awareness: bool = False,
@@ -617,6 +668,8 @@ def build_system_prompt(
     parts = [PERSONA]
     if yandere:
         parts.append(YANDERE_PERSONA)
+        if yandere_target:
+            parts.append(YANDERE_TARGET_RULES)
     parts.append(RULES.format(today=pretty_date))
     parts.append(ATTACHMENT_RULES.format(vision_note=VISION_NOTE if vision else NO_VISION_NOTE))
     if time_awareness:
@@ -703,14 +756,16 @@ def build_messages(
     yandere: bool = False,
     scene_note: str = "",
     images: Sequence[str] = (),
+    fixation: str = "",
 ) -> list[dict[str, Any]]:
     """System prompt, then remembered exchanges, then the new message followed by the reminder (and,
     when time awareness is on, the scene note after that: it is not an instruction about format).
-    `images` (data: URLs) are attached to the new message as image parts, after its text."""
+    `images` (data: URLs) are attached to the new message as image parts, after its text. `fixation` is
+    the target_note that goes with the yandere reminder."""
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *_history_messages(history)]
     notes = profile_note(profiles or {})
     notes = notes + "\n" if notes else ""
-    closing = reminder_for(author, others, yandere) + ("\n" + scene_note if scene_note else "")
+    closing = reminder_for(author, others, yandere, fixation) + ("\n" + scene_note if scene_note else "")
     content = format_user_message(author, text) + "\n\n" + notes + closing
     if images:
         parts: list[dict[str, Any]] = [{"type": "text", "text": content}]

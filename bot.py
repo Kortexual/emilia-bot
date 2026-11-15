@@ -629,6 +629,7 @@ class EmiliaBot(discord.Client):
                 shown = [replace(m, author=labels.get(m.author_id, m.author)) if m.role == "user" else m for m in shown]
                 profiles = await self._profiles(people, labels)
                 scene = await self._scene(key) if self.settings.time_awareness else None
+                fixation = await self._fixation(message, people, labels)  # "" unless she has a chosen one
 
                 system_prompt = self._system_prompt(from_bot=from_bot)
                 if self.settings.fetch_pages or self.settings.browser_tools:  # links people wrote: now, quoted, forwarded or earlier
@@ -651,6 +652,7 @@ class EmiliaBot(discord.Client):
                     yandere=self.settings.yandere_mode,
                     scene_note=prompts.time_note(scene, yandere=self.settings.yandere_mode) if scene else "",
                     images=attached.images if attached else (),
+                    fixation=fixation,
                 )
 
                 # A reply can be several Discord messages, posted as they happen: whatever the model writes
@@ -800,6 +802,7 @@ class EmiliaBot(discord.Client):
             computer_tools=self.settings.computer_tools and not from_bot,
             multi_turn=self.settings.multi_turn_tools,
             yandere=self.settings.yandere_mode,
+            yandere_target=self._chosen_one() is not None,
             fetch_pages=self.settings.fetch_pages,
             browser_tools=self.settings.browser_tools,
             time_awareness=self.settings.time_awareness,
@@ -809,6 +812,31 @@ class EmiliaBot(discord.Client):
             discord_admin=self.settings.discord_admin_tools and not from_bot,
             discord_api=self.settings.arbitrary_discord_tools and not from_bot,
             discord_cross_server=self.settings.discord_cross_server,
+        )
+
+    def _chosen_one(self) -> int | None:
+        """The Discord user ID she is devoted to (YANDERE_TARGET, which needs YANDERE_MODE), or None."""
+        return self.settings.yandere_target if self.settings.yandere_mode else None
+
+    async def _fixation(self, message: discord.Message, people: list[discord.abc.User], labels: dict[str, str]) -> str:
+        """The note that says who her chosen one is and whether the sender is them or brings them up ("" without
+        one). It names them by the name used in the prompt, or one she has seen them under if they are not in
+        this conversation; nothing else is ever taken from the message to decide who they are."""
+        target = self._chosen_one()
+        if target is None:
+            return ""
+        label = labels.get(str(target))
+        if label is None:
+            try:
+                names = (await asyncio.to_thread(self.memory.aliases, [str(target)])).get(str(target), [])
+            except sqlite3.Error:
+                log.exception("Could not look up the name of her chosen one")
+                names = []
+            label = (prompts.safe_name(names[0], default="") or None) if names else None
+        return prompts.target_note(
+            label,
+            sender_is_target=message.author.id == target,
+            mentioned=any(user.id == target for user in people[1:]),
         )
 
     async def _scene(self, key: str, *, spontaneous: bool = False) -> presence.Scene:
@@ -904,7 +932,12 @@ class EmiliaBot(discord.Client):
                 multi_turn = use_tools and self.settings.random_message_multi_turn
                 computer = use_tools and self.settings.random_message_computer_tools
                 note = prompts.unprompted_note(
-                    scene, tools=use_tools, multi_turn=multi_turn, computer=computer, yandere=self.settings.yandere_mode
+                    scene,
+                    tools=use_tools,
+                    multi_turn=multi_turn,
+                    computer=computer,
+                    yandere=self.settings.yandere_mode,
+                    chosen_one=self._chosen_one() is not None,
                 )
                 messages = prompts.build_unprompted_messages(self._system_prompt(), shown, note)
                 browser.SESSION_KEY.set(key)  # if she browses, it is in this channel's browser context

@@ -93,6 +93,18 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load(DISCORD_TOKEN="a", YANDERE_MODE="sometimes")
 
+    def test_yandere_target(self):
+        mode = {"DISCORD_TOKEN": "a", "YANDERE_MODE": "true"}
+        self.assertIsNone(load(**mode).yandere_target)
+        for value in ("123456789012345678", " 123456789012345678 ", "<@123456789012345678>", "<@!123456789012345678>"):
+            with self.subTest(value=value):
+                self.assertEqual(load(**mode, YANDERE_TARGET=value).yandere_target, 123456789012345678)
+        for bad in ("jack", "0", "12.5", "@jack"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load(**mode, YANDERE_TARGET=bad)
+        with self.assertRaises(ConfigError):  # it only means something in yandere mode
+            load(DISCORD_TOKEN="a", YANDERE_TARGET="123456789012345678")
+
     def test_style_settings(self):
         s = load(DISCORD_TOKEN="a", STYLE_COOLDOWN="0", FORGET_STANDING_INSTRUCTIONS="no")
         self.assertEqual(s.style_cooldown, 0)

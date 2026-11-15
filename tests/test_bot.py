@@ -1676,6 +1676,60 @@ class YandereModeTests(BotTestCase):
         self.assertEqual(message.replies, ["Hey <@20>!"])
 
 
+class YandereTargetTests(BotTestCase):
+    """YANDERE_TARGET: devoted to one person, cold and jealous towards everyone else."""
+
+    async def request(self, bot, text="hi", **kwargs):
+        await bot.on_message(self.msg(self.mention(text), **kwargs))
+        return self.llm.calls[-1]
+
+    async def test_the_rules_are_in_the_prompt_only_with_a_chosen_one(self):
+        call = await self.request(self.make_bot(yandere_mode=True, yandere_target=77))
+        system = call[0]["content"]
+        self.assertIn(prompts.YANDERE_TARGET_RULES, system)
+        self.assertLess(system.index(prompts.YANDERE_PERSONA), system.index(prompts.YANDERE_TARGET_RULES))
+        self.assertLess(system.index(prompts.YANDERE_TARGET_RULES), system.index("How to reply:"))
+        for settings in ({"yandere_mode": True}, {"yandere_target": 77}, {}):  # a target alone means nothing
+            with self.subTest(settings=settings):
+                call = await self.request(self.make_bot(**settings))
+                self.assertNotIn(prompts.YANDERE_TARGET_RULES, call[0]["content"])
+                self.assertNotIn("chosen one", call[-1]["content"])
+
+    async def test_the_chosen_one_is_adored(self):
+        bot = self.make_bot(yandere_mode=True, yandere_target=77)
+        final = (await self.request(bot, author=person("Jack", 77)))[-1]["content"]
+        self.assertIn("written by Jack, your chosen one", final)
+        self.assertNotIn("someone else", final)
+        self.assertLess(final.index(prompts.YANDERE_REMINDER), final.index("written by Jack, your chosen one"))
+        self.assertTrue(final.rstrip().endswith(prompts.REMINDER))  # the injection reminder is still last
+
+    async def test_everyone_else_gets_the_cold_shoulder_and_is_told_who_the_chosen_one_is(self):
+        bot = self.make_bot(yandere_mode=True, yandere_target=77)
+        self.memory.observe_users([("77", [("display", "Jack")])])  # she has met him in another channel
+        final = (await self.request(bot, author=person("Alice", 1)))[-1]["content"]
+        self.assertIn("Your chosen one is Jack", final)
+        self.assertIn("written by someone else", final)
+        self.assertIn("cold, jealous and dismissive", final)
+        self.assertNotIn("especially", final)
+
+    async def test_bringing_up_the_chosen_one_makes_it_worse(self):
+        bot = self.make_bot(yandere_mode=True, yandere_target=77)
+        jack = person("Jack", 77)
+        message = self.msg(self.mention("tell <@77> hi"), author=person("Alice", 1), mentions=[BOT, jack])
+        await bot.on_message(message)
+        self.assertIn("especially because they brought up Jack", self.llm.calls[0][-1]["content"])
+
+    async def test_a_chosen_one_she_has_never_met_is_still_a_chosen_one(self):
+        bot = self.make_bot(yandere_mode=True, yandere_target=77)
+        final = (await self.request(bot, author=person("Alice", 1)))[-1]["content"]
+        self.assertIn("Your chosen one isn't here right now", final)
+
+    async def test_the_note_is_never_remembered(self):
+        bot = self.make_bot(yandere_mode=True, yandere_target=77)
+        await self.request(bot, author=person("Jack", 77))
+        self.assertNotIn("chosen one", " ".join(m.content for m in self.memory.recent("1")))
+
+
 class PageReadingTests(BotTestCase):
     async def test_links_the_sender_wrote_may_be_opened_this_turn(self):
         bot = self.make_bot()
@@ -2253,6 +2307,14 @@ class RandomMessageTests(DayTestCase):
         self.assertTrue(any(idea in note for idea in prompts.YANDERE_EVENT_IDEAS["afternoon"]))
         self.assertFalse(any(idea in note for idea in prompts.EVENT_IDEAS["afternoon"]))
         self.assertFalse(self.channel.allowed_mentions[0].users)  # still nobody is pinged
+
+    async def test_with_a_chosen_one_her_own_messages_long_for_them(self):
+        bot = self.random_bot(yandere_mode=True, yandere_target=77)
+        await bot._check_presence()
+        self.assertIn("lonely for your chosen one", self.llm.calls[0][-1]["content"])
+        bot = self.random_bot(yandere_mode=True)
+        await bot._check_presence()
+        self.assertNotIn("chosen one", self.llm.calls[0][-1]["content"])
 
     async def test_it_counts_as_a_scene_for_the_event_cooldown(self):
         bot = self.random_bot(hour=15, random_event_cooldown_minutes=120)

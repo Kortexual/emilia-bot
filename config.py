@@ -109,6 +109,19 @@ def _channel_ids(name: str) -> tuple[int, ...]:
     return tuple(ids)
 
 
+def _user_id(name: str) -> int | None:
+    """A Discord user ID from the environment: the number itself, or a pasted <@123> mention. None if unset."""
+    raw = _text(name)
+    if not raw:
+        return None
+    digits = raw.strip("<>").lstrip("@!")
+    if not digits.isdigit() or int(digits) == 0:
+        raise ConfigError(
+            f"{name} must be a Discord user ID (Developer Mode, right-click the user, Copy User ID), got {raw!r}"
+        )
+    return int(digits)
+
+
 @dataclass(frozen=True)
 class Settings:
     discord_token: str
@@ -154,6 +167,7 @@ class Settings:
     members_intent: bool = False  # see the whole member list for pinging by name; needs the Server Members Intent
     presence_intent: bool = False  # see members' statuses (the member_statuses tool); needs the Presence Intent
     yandere_mode: bool = False  # an obsessive, possessive (but harmless) version of Emilia; see prompts.YANDERE_PERSONA
+    yandere_target: int | None = None  # with yandere_mode: the Discord user ID she is devoted to; cold to everyone else
 
     # Her day (see presence.py)
     time_awareness: bool = False  # tell her the time of day: wake-up on the first message, sleepy at night, random events
@@ -237,6 +251,10 @@ class Settings:
         arbitrary_discord_tools = _flag("ARBITRARY_DISCORD_TOOLS", cls.arbitrary_discord_tools)
         if arbitrary_discord_tools and not discord_tools:
             raise ConfigError("ARBITRARY_DISCORD_TOOLS needs DISCORD_TOOLS=true as well")
+        yandere_mode = _flag("YANDERE_MODE", cls.yandere_mode)
+        yandere_target = _user_id("YANDERE_TARGET")
+        if yandere_target is not None and not yandere_mode:
+            raise ConfigError("YANDERE_TARGET needs YANDERE_MODE=true as well")
 
         return cls(
             discord_token=token,
@@ -281,7 +299,8 @@ class Settings:
             max_tool_turns=_number("MAX_TOOL_TURNS", cls.max_tool_turns, int, minimum=2),
             members_intent=_flag("MEMBERS_INTENT", cls.members_intent),
             presence_intent=_flag("PRESENCE_INTENT", cls.presence_intent),
-            yandere_mode=_flag("YANDERE_MODE", cls.yandere_mode),
+            yandere_mode=yandere_mode,
+            yandere_target=yandere_target,
             time_awareness=_flag("TIME_AWARENESS", cls.time_awareness),
             timezone=_timezone("TIMEZONE"),
             random_event_cooldown_minutes=_number("RANDOM_EVENT_COOLDOWN_MINUTES", cls.random_event_cooldown_minutes, int, minimum=0),

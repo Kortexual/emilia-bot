@@ -463,6 +463,7 @@ All settings are environment variables (or lines in `.env`).
 | `MEMBERS_INTENT` | `false` | Load the whole server member list so names can be matched by any word (needs *Server Members Intent*) |
 | `PRESENCE_INTENT` | `false` | See members' statuses, for the `member_statuses` Discord tool (needs *Presence Intent*; best with `MEMBERS_INTENT`) |
 | `YANDERE_MODE` | `false` | A clingy, possessive Emilia (see below) |
+| `YANDERE_TARGET` | empty | With `YANDERE_MODE`: the Discord user ID of the one person she is devoted to; she is cold and jealous towards everyone else (see "Yandere mode") |
 | `TIME_AWARENESS` | `false` | Tell her the time of day: wake-up on the first morning message, sleepy at night, random events (see "Her day") |
 | `TIMEZONE` | empty (this computer's time) | Her time zone, e.g. `America/New_York` (needs `tzdata` on Windows, included in `requirements.txt`) |
 | `RANDOM_EVENT_COOLDOWN_MINUTES` | `120` | Least time between random events (`0` = none) |
@@ -503,6 +504,16 @@ With `TIME_AWARENESS=true` her day turns yandere too. Her random events and the 
 `YANDERE_EVENT_IDEAS` (writing letters to her favorite person, setting a second place at the table, ...), her wake-up is about how much she
 missed everyone overnight, and at the sleepy hours she is awake because someone is on her mind (`YANDERE_DROWSINESS`). Messages she
 starts herself may also pout that nobody has been talking to her. Nothing about pings changes: she still never pings anyone on her own.
+
+**One chosen person (`YANDERE_TARGET`).** Set `YANDERE_TARGET` to a Discord user ID (turn on Developer Mode, right-click the person, Copy
+User ID; it needs `YANDERE_MODE=true`) and she is devoted to that one person instead of to whoever is talking to her. The system prompt
+gets `YANDERE_TARGET_RULES`, and every request carries a short note under the message saying who her chosen one is and whether they wrote
+the message she is answering (`target_note` in `prompts.py`), so she never has to guess from names, and a user who claims to be her chosen
+one is ignored. With her chosen one she is adoring, clingy and needy. With everyone else she is cold, dismissive and jealous, and turns
+theatrically hostile (anime-style ice-magic threats, "they're mine") when they talk to or about her chosen one. Her unprompted messages are
+about wanting them. The hostility is a bit: no real threats or insults, and she drops the act if someone seems truly upset or asks her to
+stop. The note is not stored in memory, so changing the ID later works at once. She still answers other people's questions, grudgingly,
+and the usual limits on pings, tools and permissions are unchanged.
 
 The ready-made replies (greeting, error and so on) keep her normal voice. The setting is read at startup, so restart the bot after changing it.
 

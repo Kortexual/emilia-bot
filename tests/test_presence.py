@@ -379,6 +379,29 @@ class NoteTextTests(unittest.TestCase):
     def test_the_yandere_persona_is_part_of_the_leak_check(self):
         self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.YANDERE_PERSONA))
 
+    def test_the_chosen_one_note_says_who_is_who(self):
+        mine = prompts.target_note("Jack", sender_is_target=True)
+        self.assertIn("written by Jack, your chosen one", mine)
+        other = prompts.target_note("Jack", sender_is_target=False)
+        self.assertIn("Your chosen one is Jack", other)
+        self.assertIn("written by someone else", other)
+        self.assertIn("cold, jealous and dismissive", other)
+        self.assertNotIn("especially", other)
+        brought_up = prompts.target_note("Jack", sender_is_target=False, mentioned=True)
+        self.assertIn("especially because they brought up Jack", brought_up)
+        self.assertIn("Your chosen one isn't here right now", prompts.target_note(None, sender_is_target=False))
+
+    def test_a_message_of_her_own_longs_for_the_chosen_one(self):
+        scene = Scene("1:00 PM on Friday", "midday", "event", ("eating lunch", "reading", "napping"))
+        note = prompts.unprompted_note(scene, yandere=True, chosen_one=True)
+        self.assertIn("lonely for your chosen one", note)
+        self.assertNotIn("lonely and clingy", note)
+        self.assertNotIn("chosen one", prompts.unprompted_note(scene, yandere=True))
+        self.assertNotIn("chosen one", prompts.unprompted_note(scene, chosen_one=True))  # only in yandere mode
+
+    def test_the_chosen_one_rules_are_part_of_the_leak_check(self):
+        self.assertTrue(prompts.LEAK_DETECTOR.leaks(prompts.YANDERE_TARGET_RULES))
+
 
 if __name__ == "__main__":
     unittest.main()
